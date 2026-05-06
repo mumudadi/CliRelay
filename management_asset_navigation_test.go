@@ -33,3 +33,70 @@ func TestManagementAssetsExposeTotalCostSummaries(t *testing.T) {
 		t.Fatalf("request logs stats strip does not render total_cost")
 	}
 }
+
+func TestChannelGroupsAssetExposesRoutingStrategyControl(t *testing.T) {
+	_, pageContent := readManagementAssetByPrefix(t, "ChannelGroupsPage")
+	for _, want := range []string{
+		`"data-testid":"routing-strategy-select"`,
+		`channel_groups_page.routing_strategy_tooltip`,
+		`channel_groups_page.routing_strategy_round_robin`,
+		`channel_groups_page.routing_strategy_fill_first`,
+		`routingStrategy:t.currentTarget.value==="fill-first"?"fill-first":"round-robin"`,
+	} {
+		if !strings.Contains(pageContent, want) {
+			t.Fatalf("channel groups asset missing %q", want)
+		}
+	}
+
+	_, zhContent := readManagementAssetByPrefix(t, "zh-CN")
+	for _, want := range []string{
+		`routing_strategy_tooltip:`,
+		`round-robin`,
+		`fill-first`,
+		`prompt cache`,
+	} {
+		if !strings.Contains(zhContent, want) {
+			t.Fatalf("zh-CN asset missing routing strategy wording %q", want)
+		}
+	}
+
+	_, enContent := readManagementAssetByPrefix(t, "en")
+	for _, want := range []string{
+		`routing_strategy_tooltip:`,
+		`round-robin`,
+		`fill-first`,
+		`prompt cache`,
+	} {
+		if !strings.Contains(enContent, want) {
+			t.Fatalf("en asset missing routing strategy wording %q", want)
+		}
+	}
+}
+
+func TestChannelGroupsRoutingStrategyControlIsInsideGroupEditorModal(t *testing.T) {
+	_, pageContent := readManagementAssetByPrefix(t, "ChannelGroupsPage")
+
+	modalIndex := strings.Index(pageContent, `"group-editor-modal-body"`)
+	if modalIndex < 0 {
+		t.Fatalf("channel groups asset missing group editor modal body")
+	}
+
+	strategyIndex := strings.Index(pageContent, `"data-testid":"routing-strategy-select"`)
+	if strategyIndex < 0 {
+		t.Fatalf("channel groups asset missing routing strategy selector")
+	}
+
+	groupNameIndex := strings.Index(pageContent, `channel_groups_page.group_name_label`)
+	if groupNameIndex < 0 {
+		t.Fatalf("channel groups asset missing group name field")
+	}
+
+	if strategyIndex < modalIndex || strategyIndex > groupNameIndex {
+		t.Fatalf(
+			"routing strategy selector should render inside the group editor modal before the group name field: modal=%d strategy=%d groupName=%d",
+			modalIndex,
+			strategyIndex,
+			groupNameIndex,
+		)
+	}
+}

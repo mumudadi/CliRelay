@@ -2,9 +2,12 @@ package usage
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -18,23 +21,24 @@ const (
 )
 
 var dbBackedConfigYAMLKeys = map[string]bool{
-	"api-keys":               true,
-	"api-key-entries":        true,
-	"routing":                true,
-	"proxy-pool":             true,
-	"gemini-api-key":         true,
-	"codex-api-key":          true,
-	"claude-api-key":         true,
-	"bedrock-api-key":        true,
-	"opencode-go-api-key":    true,
-	"openai-compatibility":   true,
-	"vertex-api-key":         true,
-	"claude-header-defaults": true,
-	"kimi-header-defaults":   true,
-	"identity-fingerprint":   true,
-	"oauth-excluded-models":  true,
-	"oauth-model-alias":      true,
-	"payload":                true,
+	"api-keys":                    true,
+	"api-key-entries":             true,
+	"api-key-permission-profiles": true,
+	"routing":                     true,
+	"proxy-pool":                  true,
+	"gemini-api-key":              true,
+	"codex-api-key":               true,
+	"claude-api-key":              true,
+	"bedrock-api-key":             true,
+	"opencode-go-api-key":         true,
+	"openai-compatibility":        true,
+	"vertex-api-key":              true,
+	"claude-header-defaults":      true,
+	"kimi-header-defaults":        true,
+	"identity-fingerprint":        true,
+	"oauth-excluded-models":       true,
+	"oauth-model-alias":           true,
+	"payload":                     true,
 }
 
 // ConfigStoreAvailable reports whether the SQLite store that owns DB-backed
@@ -153,6 +157,10 @@ func cleanConfigKeysFromYAML(configFilePath string, keysToRemove map[string]bool
 }
 
 func writeYAMLNodeAtomic(configFilePath string, root *yaml.Node) error {
+	return writeYAMLNodeAtomicWithRename(configFilePath, root, os.Rename)
+}
+
+func writeYAMLNodeAtomicWithRename(configFilePath string, root *yaml.Node, renameFile func(string, string) error) error {
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -193,5 +201,37 @@ func writeYAMLNodeAtomic(configFilePath string, root *yaml.Node) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, configFilePath)
+	if renameFile == nil {
+		renameFile = os.Rename
+	}
+	if err := renameFile(tmpPath, configFilePath); err != nil {
+		if isAtomicYAMLReplaceUnsupported(err) {
+			if errFallback := writeYAMLFileInPlace(configFilePath, buf.Bytes(), mode); errFallback != nil {
+				return fmt.Errorf("atomic replace failed: %w; in-place write failed: %w", err, errFallback)
+			}
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func isAtomicYAMLReplaceUnsupported(err error) bool {
+	return errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EXDEV)
+}
+
+func writeYAMLFileInPlace(path string, data []byte, mode os.FileMode) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
