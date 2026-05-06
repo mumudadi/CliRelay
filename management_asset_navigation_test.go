@@ -41,7 +41,7 @@ func TestChannelGroupsAssetExposesRoutingStrategyControl(t *testing.T) {
 		`channel_groups_page.routing_strategy_tooltip`,
 		`channel_groups_page.routing_strategy_round_robin`,
 		`channel_groups_page.routing_strategy_fill_first`,
-		`routingStrategy:t.currentTarget.value==="fill-first"?"fill-first":"round-robin"`,
+		`strategy:t.currentTarget.value==="fill-first"?"fill-first":"round-robin"`,
 	} {
 		if !strings.Contains(pageContent, want) {
 			t.Fatalf("channel groups asset missing %q", want)
@@ -98,5 +98,25 @@ func TestChannelGroupsRoutingStrategyControlIsInsideGroupEditorModal(t *testing.
 			strategyIndex,
 			groupNameIndex,
 		)
+	}
+}
+
+func TestChannelGroupsRoutingStrategyControlIsGroupScoped(t *testing.T) {
+	_, pageContent := readManagementAssetByPrefix(t, "ChannelGroupsPage")
+
+	if strings.Contains(pageContent, `value:a.routingStrategy`) ||
+		strings.Contains(pageContent, `L({routingStrategy:`) {
+		t.Fatalf("routing strategy selector should update the group editor form, not the page-level routing strategy")
+	}
+
+	for _, want := range []string{
+		`strategy:t.currentTarget.value==="fill-first"?"fill-first":"round-robin"`,
+		`value:h.strategy`,
+		`strategy:h.strategy==="fill-first"?"fill-first":"round-robin"`,
+		`strategy:i?.strategy==="fill-first"?"fill-first":"round-robin"`,
+	} {
+		if !strings.Contains(pageContent, want) {
+			t.Fatalf("channel groups asset missing group-scoped routing strategy binding %q", want)
+		}
 	}
 }
