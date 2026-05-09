@@ -295,6 +295,21 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetAccessManager(accessManager)
+	s.mgmt.SetConfigMutatedHook(func(updated *config.Config) {
+		if updated == nil {
+			updated = cfg
+		}
+		if updated == nil {
+			return
+		}
+		usage.MigrateRoutingConfigFromConfig(updated, configFilePath)
+		usage.ApplyStoredRoutingConfig(updated)
+		usage.MigrateProxyPoolFromConfig(updated, configFilePath)
+		usage.ApplyStoredProxyPool(updated)
+		usage.MigrateRuntimeSettingsFromConfig(updated, configFilePath)
+		usage.ApplyStoredRuntimeSettings(updated)
+		s.UpdateClients(updated)
+	})
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -614,6 +629,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/model-openrouter-sync", s.mgmt.PutOpenRouterModelSync)
 		mgmt.POST("/model-openrouter-sync/run", s.mgmt.PostOpenRouterModelSyncRun)
 		mgmt.GET("/channel-groups", s.mgmt.GetChannelGroups)
+		mgmt.GET("/ccswitch-import-configs", s.mgmt.GetCcSwitchImportConfigs)
+		mgmt.PUT("/ccswitch-import-configs", s.mgmt.PutCcSwitchImportConfigs)
 		mgmt.GET("/routing-config", s.mgmt.GetRoutingConfig)
 		mgmt.PUT("/routing-config", s.mgmt.PutRoutingConfig)
 		mgmt.GET("/identity-fingerprint", s.mgmt.GetIdentityFingerprint)
@@ -624,6 +641,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 		mgmt.GET("/usage/logs", s.mgmt.GetUsageLogs)
+		mgmt.DELETE("/usage/logs", s.mgmt.DeleteUsageLogs)
 		mgmt.GET("/usage/logs/:id/content", s.mgmt.GetLogContent)
 		mgmt.GET("/usage/auth-file-group-trend", s.mgmt.GetAuthFileGroupTrend)
 		mgmt.GET("/usage/auth-file-trend", s.mgmt.GetAuthFileTrend)

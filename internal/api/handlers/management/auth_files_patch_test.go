@@ -446,6 +446,69 @@ func TestBuildAuthFileEntryIncludesActiveRestrictions(t *testing.T) {
 	}
 }
 
+func TestBuildAuthFileEntryDedupesDuplicateRestrictions(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	nextRetry := now.Add(25 * time.Minute)
+	nextRecover := now.Add(25 * time.Minute)
+
+	makeModelState := func() *coreauth.ModelState {
+		return &coreauth.ModelState{
+			Status:         coreauth.StatusError,
+			StatusMessage:  `{"error":{"type":"usage_limit_reached"}}`,
+			Unavailable:    true,
+			NextRetryAfter: nextRetry,
+			LastError:      &coreauth.Error{Message: "usage limit reached", HTTPStatus: http.StatusTooManyRequests},
+			Quota: coreauth.QuotaState{
+				Exceeded:      true,
+				Reason:        "quota",
+				NextRecoverAt: nextRecover,
+			},
+		}
+	}
+
+	auth := &coreauth.Auth{
+		ID:       "codex-429-dedupe",
+		FileName: "codex-429-dedupe.json",
+		Provider: "codex",
+		Status:   coreauth.StatusError,
+		Attributes: map[string]string{
+			"path": "codex-429-dedupe.json",
+		},
+		StatusMessage:  `{"error":{"type":"usage_limit_reached"}}`,
+		Unavailable:    false,
+		NextRetryAfter: nextRetry,
+		LastError:      &coreauth.Error{Message: "usage limit reached", HTTPStatus: http.StatusTooManyRequests},
+		Quota: coreauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: nextRecover,
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			"gpt-5.4-mini": makeModelState(),
+			"gpt-5.5":      makeModelState(),
+		},
+	}
+
+	entry := (&Handler{}).buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected auth file entry")
+	}
+	restrictions, ok := entry["restrictions"].([]gin.H)
+	if !ok {
+		t.Fatalf("restrictions type = %T, want []gin.H", entry["restrictions"])
+	}
+	if len(restrictions) != 1 {
+		t.Fatalf("restrictions length = %d, want 1", len(restrictions))
+	}
+	got := restrictions[0]
+	if got["scope"] != "auth" || got["http_status"] != http.StatusTooManyRequests {
+		t.Fatalf("restriction = %#v, want auth 429", got)
+	}
+	if _, hasModel := got["model"]; hasModel {
+		t.Fatalf("restriction model = %#v, want no model field", got["model"])
+	}
+}
+
 func TestBuildAuthFileEntryIncludesSubscriptionExpiration(t *testing.T) {
 	expiresAt := time.Now().UTC().Add(90 * time.Minute).Truncate(time.Minute)
 	auth := &coreauth.Auth{

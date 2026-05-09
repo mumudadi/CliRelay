@@ -91,6 +91,23 @@ jobs:
             chmod +x "$SERVICE_NAME"
             # Clean up old backups, keep last 3
             ls -1t "${SERVICE_NAME}.bak."* 2>/dev/null | tail -n +4 | xargs -r rm -f
+            # Ensure Nginx can accept large request bodies (Codex /v1/responses payload can be large).
+            if [ -d /etc/nginx ]; then
+              BODY_SIZE_CONF="/etc/nginx/conf.d/90-clirelay-body-size.conf"
+              mkdir -p "$(dirname "$BODY_SIZE_CONF")"
+              cat > "$BODY_SIZE_CONF" <<'EOF'
+            # Managed by CliRelay GitHub Actions deploy workflow
+            client_max_body_size 2000m;
+            EOF
+              if command -v nginx >/dev/null 2>&1; then
+                nginx -t
+                nginx -s reload || systemctl reload nginx || systemctl restart nginx
+              else
+                systemctl reload nginx || systemctl restart nginx
+              fi
+            else
+              echo "/etc/nginx not found; skip client_max_body_size tuning"
+            fi
             # Start service
             systemctl start clirelay2
             sleep 3
