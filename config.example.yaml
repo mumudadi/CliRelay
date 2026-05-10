@@ -45,6 +45,13 @@ tls:
 #   - "http://localhost:5173"
 cors-allow-origins: []
 
+# Reverse proxies whose X-Forwarded-For / X-Real-IP headers may be trusted.
+# Leave empty for direct exposure. For Docker bridge + Nginx, trust only the
+# proxy/container subnet, for example:
+# trusted-proxies:
+#   - "172.18.0.0/16"
+trusted-proxies: []
+
 # Management API settings
 remote-management:
   # Whether to allow remote (non-localhost) management access.
