@@ -418,7 +418,7 @@ func (s *Server) setupRoutes() {
 	v1.Use(AuthMiddleware(s.accessManager))
 	v1.Use(channelGroupAuthorizationMiddleware())
 	v1.Use(middleware.QuotaMiddleware())
-	v1.Use(ModelRestrictionMiddleware())
+	v1.Use(s.modelRestrictionMiddleware())
 	v1.Use(SystemPromptMiddleware())
 	registerV1Routes(v1)
 
@@ -427,7 +427,7 @@ func (s *Server) setupRoutes() {
 	groupedV1.Use(AuthMiddleware(s.accessManager))
 	groupedV1.Use(channelGroupAuthorizationMiddleware())
 	groupedV1.Use(middleware.QuotaMiddleware())
-	groupedV1.Use(ModelRestrictionMiddleware())
+	groupedV1.Use(s.modelRestrictionMiddleware())
 	groupedV1.Use(SystemPromptMiddleware())
 	registerV1Routes(groupedV1)
 
@@ -436,7 +436,7 @@ func (s *Server) setupRoutes() {
 	v1beta.Use(AuthMiddleware(s.accessManager))
 	v1beta.Use(channelGroupAuthorizationMiddleware())
 	v1beta.Use(middleware.QuotaMiddleware())
-	v1beta.Use(ModelRestrictionMiddleware())
+	v1beta.Use(s.modelRestrictionMiddleware())
 	registerV1BetaRoutes(v1beta)
 
 	groupedV1Beta := s.engine.Group("/:group/v1beta")
@@ -444,7 +444,7 @@ func (s *Server) setupRoutes() {
 	groupedV1Beta.Use(AuthMiddleware(s.accessManager))
 	groupedV1Beta.Use(channelGroupAuthorizationMiddleware())
 	groupedV1Beta.Use(middleware.QuotaMiddleware())
-	groupedV1Beta.Use(ModelRestrictionMiddleware())
+	groupedV1Beta.Use(s.modelRestrictionMiddleware())
 	registerV1BetaRoutes(groupedV1Beta)
 
 	s.engine.NoRoute(func(c *gin.Context) {
@@ -1738,10 +1738,9 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 	}
 }
 
-// ModelRestrictionMiddleware enforces the allowed-models restriction from API key config.
-// It reads the "allowed-models" metadata set by AuthMiddleware, parses the model from
-// the request body, and returns 403 if the model is not in the allowed list.
-func ModelRestrictionMiddleware() gin.HandlerFunc {
+// modelRestrictionMiddleware enforces model restrictions from API key config
+// and route-scoped channel-group allowed-models before a request reaches an upstream.
+func (s *Server) modelRestrictionMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Only check POST requests (GET /models etc. don't need restriction)
 		if c.Request.Method != http.MethodPost {
@@ -1761,7 +1760,13 @@ func ModelRestrictionMiddleware() gin.HandlerFunc {
 			return
 		}
 		allowedStr, exists := metadata["allowed-models"]
-		if !exists || allowedStr == "" {
+		route := pathRouteContextFromGin(c)
+		routeGroup := ""
+		if route != nil {
+			routeGroup = route.Group
+		}
+		allowedGroups := allowedChannelGroupsFromAccessMetadata(c)
+		if (!exists || allowedStr == "") && !s.hasScopedRoutingModelRestriction(routeGroup, allowedGroups) {
 			// No restriction — allow all models
 			c.Next()
 			return
@@ -1775,11 +1780,6 @@ func ModelRestrictionMiddleware() gin.HandlerFunc {
 				allowedModels[trimmed] = struct{}{}
 			}
 		}
-		if len(allowedModels) == 0 {
-			c.Next()
-			return
-		}
-
 		// Read the body to extract the model field
 		bodyBytes, err := bodyutil.ReadRequestBody(c, bodyutil.DefaultRequestBodyLimit)
 		if err != nil {
@@ -1800,21 +1800,123 @@ func ModelRestrictionMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		requestedModel := strings.TrimSpace(bodyObj.Model)
+		routingModel := mapCcSwitchRequestModelForRestriction(requestedModel, route)
 
 		// Check if model is allowed
-		if _, allowed := allowedModels[bodyObj.Model]; !allowed {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"error": map[string]interface{}{
-					"message": fmt.Sprintf("model '%s' is not allowed for this API key", bodyObj.Model),
-					"type":    "forbidden",
-					"code":    "model_not_allowed",
-				},
-			})
+		if len(allowedModels) > 0 && !modelInSet(requestedModel, allowedModels) && !modelInSet(routingModel, allowedModels) {
+			abortModelNotAllowed(c, requestedModel)
+			return
+		}
+		if !s.modelAllowedByScopedRoutingGroups(routingModel, routeGroup, allowedGroups) {
+			abortModelNotAllowed(c, requestedModel)
 			return
 		}
 
 		c.Next()
 	}
+}
+
+func abortModelNotAllowed(c *gin.Context, model string) {
+	c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+		"error": map[string]interface{}{
+			"message": fmt.Sprintf("model '%s' is not allowed for this API key", model),
+			"type":    "forbidden",
+			"code":    "model_not_allowed",
+		},
+	})
+}
+
+func modelInSet(model string, allowed map[string]struct{}) bool {
+	model = strings.TrimSpace(model)
+	if model == "" || len(allowed) == 0 {
+		return false
+	}
+	_, ok := allowed[model]
+	return ok
+}
+
+func mapCcSwitchRequestModelForRestriction(model string, route *internalrouting.PathRouteContext) string {
+	model = strings.TrimSpace(model)
+	if model == "" || route == nil || route.CcSwitch == nil {
+		return model
+	}
+	for _, mapping := range route.CcSwitch.ModelMappings {
+		if strings.EqualFold(strings.TrimSpace(mapping.RequestModel), model) {
+			target := strings.TrimSpace(mapping.TargetModel)
+			if target != "" {
+				return target
+			}
+		}
+	}
+	return model
+}
+
+func (s *Server) hasScopedRoutingModelRestriction(routeGroup string, allowedGroups map[string]struct{}) bool {
+	return s.scopedRoutingAllowedModels(routeGroup, allowedGroups) != nil
+}
+
+func (s *Server) modelAllowedByScopedRoutingGroups(model string, routeGroup string, allowedGroups map[string]struct{}) bool {
+	allowedModels := s.scopedRoutingAllowedModels(routeGroup, allowedGroups)
+	if allowedModels == nil {
+		return true
+	}
+	return routeAllowedModelMatches(model, allowedModels)
+}
+
+func (s *Server) scopedRoutingAllowedModels(routeGroup string, allowedGroups map[string]struct{}) []string {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	scopedGroups := make(map[string]struct{})
+	if routeGroup = internalrouting.NormalizeGroupName(routeGroup); routeGroup != "" {
+		scopedGroups[routeGroup] = struct{}{}
+	} else {
+		for group := range allowedGroups {
+			if normalized := internalrouting.NormalizeGroupName(group); normalized != "" {
+				scopedGroups[normalized] = struct{}{}
+			}
+		}
+	}
+	if len(scopedGroups) == 0 {
+		return nil
+	}
+
+	var allowedModels []string
+	for _, group := range s.cfg.Routing.ChannelGroups {
+		groupName := internalrouting.NormalizeGroupName(group.Name)
+		if _, ok := scopedGroups[groupName]; !ok {
+			continue
+		}
+		if len(group.AllowedModels) == 0 {
+			return nil
+		}
+		allowedModels = append(allowedModels, group.AllowedModels...)
+	}
+	if len(allowedModels) == 0 {
+		return nil
+	}
+	return allowedModels
+}
+
+func routeAllowedModelMatches(model string, allowedModels []string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	for _, allowed := range allowedModels {
+		allowed = strings.TrimSpace(allowed)
+		if allowed == "" {
+			continue
+		}
+		if strings.EqualFold(model, allowed) {
+			return true
+		}
+		if idx := strings.Index(model, "/"); idx >= 0 && strings.EqualFold(strings.TrimSpace(model[idx+1:]), allowed) {
+			return true
+		}
+	}
+	return false
 }
 
 // SystemPromptMiddleware injects a system-prompt (from API key config) into
