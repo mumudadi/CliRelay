@@ -29,9 +29,12 @@ var opencodeGoMessagesModels = map[string]struct{}{
 	"minimax-m2.5": {},
 }
 
-var opencodeGoVisionModels = map[string]struct{}{
-	"qwen3.5-plus": {},
-	"qwen3.6-plus": {},
+var opencodeGoKnownNativeVisionModels = map[string]struct{}{
+	"qwen3.5-plus":  {},
+	"qwen3.6-plus":  {},
+	"mimo-v2-omni":  {},
+	"mimo-v2.5":     {},
+	"mimo-v2.5-pro": {},
 }
 
 // OpenCodeGoExecutor routes OpenCode Go models to the provider's mixed OpenAI/Anthropic endpoints.
@@ -516,8 +519,26 @@ func opencodeGoSupportsNativeVision(model string) bool {
 	if baseModel == "" {
 		return false
 	}
-	_, ok := opencodeGoVisionModels[baseModel]
-	return ok
+	if _, ok := opencodeGoKnownNativeVisionModels[baseModel]; ok {
+		return true
+	}
+	return opencodeGoModelNameImpliesVision(baseModel)
+}
+
+func opencodeGoModelNameImpliesVision(model string) bool {
+	if strings.Contains(model, "vision") ||
+		strings.Contains(model, "multimodal") ||
+		strings.Contains(model, "omni") {
+		return true
+	}
+	for _, token := range strings.FieldsFunc(model, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == '/' || r == ':'
+	}) {
+		if token == "vl" {
+			return true
+		}
+	}
+	return false
 }
 
 func opencodeGoDisablesThinkingForVisionFallback(model string) bool {
