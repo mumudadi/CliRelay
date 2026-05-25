@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -75,20 +76,36 @@ func (e *managementImageExecutor) HttpRequest(context.Context, *coreauth.Auth, *
 	return nil, errors.New("not implemented")
 }
 
-func TestPostImageGenerationTestReturnsStructuredUpstreamError(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	executor := &managementImageExecutor{err: errors.New("openai image conversation returned no downloadable images")}
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(executor)
+func registerManagementImageAuth(t *testing.T, manager *coreauth.Manager, id string, models ...string) {
+	t.Helper()
 	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
+		ID:       id,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"access_token": "token"},
 	}); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
+
+	modelInfos := make([]*registry.ModelInfo, 0, len(models))
+	for _, model := range models {
+		if strings.TrimSpace(model) != "" {
+			modelInfos = append(modelInfos, &registry.ModelInfo{ID: model})
+		}
+	}
+	registry.GetGlobalRegistry().RegisterClient(id, "codex", modelInfos)
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(id)
+	})
+}
+
+func TestPostImageGenerationTestReturnsStructuredUpstreamError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &managementImageExecutor{err: errors.New("openai image conversation returned no downloadable images")}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	registerManagementImageAuth(t, manager, "codex-auth-structured-error", imageGenerationModel)
 
 	h := &Handler{authManager: manager}
 	_, execErr := h.executeImageGenerationTest(context.Background(), []byte(`{
@@ -135,14 +152,7 @@ func TestPostImageGenerationTestIncludesOfficialUpstreamErrorBody(t *testing.T) 
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerManagementImageAuth(t, manager, "codex-auth-official-error", imageGenerationModel)
 
 	h := &Handler{authManager: manager}
 	_, execErr := h.executeImageGenerationTest(context.Background(), []byte(`{
@@ -188,14 +198,7 @@ func TestPostImageGenerationTestExecutesCodexImageAlt(t *testing.T) {
 	executor := &managementImageExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerManagementImageAuth(t, manager, "codex-auth-execute-alt", imageGenerationModel)
 
 	h := &Handler{authManager: manager}
 	_, err := h.executeImageGenerationTest(context.Background(), []byte(`{"model":"gpt-image-2","prompt":"test prompt"}`), imageGenerationAlt)
@@ -209,8 +212,8 @@ func TestPostImageGenerationTestExecutesCodexImageAlt(t *testing.T) {
 	if executor.alt != "images/generations" {
 		t.Fatalf("alt = %q, want images/generations", executor.alt)
 	}
-	if executor.model != "" {
-		t.Fatalf("model = %q, want empty route model for direct codex selection", executor.model)
+	if executor.model != imageGenerationModel {
+		t.Fatalf("model = %q, want %q", executor.model, imageGenerationModel)
 	}
 	if !strings.Contains(executor.payload, "test prompt") || !strings.Contains(executor.payload, "gpt-image-2") {
 		t.Fatalf("payload = %s, want prompt and model", executor.payload)
@@ -229,14 +232,7 @@ func TestPostImageGenerationTestForwardsGenerationOptions(t *testing.T) {
 	executor := &managementImageExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerManagementImageAuth(t, manager, "codex-auth-generation-options", imageGenerationModel)
 
 	h := &Handler{authManager: manager}
 	result, err := h.executeImageGenerationTest(context.Background(), []byte(`{
@@ -254,6 +250,9 @@ func TestPostImageGenerationTestForwardsGenerationOptions(t *testing.T) {
 	}
 	if executor.alt != "images/generations" {
 		t.Fatalf("alt = %q, want images/generations", executor.alt)
+	}
+	if executor.model != imageGenerationModel {
+		t.Fatalf("model = %q, want %q", executor.model, imageGenerationModel)
 	}
 	for i, payload := range executor.payloads {
 		for _, want := range []string{`"size":"1024x1792"`, `"quality":"high"`, `"n":1`} {
@@ -281,14 +280,7 @@ func TestPostImageGenerationTestCreatesTaskAndPollsSucceededResult(t *testing.T)
 	executor := &managementImageExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerManagementImageAuth(t, manager, "codex-auth-task-success", imageGenerationModel)
 
 	h := &Handler{authManager: manager}
 	rec := httptest.NewRecorder()
@@ -362,14 +354,7 @@ func TestPostImageGenerationTestCreatesTaskAndPollsFailedError(t *testing.T) {
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerManagementImageAuth(t, manager, "codex-auth-task-failed", imageGenerationModel)
 
 	h := &Handler{authManager: manager}
 	rec := httptest.NewRecorder()
@@ -457,14 +442,7 @@ func TestPostImageGenerationTestAcceptsMultipartImageEdits(t *testing.T) {
 	executor := &managementImageExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerManagementImageAuth(t, manager, "codex-auth-multipart-edits", imageGenerationModel)
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -525,6 +503,9 @@ func TestPostImageGenerationTestAcceptsMultipartImageEdits(t *testing.T) {
 	}
 	if executor.alt != imageEditsAlt {
 		t.Fatalf("alt = %q, want %q", executor.alt, imageEditsAlt)
+	}
+	if executor.model != imageGenerationModel {
+		t.Fatalf("model = %q, want %q", executor.model, imageGenerationModel)
 	}
 	if !strings.Contains(executor.payload, `"mask_file"`) {
 		t.Fatalf("payload = %s, want mask_file", executor.payload)

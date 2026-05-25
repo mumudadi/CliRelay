@@ -15,6 +15,7 @@ import (
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	internalrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/routing"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -358,6 +359,44 @@ func TestRootV1RouteForbiddenByDefaultChannelGroupAllowedModels(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "model_not_allowed") {
+		t.Fatalf("expected model_not_allowed in body, got %s", rr.Body.String())
+	}
+}
+
+func TestRouteAllowedModelsApplyWithoutAccessMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &proxyconfig.Config{
+		Routing: proxyconfig.RoutingConfig{
+			ChannelGroups: []proxyconfig.RoutingChannelGroup{
+				{
+					Name:          "pro",
+					AllowedModels: []string{"gpt-5.5"},
+				},
+			},
+		},
+	}
+	cfg.SanitizeRouting()
+	server := &Server{cfg: cfg}
+
+	router := gin.New()
+	router.POST("/test", func(c *gin.Context) {
+		attachPathRouteContext(c, &internalrouting.PathRouteContext{Group: "pro"})
+		c.Next()
+	}, server.modelRestrictionMiddleware(), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(`{"model":"gpt-image-2"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -60,14 +61,10 @@ func (e *imageCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *htt
 	return nil, errors.New("not implemented")
 }
 
-func TestOpenAIImagesGenerationsExecutesCodexImageAlt(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	executor := &imageCaptureExecutor{}
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(executor)
+func registerImageTestCodexAuth(t *testing.T, manager *coreauth.Manager, id string, models ...string) {
+	t.Helper()
 	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
+		ID:       id,
 		Provider: "codex",
 		Label:    "Team Codex",
 		Status:   coreauth.StatusActive,
@@ -75,6 +72,26 @@ func TestOpenAIImagesGenerationsExecutesCodexImageAlt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
+
+	modelInfos := make([]*registry.ModelInfo, 0, len(models))
+	for _, model := range models {
+		if strings.TrimSpace(model) != "" {
+			modelInfos = append(modelInfos, &registry.ModelInfo{ID: model})
+		}
+	}
+	registry.GetGlobalRegistry().RegisterClient(id, "codex", modelInfos)
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(id)
+	})
+}
+
+func TestOpenAIImagesGenerationsExecutesCodexImageAlt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &imageCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	registerImageTestCodexAuth(t, manager, "codex-auth", openAIImageModelID)
 
 	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	h := NewOpenAIImagesAPIHandler(base)
@@ -98,8 +115,8 @@ func TestOpenAIImagesGenerationsExecutesCodexImageAlt(t *testing.T) {
 	if executor.alt != "images/generations" {
 		t.Fatalf("alt = %q, want %q", executor.alt, "images/generations")
 	}
-	if executor.model != "" {
-		t.Fatalf("model = %q, want empty route model for direct codex selection", executor.model)
+	if executor.model != openAIImageModelID {
+		t.Fatalf("model = %q, want %q", executor.model, openAIImageModelID)
 	}
 	if !strings.Contains(executor.payload, "draw a fox") || !strings.Contains(executor.payload, "gpt-image-2") {
 		t.Fatalf("payload = %s, want prompt", executor.payload)
@@ -121,15 +138,7 @@ func TestOpenAIImagesGenerationsDefaultsModel(t *testing.T) {
 	executor := &imageCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Label:    "Team Codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token", "email": "team@example.com"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerImageTestCodexAuth(t, manager, "codex-auth-default-model", openAIImageModelID)
 
 	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	h := NewOpenAIImagesAPIHandler(base)
@@ -144,11 +153,40 @@ func TestOpenAIImagesGenerationsDefaultsModel(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
-	if executor.model != "" {
-		t.Fatalf("model = %q, want empty route model for direct codex selection", executor.model)
+	if executor.model != openAIImageModelID {
+		t.Fatalf("model = %q, want %q", executor.model, openAIImageModelID)
 	}
 	if !strings.Contains(executor.payload, "gpt-image-2") {
 		t.Fatalf("payload = %s, want default model in payload", executor.payload)
+	}
+}
+
+func TestOpenAIImagesGenerationsRequiresImageModelSupport(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &imageCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	registerImageTestCodexAuth(t, manager, "codex-auth-text-only", "gpt-5.5")
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIImagesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.Generations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a fox"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d, body=%s", resp.Code, http.StatusBadGateway, resp.Body.String())
+	}
+	if executor.calls != 0 {
+		t.Fatalf("executor calls = %d, want 0", executor.calls)
+	}
+	if !strings.Contains(resp.Body.String(), "auth_not_found") {
+		t.Fatalf("body = %s, want auth_not_found", resp.Body.String())
 	}
 }
 
@@ -158,15 +196,7 @@ func TestOpenAIImagesGenerationsSplitsMultipleImagesIntoSingleImageExecutions(t 
 	executor := &imageCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Label:    "Team Codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token", "email": "team@example.com"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerImageTestCodexAuth(t, manager, "codex-auth-multiple-images", openAIImageModelID)
 
 	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	h := NewOpenAIImagesAPIHandler(base)
@@ -183,6 +213,9 @@ func TestOpenAIImagesGenerationsSplitsMultipleImagesIntoSingleImageExecutions(t 
 	}
 	if executor.calls != 3 {
 		t.Fatalf("executor calls = %d, want 3", executor.calls)
+	}
+	if executor.model != openAIImageModelID {
+		t.Fatalf("model = %q, want %q", executor.model, openAIImageModelID)
 	}
 	for i, payload := range executor.payloads {
 		if !strings.Contains(payload, `"n":1`) {
@@ -208,15 +241,7 @@ func TestOpenAIImagesEditsExecutesCodexImageEditsAlt(t *testing.T) {
 	executor := &imageCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	if _, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-auth",
-		Provider: "codex",
-		Label:    "Team Codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "token", "email": "team@example.com"},
-	}); err != nil {
-		t.Fatalf("Register auth: %v", err)
-	}
+	registerImageTestCodexAuth(t, manager, "codex-auth-edits", openAIImageModelID)
 
 	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	h := NewOpenAIImagesAPIHandler(base)
@@ -258,6 +283,9 @@ func TestOpenAIImagesEditsExecutesCodexImageEditsAlt(t *testing.T) {
 	}
 	if executor.alt != "images/edits" {
 		t.Fatalf("alt = %q, want %q", executor.alt, "images/edits")
+	}
+	if executor.model != openAIImageModelID {
+		t.Fatalf("model = %q, want %q", executor.model, openAIImageModelID)
 	}
 	if !strings.Contains(executor.payload, `"output_format":"webp"`) {
 		t.Fatalf("payload = %s, want output_format", executor.payload)

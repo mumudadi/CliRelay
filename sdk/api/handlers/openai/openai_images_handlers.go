@@ -90,7 +90,7 @@ func (h *OpenAIImagesAPIHandler) executeImages(c *gin.Context, rawJSON []byte, a
 			}
 		}
 		resp, err := h.AuthManager.Execute(cliCtx, []string{"codex"}, coreexecutor.Request{
-			Model:   "",
+			Model:   modelName,
 			Payload: execPayload,
 			Format:  sdktranslator.FromString("openai"),
 		}, coreexecutor.Options{

@@ -1754,25 +1754,19 @@ func (s *Server) modelRestrictionMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Get allowed-models from auth metadata
-		metadataVal, exists := c.Get("accessMetadata")
-		if !exists {
-			c.Next()
-			return
+		allowedStr := ""
+		if metadataVal, exists := c.Get("accessMetadata"); exists {
+			if metadata, ok := metadataVal.(map[string]string); ok {
+				allowedStr = strings.TrimSpace(metadata["allowed-models"])
+			}
 		}
-		metadata, ok := metadataVal.(map[string]string)
-		if !ok {
-			c.Next()
-			return
-		}
-		allowedStr, exists := metadata["allowed-models"]
 		route := pathRouteContextFromGin(c)
 		routeGroup := ""
 		if route != nil {
 			routeGroup = route.Group
 		}
 		allowedGroups := allowedChannelGroupsFromAccessMetadata(c)
-		if (!exists || allowedStr == "") && !s.hasScopedRoutingModelRestriction(routeGroup, allowedGroups) {
+		if allowedStr == "" && !s.hasScopedRoutingModelRestriction(routeGroup, allowedGroups) {
 			// No restriction — allow all models
 			c.Next()
 			return

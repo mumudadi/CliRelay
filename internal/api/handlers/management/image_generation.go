@@ -20,6 +20,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -115,6 +116,10 @@ func (h *Handler) runImageGenerationTask(taskID string, payload []byte, alt stri
 }
 
 func (h *Handler) executeImageGenerationTest(ctx context.Context, payload []byte, alt string) ([]byte, error) {
+	modelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+	if modelName == "" {
+		modelName = imageGenerationModel
+	}
 	imageCount, err := imageGenerationRequestCount(payload)
 	if err != nil {
 		return nil, err
@@ -130,7 +135,7 @@ func (h *Handler) executeImageGenerationTest(ctx context.Context, payload []byte
 			}
 		}
 		resp, execErr := h.authManager.Execute(ctx, []string{"codex"}, coreexecutor.Request{
-			Model:   "",
+			Model:   modelName,
 			Payload: execPayload,
 			Format:  sdktranslator.FromString("openai"),
 		}, coreexecutor.Options{
