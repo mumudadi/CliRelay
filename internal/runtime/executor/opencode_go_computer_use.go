@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -200,6 +201,12 @@ var mcpComputerUseFunctions = []map[string]any{
 // carries mcp__computer_use__ function definitions.  When they are missing
 // (which is the case for DeepSeek models routed through /v1/messages), it
 // injects them so the model sees Computer Use as regular function tools.
+//
+// The function detects whether existing tools are in OpenAI Chat Completions
+// format ({"type":"function","function":{"name":"..."}}) or Claude /v1/messages
+// format ({"name":"...","description":"...","input_schema":{...}}) and injects
+// in the same format to prevent the translator from producing empty function
+// names when the payload format differs from the injection format.
 func opencodeGoInjectComputerUseTools(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
@@ -211,9 +218,25 @@ func opencodeGoInjectComputerUseTools(payload []byte) []byte {
 		return payload
 	}
 
+	toolArray := tools.Array()
+
+	// Detect format from the first tool in the array.
+	isClaudeFormat := false
+	for _, tool := range toolArray {
+		if tool.Get("name").Exists() && !tool.Get("function").Exists() {
+			isClaudeFormat = true
+		}
+		break
+	}
+
 	// If Computer Use tools are already present, do nothing.
-	for _, tool := range tools.Array() {
-		name := tool.Get("function.name").String()
+	for _, tool := range toolArray {
+		var name string
+		if isClaudeFormat {
+			name = tool.Get("name").String()
+		} else {
+			name = tool.Get("function.name").String()
+		}
 		if strings.HasPrefix(name, "mcp__computer_use__") {
 			return payload
 		}
@@ -225,15 +248,41 @@ func opencodeGoInjectComputerUseTools(payload []byte) []byte {
 	}
 
 	// Inject each Computer Use function tool into the tools array.
-	startIdx := len(tools.Array())
-	for i, fn := range mcpComputerUseFunctions {
-		path := fmt.Sprintf("tools.%d", startIdx+i)
-		var err error
-		payload, err = sjson.SetBytes(payload, path, fn)
-		if err != nil {
-			// Non-critical: skip remaining injections if one fails.
-			break
+	startIdx := len(toolArray)
+
+	if isClaudeFormat {
+		// Inject in Claude /v1/messages format: {"name":"...","description":"...","input_schema":{...}}
+		for i, fn := range mcpComputerUseFunctions {
+			name := fn["function"].(map[string]any)["name"].(string)
+			desc := fn["function"].(map[string]any)["description"].(string)
+			params := fn["function"].(map[string]any)["parameters"]
+
+			claudeTool := fmt.Sprintf(`{"name":"%s","description":"","input_schema":null}`, name)
+			claudeTool, _ = sjson.Set(claudeTool, "description", desc)
+
+			paramsJSON, err := json.Marshal(params)
+			if err != nil {
+				break
+			}
+			claudeTool, _ = sjson.SetRaw(claudeTool, "input_schema", string(paramsJSON))
+
+			path := fmt.Sprintf("tools.%d", startIdx+i)
+			payload, err = sjson.SetRawBytes(payload, path, []byte(claudeTool))
+			if err != nil {
+				break
+			}
+		}
+	} else {
+		// Inject in OpenAI Chat Completions format (original behavior).
+		for i, fn := range mcpComputerUseFunctions {
+			path := fmt.Sprintf("tools.%d", startIdx+i)
+			var err error
+			payload, err = sjson.SetBytes(payload, path, fn)
+			if err != nil {
+				break
+			}
 		}
 	}
+
 	return payload
 }
