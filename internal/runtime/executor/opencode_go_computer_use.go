@@ -220,11 +220,25 @@ func opencodeGoInjectComputerUseTools(payload []byte) []byte {
 
 	toolArray := tools.Array()
 
-	// Detect format from the first tool in the array.
+	// Detect format from the first tool's structure.
+	//   1. OpenAI Chat Completions: {"function":{"name":"..."}}
+	//   2. Claude /v1/messages:     {"name":"...","input_schema":{...}} (no "function" key, no "type"="function")
+	//   3. Responses API:           {"type":"function","name":"...","parameters":{...}} (no "function" key but has "type"="function")
 	isClaudeFormat := false
+	isResponsesAPIFormat := false
 	for _, tool := range toolArray {
-		if tool.Get("name").Exists() && !tool.Get("function").Exists() {
+		if tool.Get("function").Exists() {
+			// #1: OpenAI Chat Completions format
+			isClaudeFormat = false
+			isResponsesAPIFormat = false
+		} else if tool.Get("type").String() == "function" && tool.Get("name").Exists() {
+			// #3: Responses API format - has top-level "type"="function" and "name"
+			isClaudeFormat = false
+			isResponsesAPIFormat = true
+		} else if tool.Get("name").Exists() {
+			// #2: Claude format - only has top-level "name" (no "type"="function")
 			isClaudeFormat = true
+			isResponsesAPIFormat = false
 		}
 		break
 	}
@@ -233,6 +247,8 @@ func opencodeGoInjectComputerUseTools(payload []byte) []byte {
 	for _, tool := range toolArray {
 		var name string
 		if isClaudeFormat {
+			name = tool.Get("name").String()
+		} else if isResponsesAPIFormat {
 			name = tool.Get("name").String()
 		} else {
 			name = tool.Get("function.name").String()
@@ -251,7 +267,7 @@ func opencodeGoInjectComputerUseTools(payload []byte) []byte {
 	startIdx := len(toolArray)
 
 	if isClaudeFormat {
-		// Inject in Claude /v1/messages format: {"name":"...","description":"...","input_schema":{...}}
+		// Inject in Claude /v1/messages format.
 		for i, fn := range mcpComputerUseFunctions {
 			name := fn["function"].(map[string]any)["name"].(string)
 			desc := fn["function"].(map[string]any)["description"].(string)
@@ -268,6 +284,28 @@ func opencodeGoInjectComputerUseTools(payload []byte) []byte {
 
 			path := fmt.Sprintf("tools.%d", startIdx+i)
 			payload, err = sjson.SetRawBytes(payload, path, []byte(claudeTool))
+			if err != nil {
+				break
+			}
+		}
+	} else if isResponsesAPIFormat {
+		// Inject in Responses API format: {"type":"function","name":"...","description":"...","parameters":{...}}
+		for i, fn := range mcpComputerUseFunctions {
+			name := fn["function"].(map[string]any)["name"].(string)
+			desc := fn["function"].(map[string]any)["description"].(string)
+			params := fn["function"].(map[string]any)["parameters"]
+
+			respTool := fmt.Sprintf(`{"type":"function","name":"%s","description":"","parameters":null}`, name)
+			respTool, _ = sjson.Set(respTool, "description", desc)
+
+			paramsJSON, err := json.Marshal(params)
+			if err != nil {
+				break
+			}
+			respTool, _ = sjson.SetRaw(respTool, "parameters", string(paramsJSON))
+
+			path := fmt.Sprintf("tools.%d", startIdx+i)
+			payload, err = sjson.SetRawBytes(payload, path, []byte(respTool))
 			if err != nil {
 				break
 			}
