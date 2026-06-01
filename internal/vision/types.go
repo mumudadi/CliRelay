@@ -51,7 +51,7 @@ type ImageOccurrence struct {
 // ImageEntry represents one unique image tracked across turns.
 type ImageEntry struct {
 	Hash                    ImageHash
-	StableOrdinal           int               // stable across turns: Image #1, #2, ...
+	StableOrdinal           int // stable across turns: Image #1, #2, ...
 	SourceKind              ImageSourceKind
 	FirstSeenTurn           int
 	LastSeenTurn            int

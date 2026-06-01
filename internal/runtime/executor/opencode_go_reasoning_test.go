@@ -395,8 +395,8 @@ func TestOpenCodeGoInjectReasoningContentMultipleAssistants(t *testing.T) {
 	// a3 (index 5) - text assistant, should get the cached reasoning_content
 	if rc := msgs[5].Get("reasoning_content").String(); rc != "cached reasoning" {
 		t.Errorf("last assistant at index 5 should get cached reasoning_content, got %q", rc)
-}
 	}
+}
 
 func TestOpenCodeGoInjectReasoningContentPreservesModelName(t *testing.T) {
 	reasoningCache = sync.Map{}

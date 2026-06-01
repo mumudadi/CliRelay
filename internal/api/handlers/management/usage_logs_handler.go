@@ -46,7 +46,7 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 	// to stable auth_index values (and reflect renamed OAuth channels).
 	keyNameMap, channelNameMap, authIndexChannelMap, ambiguousAuthIndexChannelMap := h.buildNameMaps()
 
-		// Read channel multi-value: support repeated ?channel=x&channel=y,
+	// Read channel multi-value: support repeated ?channel=x&channel=y,
 	// plural ?channels=x,y, and legacy alias ?channel_name=x / ?channel-name=x.
 	channelValues := queryStringListMulti(c, "channel", "channels")
 	// Merge legacy aliases (channel_name, channel-name) into channelValues.

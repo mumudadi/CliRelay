@@ -582,7 +582,7 @@ func QueryStats(params LogQueryParams) (LogStats, error) {
 	db := getDB()
 	if db == nil {
 
-	return LogStats{CacheRate: 0}, nil
+		return LogStats{CacheRate: 0}, nil
 	}
 	if params.Days < 1 {
 		params.Days = 7

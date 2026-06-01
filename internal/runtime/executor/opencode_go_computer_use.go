@@ -24,12 +24,12 @@ var mcpComputerUseFunctions = []map[string]any{
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"app":          map[string]any{"type": "string", "description": "App name, full app path, or unambiguous bundle identifier"},
-					"click_count":  map[string]any{"type": "integer", "description": "Number of clicks. Defaults to 1"},
+					"app":           map[string]any{"type": "string", "description": "App name, full app path, or unambiguous bundle identifier"},
+					"click_count":   map[string]any{"type": "integer", "description": "Number of clicks. Defaults to 1"},
 					"element_index": map[string]any{"type": "string", "description": "Element index to click"},
-					"mouse_button": map[string]any{"type": "string", "description": "Mouse button to click. Defaults to left.", "enum": []string{"left", "right", "middle"}},
-					"x":            map[string]any{"type": "number", "description": "X coordinate in screenshot pixel coordinates"},
-					"y":            map[string]any{"type": "number", "description": "Y coordinate in screenshot pixel coordinates"},
+					"mouse_button":  map[string]any{"type": "string", "description": "Mouse button to click. Defaults to left.", "enum": []string{"left", "right", "middle"}},
+					"x":             map[string]any{"type": "number", "description": "X coordinate in screenshot pixel coordinates"},
+					"y":             map[string]any{"type": "number", "description": "Y coordinate in screenshot pixel coordinates"},
 				},
 				"required":             []string{"app"},
 				"additionalProperties": false,
@@ -45,11 +45,11 @@ var mcpComputerUseFunctions = []map[string]any{
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"app":   map[string]any{"type": "string", "description": "App name, full app path, or unambiguous bundle identifier"},
+					"app":    map[string]any{"type": "string", "description": "App name, full app path, or unambiguous bundle identifier"},
 					"from_x": map[string]any{"type": "number", "description": "Start X coordinate"},
 					"from_y": map[string]any{"type": "number", "description": "Start Y coordinate"},
-					"to_x":  map[string]any{"type": "number", "description": "End X coordinate"},
-					"to_y":  map[string]any{"type": "number", "description": "End Y coordinate"},
+					"to_x":   map[string]any{"type": "number", "description": "End X coordinate"},
+					"to_y":   map[string]any{"type": "number", "description": "End Y coordinate"},
 				},
 				"required":             []string{"app", "from_x", "from_y", "to_x", "to_y"},
 				"additionalProperties": false,
@@ -381,4 +381,3 @@ func opencodeGoStripArrayScreenshots(payload []byte, arrayPath string) []byte {
 	}
 	return payload
 }
-

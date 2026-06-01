@@ -7,14 +7,14 @@ import (
 
 // ImagePart describes a single image content part found in a payload.
 type ImagePart struct {
-	ArrayName  string // "messages" or "input"
-	MsgIdx     int    // index in the array
-	PartIdx    int    // index in the content array
-	Type       string // original type ("image_url" / "input_image" / "image")
-	Data       string // base64 data (may be empty for remote URLs)
-	RemoteURL  string // remote URL if not inline
-	MIMEType   string
-	IsCurrent  bool // true if this part belongs to the last user message
+	ArrayName string // "messages" or "input"
+	MsgIdx    int    // index in the array
+	PartIdx   int    // index in the content array
+	Type      string // original type ("image_url" / "input_image" / "image")
+	Data      string // base64 data (may be empty for remote URLs)
+	RemoteURL string // remote URL if not inline
+	MIMEType  string
+	IsCurrent bool // true if this part belongs to the last user message
 }
 
 // WalkResult contains all image parts found and whether any are current/historical.

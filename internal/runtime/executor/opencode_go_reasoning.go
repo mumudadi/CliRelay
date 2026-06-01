@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	reasoningContentCacheTTL        = 30 * time.Minute
-	reasoningCacheCleanupInterval   = 5 * time.Minute
-	reasoningCacheMaxEntriesPerKey  = 1
+	reasoningContentCacheTTL       = 30 * time.Minute
+	reasoningCacheCleanupInterval  = 5 * time.Minute
+	reasoningCacheMaxEntriesPerKey = 1
 )
 
 var (

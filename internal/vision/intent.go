@@ -9,10 +9,10 @@ import (
 type Intent int
 
 const (
-	IntentNone        Intent = iota // no historical image action needed
-	IntentFollowUp                  // user is asking about a specific image
-	IntentAmbiguous                 // user references image but target is unclear
-	IntentNewImage                  // current turn has new images
+	IntentNone      Intent = iota // no historical image action needed
+	IntentFollowUp                // user is asking about a specific image
+	IntentAmbiguous               // user references image but target is unclear
+	IntentNewImage                // current turn has new images
 )
 
 // DetectIntent examines the last user message and registry state to determine

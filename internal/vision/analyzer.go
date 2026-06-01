@@ -15,12 +15,12 @@ import (
 
 // AnalyzeRequest carries all context needed for image analysis.
 type AnalyzeRequest struct {
-	ImageData    string        // base64 data from current request
-	MIMEType     string        // "image/png", "image/jpeg", etc.
-	Existing     ImageSummary  // previously accumulated summary (empty on first analysis)
-	Query        string        // user's current question (empty on first analysis)
-	IsFollowUp   bool          // true if this is a follow-up analysis
-	SourceKind   ImageSourceKind
+	ImageData  string       // base64 data from current request
+	MIMEType   string       // "image/png", "image/jpeg", etc.
+	Existing   ImageSummary // previously accumulated summary (empty on first analysis)
+	Query      string       // user's current question (empty on first analysis)
+	IsFollowUp bool         // true if this is a follow-up analysis
+	SourceKind ImageSourceKind
 }
 
 // AnalyzeResponse contains the analysis result.
@@ -51,9 +51,9 @@ func NewOpenCodeGoAnalyzer(baseURL, apiKey, model string) *OpenCodeGoAnalyzer {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				MaxIdleConns:        10,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  false,
+				MaxIdleConns:       10,
+				IdleConnTimeout:    90 * time.Second,
+				DisableCompression: false,
 			},
 		},
 	}
@@ -150,7 +150,7 @@ func (a *OpenCodeGoAnalyzer) buildRequestBody(prompt, imageData, mimeType string
 		"model": a.model,
 		"messages": []map[string]any{
 			{
-				"role": "system",
+				"role":    "system",
 				"content": "You are an expert image analyst. Provide structured, detailed descriptions.",
 			},
 			{
