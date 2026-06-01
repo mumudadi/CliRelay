@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/vision"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -79,27 +80,19 @@ func (e *OpenCodeGoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth
 }
 
 func (e *OpenCodeGoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	// Vision preprocessing: when the model doesn't support vision but the
-	// current request has images, call qwen3.5-plus internally to get a text
-	// description and replace the image. The model is never changed, so the
-	// original model is preserved for subsequent requests and usage logging.
-	apiKey := opencodeGoAPIKey(auth)
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	visionModel := opencodeGoVisionFallbackModel(e.cfg, auth)
-	if visionModel == "" {
-		visionModel = "qwen3.5-plus"
-	}
-	if !opencodeGoSupportsNativeVision(baseModel) && opencodeGoPayloadHasImage(req.Payload) && apiKey != ""  {
-		if preprocessed, ok := opencodeGoPreprocessVision(ctx, e.cfg, auth, apiKey, visionModel, req.Payload); ok {
-			req.Payload = preprocessed
-		}
-	}
+	// Image registry: handle historical image references and inject
+	// registry notes for follow-up questions. Current-turn images are
+	// left for the existing vision fallback path below.
+		sessionKey, _ := vision.ResolveSessionKey(opts, auth)
+		processor := vision.NewProcessor(e.newAnalyzer(auth))
+		procRes, _ := processor.Process(ctx, req.Payload, sessionKey, 0)
+		req.Payload = procRes.Payload
 
-	fallback := e.applyVisionFallback(auth, req, opts)
-	req = fallback.Request
-	if !fallback.Applied {
-		req = e.sanitizeHistoricalImagesForTextModel(req)
-	}
+		// Vision fallback: if the current message has new images and the
+		// model doesn't natively support vision, route to the configured
+		// vision model for direct image analysis.
+		fallback := e.applyVisionFallback(auth, req, opts)
+		req = fallback.Request
 
 	// Inject cached reasoning_content for models that need it (e.g., DeepSeek thinking mode).
 	sessionID := opencodeGoSessionID(opts, auth)
@@ -146,25 +139,19 @@ func (e *OpenCodeGoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Aut
 }
 
 func (e *OpenCodeGoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	// Vision preprocessing: replace images with text from the configured vision model.
-	apiKey := opencodeGoAPIKey(auth)
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	visionModel := opencodeGoVisionFallbackModel(e.cfg, auth)
-	if visionModel == "" {
-		visionModel = "qwen3.5-plus"
-	}
-	if !opencodeGoSupportsNativeVision(baseModel) && opencodeGoPayloadHasImage(req.Payload) && apiKey != ""  {
-		if preprocessed, ok := opencodeGoPreprocessVision(ctx, e.cfg, auth, apiKey, visionModel, req.Payload); ok {
-			req.Payload = preprocessed
-		}
-	}
+	// Image registry: handle historical image references and inject
+	// registry notes for follow-up questions. Current-turn images are
+	// left for the existing vision fallback path below.
+	sessionKey, _ := vision.ResolveSessionKey(opts, auth)
+	processor := vision.NewProcessor(e.newAnalyzer(auth))
+	procRes, _ := processor.Process(ctx, req.Payload, sessionKey, 0)
+	req.Payload = procRes.Payload
 
+	// Vision fallback: if the current message has new images and the
+	// model doesn't natively support vision, route to the configured
+	// vision model for direct image analysis.
 	fallback := e.applyVisionFallback(auth, req, opts)
 	req = fallback.Request
-	if !fallback.Applied {
-		req = e.sanitizeHistoricalImagesForTextModel(req)
-	}
-	// Inject cached reasoning_content for models that need it (e.g., DeepSeek thinking mode).
 	sessionID := opencodeGoSessionID(opts, auth)
 	if opencodeGoNeedsReasoningInjection(req.Model) && sessionID != "" {
 		req.Payload = opencodeGoInjectReasoningContentIntoPayload(req.Payload, req.Model, sessionID)
@@ -259,19 +246,7 @@ func (e *OpenCodeGoExecutor) applyVisionFallback(auth *cliproxyauth.Auth, req cl
 	return result
 }
 
-func (e *OpenCodeGoExecutor) sanitizeHistoricalImagesForTextModel(req cliproxyexecutor.Request) cliproxyexecutor.Request {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	if opencodeGoSupportsNativeVision(baseModel) {
-		return req
-	}
-	if opencodeGoCurrentRequestHasImage(req.Payload) || !opencodeGoPayloadHasImage(req.Payload) {
-		return req
-	}
-	if payload, ok := opencodeGoSanitizeHistoricalImages(req.Payload); ok {
-		req.Payload = payload
-	}
-	return req
-}
+
 
 func opencodeGoVisionFallbackModel(cfg *config.Config, auth *cliproxyauth.Auth) string {
 	if auth == nil {
@@ -932,6 +907,16 @@ func (e *OpenCodeGoExecutor) requestLog(url string, req *http.Request, body []by
 // opencodeGoStripOrphanedToolCalls removes tool_calls from assistant messages
 // that are not followed by tool messages responding to them. Strict upstream
 // providers (e.g., DeepSeek) reject requests with unresolved tool_calls.
+
+func (e *OpenCodeGoExecutor) newAnalyzer(auth *cliproxyauth.Auth) *vision.OpenCodeGoAnalyzer {
+	apiKey := opencodeGoAPIKey(auth)
+	model := opencodeGoVisionFallbackModel(e.cfg, auth)
+	if model == "" {
+		model = "qwen3.5-plus"
+	}
+	return vision.NewOpenCodeGoAnalyzer(opencodeGoBaseURL, apiKey, model)
+}
+
 func opencodeGoStripOrphanedToolCalls(payload []byte) []byte {
 	if !gjson.ValidBytes(payload) {
 		return payload
