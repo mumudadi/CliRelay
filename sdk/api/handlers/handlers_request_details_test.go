@@ -29,12 +29,19 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	modelRegistry.RegisterClient("test-request-details-claude", "claude", []*registry.ModelInfo{
 		{ID: "claude-sonnet-4-5", Created: now + 5},
 	})
+	modelRegistry.RegisterClient("test-request-details-opencode-go", "opencode-go", []*registry.ModelInfo{
+		{ID: "deepseek-v4-flash", Created: now + 10},
+	})
+	modelRegistry.RegisterClient("test-request-details-custom", "openai", []*registry.ModelInfo{
+		{ID: "custom-model[beta]", Created: now + 15},
+	})
 
 	// Ensure cleanup of all test registrations.
 	clientIDs := []string{
 		"test-request-details-gemini",
 		"test-request-details-openai",
 		"test-request-details-claude",
+		"test-request-details-opencode-go",
 	}
 	for _, clientID := range clientIDs {
 		id := clientID
@@ -92,6 +99,41 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			inputModel:    "gemini-2.5-flash(none)",
 			wantProviders: []string{"gemini"},
 			wantModel:     "gemini-2.5-flash(none)",
+			wantErr:       false,
+		},
+		{
+			name:          "bracket suffix 1M stripped for provider lookup",
+			inputModel:    "deepseek-v4-flash[1M]",
+			wantProviders: []string{"opencode-go"},
+			wantModel:     "deepseek-v4-flash",
+			wantErr:       false,
+		},
+		{
+			name:          "bracket suffix 128K stripped",
+			inputModel:    "deepseek-v4-flash[128K]",
+			wantProviders: []string{"opencode-go"},
+			wantModel:     "deepseek-v4-flash",
+			wantErr:       false,
+		},
+		{
+			name:          "bracket suffix unknown model",
+			inputModel:    "unknown-model[1M]",
+			wantProviders: nil,
+			wantModel:     "",
+			wantErr:       true,
+		},
+		{
+			name:          "bracket suffix preserved round bracket thinking suffix",
+			inputModel:    "deepseek-v4-flash[1M](8192)",
+			wantProviders: []string{"opencode-go"},
+			wantModel:     "deepseek-v4-flash(8192)",
+			wantErr:       false,
+		},
+		{
+			name:          "custom model with bracket suffix preserved",
+			inputModel:    "custom-model[beta]",
+			wantProviders: []string{"openai"},
+			wantModel:     "custom-model[beta]",
 			wantErr:       false,
 		},
 		{

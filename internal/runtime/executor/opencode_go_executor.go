@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/vision"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -79,11 +80,41 @@ func (e *OpenCodeGoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth
 }
 
 func (e *OpenCodeGoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	// Image registry: handle historical image references and inject
+	// registry notes for follow-up questions. Current-turn images are
+	// left for the existing vision fallback path below.
+	sessionKey, _ := vision.ResolveSessionKey(opts, auth)
+	processor := vision.NewProcessor(e.newAnalyzer(auth))
+	procRes, _ := processor.Process(ctx, req.Payload, sessionKey, 0)
+	req.Payload = procRes.Payload
+
+	// Vision fallback: if the current message has new images and the
+	// model doesn't natively support vision, route to the configured
+	// vision model for direct image analysis.
 	fallback := e.applyVisionFallback(auth, req, opts)
 	req = fallback.Request
-	if !fallback.Applied {
-		req = e.sanitizeHistoricalImagesForTextModel(req)
+
+	// Inject cached reasoning_content for models that need it (e.g., DeepSeek thinking mode).
+	sessionID := opencodeGoSessionID(opts, auth)
+	if opencodeGoNeedsReasoningInjection(req.Model) && sessionID != "" {
+		req.Payload = opencodeGoInjectReasoningContentIntoPayload(req.Payload, req.Model, sessionID)
 	}
+	// Inject Computer Use function tools for models that need them.
+	// Codex Desktop skips mcp__computer_use__ when routing through /v1/messages,
+	// so DeepSeek models don't see Computer Use capabilities.
+	if opencodeGoNeedsReasoningInjection(req.Model) {
+		req.Payload = opencodeGoInjectComputerUseTools(req.Payload)
+	}
+	// Strip old base64 screenshots from tool result messages to save context.
+	if opencodeGoNeedsReasoningInjection(req.Model) {
+		req.Payload = opencodeGoStripScreenshots(req.Payload)
+	}
+	// Strip orphaned tool_calls that strict upstreams reject.
+	cleaned := opencodeGoStripOrphanedToolCalls(req.Payload)
+	if len(cleaned) != len(req.Payload) {
+		log.Warnf("opencode: stripped orphaned tool_calls")
+	}
+	req.Payload = cleaned
 	var resp cliproxyexecutor.Response
 	var err error
 	if opencodeGoUsesMessages(req.Model) {
@@ -91,19 +122,56 @@ func (e *OpenCodeGoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Aut
 	} else {
 		resp, err = e.openAIExecutor().Execute(ctx, opencodeGoAuthWithBaseURL(auth), req, opts)
 	}
-	if err != nil || !fallback.Applied {
+	if err != nil {
 		return resp, err
+	}
+
+	// Capture reasoning_content from the upstream response for caching.
+	if opencodeGoNeedsReasoningInjection(req.Model) && sessionID != "" {
+		opencodeGoCacheReasoningFromNonStream(resp.Payload, req.Model, sessionID)
+	}
+
+	if !fallback.Applied {
+		return resp, nil
 	}
 	resp.Payload = opencodeGoRewriteFallbackResponseModel(resp.Payload, fallback.OriginalModel)
 	return resp, nil
 }
 
 func (e *OpenCodeGoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	// Image registry: handle historical image references and inject
+	// registry notes for follow-up questions. Current-turn images are
+	// left for the existing vision fallback path below.
+	sessionKey, _ := vision.ResolveSessionKey(opts, auth)
+	processor := vision.NewProcessor(e.newAnalyzer(auth))
+	procRes, _ := processor.Process(ctx, req.Payload, sessionKey, 0)
+	req.Payload = procRes.Payload
+
+	// Vision fallback: if the current message has new images and the
+	// model doesn't natively support vision, route to the configured
+	// vision model for direct image analysis.
 	fallback := e.applyVisionFallback(auth, req, opts)
 	req = fallback.Request
-	if !fallback.Applied {
-		req = e.sanitizeHistoricalImagesForTextModel(req)
+	sessionID := opencodeGoSessionID(opts, auth)
+	if opencodeGoNeedsReasoningInjection(req.Model) && sessionID != "" {
+		req.Payload = opencodeGoInjectReasoningContentIntoPayload(req.Payload, req.Model, sessionID)
 	}
+	// Inject Computer Use function tools for models that need them.
+	// Codex Desktop skips mcp__computer_use__ when routing through /v1/messages,
+	// so DeepSeek models don't see Computer Use capabilities.
+	if opencodeGoNeedsReasoningInjection(req.Model) {
+		req.Payload = opencodeGoInjectComputerUseTools(req.Payload)
+	}
+	// Strip old base64 screenshots from tool result messages to save context.
+	if opencodeGoNeedsReasoningInjection(req.Model) {
+		req.Payload = opencodeGoStripScreenshots(req.Payload)
+	}
+	// Strip orphaned tool_calls that strict upstreams reject.
+	cleaned := opencodeGoStripOrphanedToolCalls(req.Payload)
+	if len(cleaned) != len(req.Payload) {
+		log.Warnf("opencode: stripped orphaned tool_calls")
+	}
+	req.Payload = cleaned
 	var result *cliproxyexecutor.StreamResult
 	var err error
 	if opencodeGoUsesMessages(req.Model) {
@@ -111,9 +179,20 @@ func (e *OpenCodeGoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyau
 	} else {
 		result, err = e.openAIExecutor().ExecuteStream(ctx, opencodeGoAuthWithBaseURL(auth), req, opts)
 	}
-	if err != nil || !fallback.Applied {
+	if err != nil {
 		return result, err
 	}
+
+	// Wrap stream to capture reasoning_content from streaming chunks.
+	// This must happen before the fallback check so non-fallback requests also get caching.
+	if opencodeGoNeedsReasoningInjection(req.Model) && sessionID != "" {
+		result = opencodeGoWrapStreamCacheReasoning(result, req.Model, sessionID)
+	}
+
+	if !fallback.Applied {
+		return result, nil
+	}
+
 	return opencodeGoRewriteFallbackStreamResult(result, fallback.OriginalModel), nil
 }
 
@@ -165,20 +244,6 @@ func (e *OpenCodeGoExecutor) applyVisionFallback(auth *cliproxyauth.Auth, req cl
 	result.FallbackModel = fallback
 	result.Applied = true
 	return result
-}
-
-func (e *OpenCodeGoExecutor) sanitizeHistoricalImagesForTextModel(req cliproxyexecutor.Request) cliproxyexecutor.Request {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	if opencodeGoSupportsNativeVision(baseModel) {
-		return req
-	}
-	if opencodeGoCurrentRequestHasImage(req.Payload) || !opencodeGoPayloadHasImage(req.Payload) {
-		return req
-	}
-	if payload, ok := opencodeGoSanitizeHistoricalImages(req.Payload); ok {
-		req.Payload = payload
-	}
-	return req
 }
 
 func opencodeGoVisionFallbackModel(cfg *config.Config, auth *cliproxyauth.Auth) string {
@@ -428,21 +493,24 @@ func opencodeGoCurrentValueHasImage(value any) (bool, bool) {
 }
 
 func opencodeGoLatestUserMessageHasImage(messages []any) (bool, bool) {
-	for i := len(messages) - 1; i >= 0; i-- {
-		message, ok := messages[i].(map[string]any)
-		if !ok {
-			continue
-		}
-		role, _ := message["role"].(string)
-		if !strings.EqualFold(strings.TrimSpace(role), "user") {
-			continue
-		}
-		if content, ok := message["content"]; ok {
-			return opencodeGoValueHasImage(content), true
-		}
-		return opencodeGoValueHasImage(message), true
+	// Only check the VERY LAST message. Scanning backwards for any user
+	// message causes the vision fallback to trigger on follow-up tool-call
+	// requests where the most recent user message is an old image message.
+	if len(messages) == 0 {
+		return false, false
 	}
-	return false, false
+	message, ok := messages[len(messages)-1].(map[string]any)
+	if !ok {
+		return false, false
+	}
+	role, _ := message["role"].(string)
+	if !strings.EqualFold(strings.TrimSpace(role), "user") {
+		return false, false
+	}
+	if content, ok := message["content"]; ok {
+		return opencodeGoValueHasImage(content), true
+	}
+	return opencodeGoValueHasImage(message), true
 }
 
 func opencodeGoInputHasImage(input any) (bool, bool) {
@@ -833,6 +901,82 @@ func (e *OpenCodeGoExecutor) requestLog(url string, req *http.Request, body []by
 	}
 }
 
+// opencodeGoStripOrphanedToolCalls removes tool_calls from assistant messages
+// that are not followed by tool messages responding to them. Strict upstream
+// providers (e.g., DeepSeek) reject requests with unresolved tool_calls.
+
+func (e *OpenCodeGoExecutor) newAnalyzer(auth *cliproxyauth.Auth) *vision.OpenCodeGoAnalyzer {
+	apiKey := opencodeGoAPIKey(auth)
+	model := opencodeGoVisionFallbackModel(e.cfg, auth)
+	if model == "" {
+		model = "qwen3.5-plus"
+	}
+	return vision.NewOpenCodeGoAnalyzer(opencodeGoBaseURL, apiKey, model)
+}
+
+func opencodeGoStripOrphanedToolCalls(payload []byte) []byte {
+	if !gjson.ValidBytes(payload) {
+		return payload
+	}
+
+	// Determine format: "messages" (Chat Completions) or "input" (Responses API)
+	arrayName := "messages"
+	msgs := gjson.GetBytes(payload, "messages")
+	if !msgs.Exists() || !msgs.IsArray() || len(msgs.Array()) == 0 {
+		msgs = gjson.GetBytes(payload, "input")
+		if !msgs.Exists() || !msgs.IsArray() || len(msgs.Array()) == 0 {
+			return payload
+		}
+		arrayName = "input"
+	}
+
+	items := msgs.Array()
+	needsStrip := make([]int, 0)
+
+	for i, item := range items {
+		if item.Get("role").String() != "assistant" {
+			continue
+		}
+		tc := item.Get("tool_calls")
+		if !tc.Exists() || !tc.IsArray() {
+			continue
+		}
+
+		// Collect tool_call_ids resolved by tool messages after this message
+		resolved := make(map[string]bool)
+		for _, later := range items[i+1:] {
+			if later.Get("role").String() == "tool" {
+				if id := later.Get("tool_call_id").String(); id != "" {
+					resolved[id] = true
+				}
+			}
+		}
+
+		allResolved := true
+		for _, call := range tc.Array() {
+			if id := call.Get("id").String(); id != "" {
+				if !resolved[id] {
+					allResolved = false
+					break
+				}
+			}
+		}
+		if !allResolved {
+			needsStrip = append(needsStrip, i)
+		}
+	}
+
+	if len(needsStrip) == 0 {
+		return payload
+	}
+
+	for i := len(needsStrip) - 1; i >= 0; i-- {
+		path := fmt.Sprintf("%s.%d.tool_calls", arrayName, needsStrip[i])
+		payload, _ = sjson.DeleteBytes(payload, path)
+	}
+	return payload
+}
+
 func opencodeGoUsesMessages(model string) bool {
 	base := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
 	_, ok := opencodeGoMessagesModels[base]
@@ -858,6 +1002,130 @@ func opencodeGoAuthWithBaseURL(auth *cliproxyauth.Auth) *cliproxyauth.Auth {
 	attrs["base_url"] = strings.TrimSuffix(opencodeGoBaseURL, "/")
 	clone.Attributes = attrs
 	return &clone
+}
+
+// opencodeGoFixToolCallArguments repairs tool_calls where function.arguments contains
+// concatenated JSON objects by splitting them into separate tool_call entries.
+// This handles a Codex Desktop client bug where multiple shell_command calls get
+// merged into a single tool_call's arguments field (e.g., {"c":"ls"}{"c":"cat pkg.json"}).
+func opencodeGoFixToolCallArguments(payload []byte) []byte {
+	if len(payload) == 0 || !json.Valid(payload) {
+		return payload
+	}
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return payload
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return payload
+	}
+	changed := false
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if !strings.EqualFold(role, "assistant") {
+			continue
+		}
+		rawCalls, ok := msg["tool_calls"]
+		if !ok {
+			continue
+		}
+		calls, ok := rawCalls.([]any)
+		if !ok {
+			continue
+		}
+		fixed := make([]any, 0, len(calls))
+		for _, rawCall := range calls {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				fixed = append(fixed, rawCall)
+				continue
+			}
+			fn, ok := call["function"].(map[string]any)
+			if !ok {
+				fixed = append(fixed, rawCall)
+				continue
+			}
+			args, ok := fn["arguments"].(string)
+			if !ok {
+				fixed = append(fixed, rawCall)
+				continue
+			}
+			if json.Valid([]byte(args)) {
+				fixed = append(fixed, rawCall)
+				continue
+			}
+			parts := splitConcatenatedJSONObjects(args)
+			if len(parts) <= 1 {
+				fixed = append(fixed, rawCall)
+				continue
+			}
+			changed = true
+			// First split part replaces the original tool_call's arguments.
+			fn["arguments"] = parts[0]
+			fixed = append(fixed, call)
+			baseID, _ := call["id"].(string)
+			for i := 1; i < len(parts); i++ {
+				newCall := cloneToolCallMap(call, baseID, i)
+				if newFn, ok := newCall["function"].(map[string]any); ok {
+					newFn["arguments"] = parts[i]
+				}
+				fixed = append(fixed, newCall)
+			}
+		}
+		if changed {
+			msg["tool_calls"] = fixed
+		}
+	}
+	if !changed {
+		return payload
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
+// splitConcatenatedJSONObjects splits a string containing concatenated JSON objects
+// into individual JSON strings. Uses json.Decoder to read one object at a time
+// regardless of whitespace, nesting, or string content.
+func splitConcatenatedJSONObjects(input string) []string {
+	decoder := json.NewDecoder(strings.NewReader(input))
+	var parts []string
+	for {
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			break
+		}
+		parts = append(parts, string(raw))
+	}
+	return parts
+}
+
+// cloneToolCallMap creates a shallow copy of a tool_call map with a new ID
+// and a deep clone of its function sub-map.
+func cloneToolCallMap(original map[string]any, baseID string, splitIdx int) map[string]any {
+	clone := make(map[string]any, len(original))
+	for k, v := range original {
+		clone[k] = v
+	}
+	if baseID != "" {
+		clone["id"] = fmt.Sprintf("%s_split_%d", baseID, splitIdx)
+	}
+	// Deep clone the function map so each split tool_call has independent state.
+	if fn, ok := original["function"].(map[string]any); ok {
+		fnClone := make(map[string]any, len(fn))
+		for k, v := range fn {
+			fnClone[k] = v
+		}
+		clone["function"] = fnClone
+	}
+	return clone
 }
 
 func opencodeGoClaudeMessageToSSE(data []byte) []byte {

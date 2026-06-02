@@ -41,9 +41,12 @@ type LogQueryParams struct {
 	Page         int      // 1-based
 	Size         int      // rows per page
 	Days         int      // time range in days
-	APIKey       string   // exact match filter
-	Model        string   // exact match filter
-	Status       string   // "success", "failed", or "" (all)
+	APIKey       string   // exact match filter (deprecated, use APIKeys)
+	Model        string   // exact match filter (deprecated, use Models)
+	Status       string   // "success", "failed", or "" (all) (deprecated, use Statuses)
+	APIKeys      []string // multi-value API key filter
+	Models       []string // multi-value model filter
+	Statuses     []string // multi-value status filter
 	AuthIndexes  []string // optional auth_index IN (...) filter
 	ChannelNames []string // optional channel_name IN (...) filter
 	// Optional precise legacy matches for renamed auth channels whose stored
@@ -73,6 +76,7 @@ type LogStats struct {
 	SuccessRate float64 `json:"success_rate"`
 	TotalTokens int64   `json:"total_tokens"`
 	TotalCost   float64 `json:"total_cost"`
+	CacheRate   float64 `json:"cache_rate"`
 }
 
 type ClearRequestLogsResult struct {
@@ -577,7 +581,8 @@ func QueryFilters(days int) (FilterOptions, error) {
 func QueryStats(params LogQueryParams) (LogStats, error) {
 	db := getDB()
 	if db == nil {
-		return LogStats{}, nil
+
+		return LogStats{CacheRate: 0}, nil
 	}
 	if params.Days < 1 {
 		params.Days = 7
@@ -585,11 +590,11 @@ func QueryStats(params LogQueryParams) (LogStats, error) {
 
 	where, args := buildWhereClause(params)
 
-	var total, successCount, totalTokens int64
+	var total, successCount, totalTokens, cacheHitCount int64
 	var totalCost float64
-	statsSQL := "SELECT COUNT(*), COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost),0) " +
+	statsSQL := "SELECT COUNT(*), COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost),0), COALESCE(SUM(CASE WHEN cached_tokens>0 THEN 1 ELSE 0 END),0) " +
 		"FROM request_logs" + where
-	if err := db.QueryRow(statsSQL, args...).Scan(&total, &successCount, &totalTokens, &totalCost); err != nil {
+	if err := db.QueryRow(statsSQL, args...).Scan(&total, &successCount, &totalTokens, &totalCost, &cacheHitCount); err != nil {
 		return LogStats{}, fmt.Errorf("usage: stats query: %w", err)
 	}
 
@@ -598,10 +603,16 @@ func QueryStats(params LogQueryParams) (LogStats, error) {
 		successRate = float64(successCount) / float64(total) * 100
 	}
 
+	var cacheRate float64
+	if total > 0 {
+		cacheRate = float64(cacheHitCount) / float64(total) * 100
+	}
+
 	return LogStats{
 		Total:       total,
 		SuccessRate: successRate,
 		TotalTokens: totalTokens,
+		CacheRate:   cacheRate,
 		TotalCost:   totalCost,
 	}, nil
 }
@@ -1178,7 +1189,50 @@ func cutoffDayKey(days int) string {
 	return localDayKeyAt(CutoffStartUTC(days))
 }
 
+// normalizeLogQueryParams merges deprecated single-value fields into their
+// multi-value counterparts. It trims spaces, deduplicates, and removes empties.
+func normalizeLogQueryParams(params LogQueryParams) LogQueryParams {
+	if params.APIKey != "" {
+		params.APIKeys = append(params.APIKeys, params.APIKey)
+		params.APIKey = ""
+	}
+	if params.Model != "" {
+		params.Models = append(params.Models, params.Model)
+		params.Model = ""
+	}
+	if params.Status != "" {
+		params.Statuses = append(params.Statuses, params.Status)
+		params.Status = ""
+	}
+	params.APIKeys = normalizeStringList(params.APIKeys)
+	params.Models = normalizeStringList(params.Models)
+	params.Statuses = normalizeStringList(params.Statuses)
+	return params
+}
+
+func normalizeStringList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, v := range values {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if _, ok := seen[lower]; ok {
+			continue
+		}
+		seen[lower] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
 func buildWhereClause(params LogQueryParams) (string, []interface{}) {
+	params = normalizeLogQueryParams(params)
 	conditions := make([]string, 0, 4)
 	args := make([]interface{}, 0, 4)
 
@@ -1186,35 +1240,75 @@ func buildWhereClause(params LogQueryParams) (string, []interface{}) {
 	conditions = append(conditions, "timestamp >= ?")
 	args = append(args, CutoffStartUTC(params.Days).Format(time.RFC3339))
 
-	if params.APIKey != "" {
-		if params.APIKey == systemRequestLogFilterValue {
-			conditions = append(conditions, `(
-				trim(coalesce(api_key_name, '')) = ''
-				AND (
-					trim(coalesce(api_key, '')) = ''
-					OR trim(coalesce(api_key, '')) LIKE '/%'
-					OR upper(trim(coalesce(api_key, ''))) LIKE 'GET /%'
-					OR upper(trim(coalesce(api_key, ''))) LIKE 'POST /%'
-					OR upper(trim(coalesce(api_key, ''))) LIKE 'PUT /%'
-					OR upper(trim(coalesce(api_key, ''))) LIKE 'PATCH /%'
-					OR upper(trim(coalesce(api_key, ''))) LIKE 'DELETE /%'
-					OR upper(trim(coalesce(api_key, ''))) LIKE 'OPTIONS /%'
-					OR upper(trim(coalesce(api_key, ''))) LIKE 'HEAD /%'
-				)
-			)`)
-		} else {
-			conditions = append(conditions, "api_key = ?")
-			args = append(args, params.APIKey)
+	// API Key multi-value filter
+	if len(params.APIKeys) > 0 {
+		apiKeyConds := make([]string, 0, len(params.APIKeys))
+		systemConds := make([]string, 0)
+		normalKeys := make([]string, 0, len(params.APIKeys))
+		for _, key := range params.APIKeys {
+			if key == systemRequestLogFilterValue {
+				systemConds = append(systemConds, `(
+					trim(coalesce(api_key_name, '')) = ''
+					AND (
+						trim(coalesce(api_key, '')) = ''
+						OR trim(coalesce(api_key, '')) LIKE '/%'
+						OR upper(trim(coalesce(api_key, ''))) LIKE 'GET /%'
+						OR upper(trim(coalesce(api_key, ''))) LIKE 'POST /%'
+						OR upper(trim(coalesce(api_key, ''))) LIKE 'PUT /%'
+						OR upper(trim(coalesce(api_key, ''))) LIKE 'PATCH /%'
+						OR upper(trim(coalesce(api_key, ''))) LIKE 'DELETE /%'
+						OR upper(trim(coalesce(api_key, ''))) LIKE 'OPTIONS /%'
+						OR upper(trim(coalesce(api_key, ''))) LIKE 'HEAD /%'
+					)
+				)`)
+			} else {
+				normalKeys = append(normalKeys, key)
+			}
+		}
+		if len(normalKeys) > 0 {
+			placeholders := make([]string, 0, len(normalKeys))
+			for _, k := range normalKeys {
+				placeholders = append(placeholders, "?")
+				args = append(args, k)
+			}
+			apiKeyConds = append(apiKeyConds, "api_key IN ("+strings.Join(placeholders, ",")+")")
+		}
+		apiKeyConds = append(apiKeyConds, systemConds...)
+		if len(apiKeyConds) == 1 {
+			conditions = append(conditions, apiKeyConds[0])
+		} else if len(apiKeyConds) > 1 {
+			conditions = append(conditions, "("+strings.Join(apiKeyConds, " OR ")+")")
 		}
 	}
-	if params.Model != "" {
-		conditions = append(conditions, "model = ?")
-		args = append(args, params.Model)
+
+	// Model multi-value filter
+	if len(params.Models) > 0 {
+		placeholders := make([]string, 0, len(params.Models))
+		for _, m := range params.Models {
+			placeholders = append(placeholders, "?")
+			args = append(args, m)
+		}
+		conditions = append(conditions, "model IN ("+strings.Join(placeholders, ",")+")")
 	}
-	if params.Status == "success" {
-		conditions = append(conditions, "failed = 0")
-	} else if params.Status == "failed" {
-		conditions = append(conditions, "failed = 1")
+
+	// Status multi-value filter
+	if len(params.Statuses) > 0 {
+		hasSuccess := false
+		hasFailed := false
+		for _, s := range params.Statuses {
+			switch strings.ToLower(s) {
+			case "success":
+				hasSuccess = true
+			case "failed":
+				hasFailed = true
+			}
+		}
+		if hasSuccess && !hasFailed {
+			conditions = append(conditions, "failed = 0")
+		} else if hasFailed && !hasSuccess {
+			conditions = append(conditions, "failed = 1")
+		}
+		// Both success and failed: no status filter needed (equivalent to "all")
 	}
 	if len(params.AuthIndexes) > 0 || len(params.ChannelNames) > 0 {
 		filterConditions := make([]string, 0, 2)

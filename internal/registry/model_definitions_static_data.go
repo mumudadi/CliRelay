@@ -64,6 +64,18 @@ func GetClaudeModels() []*ModelInfo {
 			Thinking:            &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: false, Levels: []string{"low", "medium", "high", "xhigh", "max"}},
 		},
 		{
+			ID:                  "claude-opus-4-8",
+			Object:              "model",
+			Created:             1779984000, // 2026-06-01 (estimated release)
+			OwnedBy:             "anthropic",
+			Type:                "claude",
+			DisplayName:         "Claude Opus 4.8",
+			Description:         "Next-generation Claude Opus model with enhanced intelligence and capabilities",
+			ContextLength:       1000000,
+			MaxCompletionTokens: 128000,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: false, Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+		},
+		{
 			ID:                  "claude-opus-4-5-20251101",
 			Object:              "model",
 			Created:             1761955200, // 2025-11-01
@@ -1039,6 +1051,8 @@ func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
 		"claude-sonnet-4-5-thinking": {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
 		"claude-opus-4-5-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
 		"claude-opus-4-6-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
+		"claude-opus-4-7-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
+		"claude-opus-4-8-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
 		"claude-sonnet-4-5":          {MaxCompletionTokens: 64000},
 		"claude-sonnet-4-6":          {MaxCompletionTokens: 64000},
 		"claude-sonnet-4-6-thinking": {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},

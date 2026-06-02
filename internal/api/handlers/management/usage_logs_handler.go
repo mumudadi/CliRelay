@@ -46,22 +46,39 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 	// to stable auth_index values (and reflect renamed OAuth channels).
 	keyNameMap, channelNameMap, authIndexChannelMap, ambiguousAuthIndexChannelMap := h.buildNameMaps()
 
-	channelFilterRaw := strings.TrimSpace(c.Query("channel"))
-	if channelFilterRaw == "" {
-		channelFilterRaw = strings.TrimSpace(c.Query("channel_name"))
+	// Read channel multi-value: support repeated ?channel=x&channel=y,
+	// plural ?channels=x,y, and legacy alias ?channel_name=x / ?channel-name=x.
+	channelValues := queryStringListMulti(c, "channel", "channels")
+	// Merge legacy aliases (channel_name, channel-name) into channelValues.
+	if raw := strings.TrimSpace(c.Query("channel_name")); raw != "" {
+		channelValues = append(channelValues, raw)
 	}
-	if channelFilterRaw == "" {
-		channelFilterRaw = strings.TrimSpace(c.Query("channel-name"))
+	if raw := strings.TrimSpace(c.Query("channel-name")); raw != "" {
+		channelValues = append(channelValues, raw)
 	}
-	selectedChannelKeys := make(map[string]struct{})
-	if channelFilterRaw != "" {
-		for _, part := range strings.Split(channelFilterRaw, ",") {
-			key := strings.ToLower(strings.TrimSpace(part))
-			if key == "" {
-				continue
-			}
-			selectedChannelKeys[key] = struct{}{}
+	// Deduplicate after merging legacy aliases
+	chanSeen := make(map[string]struct{}, len(channelValues))
+	deduped := make([]string, 0, len(channelValues))
+	for _, v := range channelValues {
+		lower := strings.ToLower(strings.TrimSpace(v))
+		if lower == "" {
+			continue
 		}
+		if _, ok := chanSeen[lower]; ok {
+			continue
+		}
+		chanSeen[lower] = struct{}{}
+		deduped = append(deduped, v)
+	}
+	channelValues = deduped
+
+	selectedChannelKeys := make(map[string]struct{})
+	for _, part := range channelValues {
+		key := strings.ToLower(strings.TrimSpace(part))
+		if key == "" {
+			continue
+		}
+		selectedChannelKeys[key] = struct{}{}
 	}
 	var authIndexes []string
 	var channelNames []string
@@ -101,9 +118,9 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 		Page:                  intQueryDefault(c, "page", 1),
 		Size:                  intQueryDefault(c, "size", 50),
 		Days:                  intQueryDefault(c, "days", 7),
-		APIKey:                strings.TrimSpace(c.Query("api_key")),
-		Model:                 strings.TrimSpace(c.Query("model")),
-		Status:                strings.TrimSpace(c.Query("status")),
+		APIKeys:               queryStringListMulti(c, "api_key", "api_keys"),
+		Models:                queryStringListMulti(c, "model", "models"),
+		Statuses:              queryStringListMulti(c, "status", "statuses"),
 		AuthIndexes:           authIndexes,
 		ChannelNames:          channelNames,
 		AuthIndexChannelNames: authIndexChannelNames,
@@ -784,6 +801,40 @@ func queryStringList(c *gin.Context, key string) []string {
 		}
 	}
 	return values
+}
+
+// queryStringListMulti parses query parameters that can be provided as:
+//  1. Repeated singular keys: ?api_key=a&api_key=b
+//  2. Plural comma-separated key: ?api_keys=a,b
+//  3. Single value: ?api_key=a
+func queryStringListMulti(c *gin.Context, singular, plural string) []string {
+	values := make([]string, 0)
+	// 1. Repeated singular keys: QueryArray handles ?key=a&key=b
+	values = append(values, c.QueryArray(singular)...)
+	// 2. Plural comma-separated key
+	if raw := strings.TrimSpace(c.Query(plural)); raw != "" {
+		values = append(values, strings.Split(raw, ",")...)
+	}
+	// 3. Single singular value (QueryArray already covered this, but be safe)
+	if raw := strings.TrimSpace(c.Query(singular)); raw != "" {
+		values = append(values, raw)
+	}
+	// Normalize: trim, deduplicate, remove empties
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, raw := range values {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if _, ok := seen[lower]; ok {
+			continue
+		}
+		seen[lower] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
 }
 
 func (h *Handler) GetAuthFileGroupTrend(c *gin.Context) {

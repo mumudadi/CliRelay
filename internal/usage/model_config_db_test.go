@@ -48,6 +48,14 @@ func TestInitDBSeedsDefaultModelConfigs(t *testing.T) {
 	if _, ok := GetModelOwnerPreset("openai"); !ok {
 		t.Fatal("expected openai owner preset")
 	}
+
+	opencodeModel, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected opencode-go qwen3.5-plus to be seeded")
+	}
+	if opencodeModel.OwnedBy != "opencode" || opencodeModel.Source != "seed" {
+		t.Fatalf("unexpected opencode-go seed model config: %+v", opencodeModel)
+	}
 }
 
 func TestUpsertModelConfigAndPerCallCost(t *testing.T) {

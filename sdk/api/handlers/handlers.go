@@ -1045,6 +1045,16 @@ func (h *BaseAPIHandler) getRequestDetails(ctx context.Context, modelName string
 		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
 
+	// Reconstruct the returned model name from parsed result to ensure trailing
+	// [...] context window markers (e.g., "[1M]", "[128K]") are stripped, even
+	// when they appear before a thinking suffix (e.g., "model[1M](8192)").
+	// Round bracket thinking suffixes are preserved for existing thinking config.
+	if parsed.HasSuffix {
+		resolvedModelName = parsed.ModelName + "(" + parsed.RawSuffix + ")"
+	} else {
+		resolvedModelName = parsed.ModelName
+	}
+
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
