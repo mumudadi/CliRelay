@@ -153,6 +153,9 @@ func SyncOpenRouterModelList(ctx context.Context, models []OpenRouterRemoteModel
 		}
 		result.Added++
 	}
+	if err := openRouterMergeVariantGroups(models); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
@@ -417,8 +420,8 @@ func openRouterLocalModelID(remoteModelID, owner string) string {
 	modelID := openRouterProviderlessModelID(remoteModelID)
 	if normalizeModelOwnerValue(owner) == "anthropic" {
 		modelID = strings.ReplaceAll(modelID, ".", "-")
-		modelID = openRouterStripAnthropicReleaseDate(modelID)
 	}
+	modelID = openRouterStripDateSuffix(modelID)
 	return modelID
 }
 
@@ -430,9 +433,32 @@ func openRouterProviderlessModelID(remoteModelID string) string {
 	return modelID
 }
 
-func openRouterStripAnthropicReleaseDate(modelID string) string {
+func openRouterStripDateSuffix(modelID string) string {
 	modelID = strings.TrimSpace(modelID)
-	if !strings.HasPrefix(modelID, "claude-") || len(modelID) <= 9 {
+	if modelID == "" {
+		return modelID
+	}
+	// Iteratively strip known date/version suffixes from the tail.
+	// This handles models like qwen3.5-plus-20260420 → qwen3.5-plus
+	// or qwen3.5-plus-02-15 → qwen3.5-plus. Must NOT strip semantic suffixes
+	// like -thinking, -max, -turbo, -preview, -v2, etc.
+	for {
+		stripped := stripTrailing8DigitDate(modelID)
+		if stripped == modelID {
+			stripped = stripTrailingSegmentedDate(modelID)
+		}
+		if stripped == modelID {
+			break
+		}
+		modelID = stripped
+	}
+	return modelID
+}
+
+// stripTrailing8DigitDate strips a trailing -YYYYMMDD suffix (8 digits, preceded by a dash).
+// Example: "qwen3.5-plus-20260420" → "qwen3.5-plus", "claude-3-5-haiku-20241022" → "claude-3-5-haiku"
+func stripTrailing8DigitDate(modelID string) string {
+	if len(modelID) < 10 { // need at least "a-12345678" (1 char + dash + 8 digits)
 		return modelID
 	}
 	dateStart := len(modelID) - 8
@@ -445,6 +471,46 @@ func openRouterStripAnthropicReleaseDate(modelID string) string {
 		}
 	}
 	return modelID[:dateStart-1]
+}
+
+// stripTrailingSegmentedDate strips trailing date patterns like -MM-DD or -YYYY-MM-DD.
+// Examples: "qwen3.5-plus-02-15" → "qwen3.5-plus", "model-2026-04-20" → "model"
+func stripTrailingSegmentedDate(modelID string) string {
+	// Reconstruct to find the last segment
+	parts := strings.Split(modelID, "-")
+	if len(parts) < 3 {
+		return modelID
+	}
+	tail2 := parts[len(parts)-2]
+	tail1 := parts[len(parts)-1]
+	// Try -YYYY-MM-DD first (3 trailing parts: 4 digits, 2 digits, 2 digits)
+	// Check before MM-DD to avoid partial stripping like "model-2026-04-20" → "model-2026".
+	if len(parts) >= 4 {
+		tail3 := parts[len(parts)-3]
+		if len(tail3) == 4 && len(tail2) == 2 && len(tail1) == 2 && isAllDigits(tail3) && isAllDigits(tail2) && isAllDigits(tail1) {
+			return strings.Join(parts[:len(parts)-3], "-")
+		}
+	}
+	// Try -MM-DD (2 trailing parts, both 2 digits)
+	if len(tail2) == 2 && len(tail1) == 2 && isAllDigits(tail2) && isAllDigits(tail1) {
+		return strings.Join(parts[:len(parts)-2], "-")
+	}
+	return modelID
+}
+
+func isAllDigits(s string) bool {
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// openRouterStripAnthropicReleaseDate is retained for backward compat in legacy alias detection.
+// New code should use openRouterStripDateSuffix instead.
+func openRouterStripAnthropicReleaseDate(modelID string) string {
+	return openRouterStripDateSuffix(modelID)
 }
 
 func openRouterLegacyLocalModelIDs(remoteModelID, owner, modelID string) []string {
@@ -467,14 +533,14 @@ func openRouterLegacyLocalModelIDs(remoteModelID, owner, modelID string) []strin
 	add(providerless)
 	if normalizeModelOwnerValue(owner) == "anthropic" {
 		add(strings.ReplaceAll(providerless, ".", "-"))
-		for _, aliasID := range openRouterExistingAnthropicReleaseDateAliasIDs(modelID) {
-			add(aliasID)
-		}
+	}
+	for _, aliasID := range openRouterExistingDateSuffixAliasIDs(modelID) {
+		add(aliasID)
 	}
 	return ids
 }
 
-func openRouterExistingAnthropicReleaseDateAliasIDs(modelID string) []string {
+func openRouterExistingDateSuffixAliasIDs(modelID string) []string {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return nil
@@ -486,11 +552,17 @@ func openRouterExistingAnthropicReleaseDateAliasIDs(modelID string) []string {
 		if aliasID == modelID || !strings.HasPrefix(aliasID, prefix) {
 			continue
 		}
-		if openRouterStripAnthropicReleaseDate(aliasID) == modelID {
+		if openRouterStripDateSuffix(aliasID) == modelID {
 			aliases = append(aliases, aliasID)
 		}
 	}
 	return aliases
+}
+
+// openRouterExistingAnthropicReleaseDateAliasIDs is retained for backward compat.
+// New code should use openRouterExistingDateSuffixAliasIDs instead.
+func openRouterExistingAnthropicReleaseDateAliasIDs(modelID string) []string {
+	return openRouterExistingDateSuffixAliasIDs(modelID)
 }
 
 func openRouterApplyModelSync(row *ModelConfigRow, model OpenRouterRemoteModel, owner string) {
@@ -531,7 +603,7 @@ func openRouterShouldSyncDescription(row ModelConfigRow) bool {
 
 func openRouterMigrateLegacyOpenRouterRow(modelID, owner string, model OpenRouterRemoteModel, legacyModelIDs []string) (bool, error) {
 	for _, legacyModelID := range legacyModelIDs {
-		if openRouterIsAnthropicReleaseDateAlias(legacyModelID, modelID) {
+		if openRouterIsDateSuffixAlias(legacyModelID, modelID) {
 			continue
 		}
 		existing, exists := GetModelConfig(legacyModelID)
@@ -553,7 +625,7 @@ func openRouterMigrateLegacyOpenRouterRow(modelID, owner string, model OpenRoute
 
 func openRouterDeleteLegacyOpenRouterRows(baseModelID string, modelIDs []string) error {
 	for _, modelID := range modelIDs {
-		if openRouterIsAnthropicReleaseDateAlias(modelID, baseModelID) {
+		if openRouterIsDateSuffixAlias(modelID, baseModelID) {
 			continue
 		}
 		existing, exists := GetModelConfig(modelID)
@@ -573,7 +645,7 @@ func openRouterSyncExistingAliasRows(baseModelID string, model OpenRouterRemoteM
 		if !exists {
 			continue
 		}
-		if existing.Source == openRouterModelSource && !openRouterIsAnthropicReleaseDateAlias(modelID, baseModelID) {
+		if existing.Source == openRouterModelSource && !openRouterIsDateSuffixAlias(modelID, baseModelID) {
 			continue
 		}
 		openRouterApplyModelSync(&existing, model, owner)
@@ -584,10 +656,125 @@ func openRouterSyncExistingAliasRows(baseModelID string, model OpenRouterRemoteM
 	return nil
 }
 
-func openRouterIsAnthropicReleaseDateAlias(modelID, baseModelID string) bool {
+func openRouterIsDateSuffixAlias(modelID, baseModelID string) bool {
 	modelID = strings.TrimSpace(modelID)
 	baseModelID = strings.TrimSpace(baseModelID)
-	return modelID != "" && baseModelID != "" && modelID != baseModelID && openRouterStripAnthropicReleaseDate(modelID) == baseModelID
+	return modelID != "" && baseModelID != "" && modelID != baseModelID && openRouterStripDateSuffix(modelID) == baseModelID
+}
+
+// openRouterIsAnthropicReleaseDateAlias is retained for backward compat.
+// New code should use openRouterIsDateSuffixAlias instead.
+func openRouterIsAnthropicReleaseDateAlias(modelID, baseModelID string) bool {
+	return openRouterIsDateSuffixAlias(modelID, baseModelID)
+}
+
+// openRouterMergeVariantGroups performs a second pass after the main sync loop.
+// It groups all remote models by their date-stripped base ID and updates existing
+// base model config rows with the highest prices and best metadata found across
+// all models that share the same base. This ensures:
+//   - When OpenRouter only returns dated/versioned variants
+//     (e.g. qwen3.5-plus-20260420), the base model (qwen3.5-plus) gets correct data.
+//   - When an exact base match AND dated variants exist in the same sync batch,
+//     the base model ends up with the highest prices from any member of the group,
+//     rather than being overwritten by the last-processed variant.
+func openRouterMergeVariantGroups(models []OpenRouterRemoteModel) error {
+	type groupEntry struct {
+		providerlessID string
+		model          OpenRouterRemoteModel
+	}
+	groups := make(map[string][]groupEntry)
+
+	for _, m := range models {
+		remoteModelID := strings.TrimSpace(m.ID)
+		if remoteModelID == "" {
+			continue
+		}
+		providerless := openRouterProviderlessModelID(remoteModelID)
+		baseID := openRouterStripDateSuffix(providerless)
+		groups[baseID] = append(groups[baseID], groupEntry{
+			providerlessID: providerless,
+			model:          m,
+		})
+	}
+
+	for baseID, entries := range groups {
+		baseModel, exists := GetModelConfig(baseID)
+		if !exists {
+			continue
+		}
+		// Skip groups with only one member — the main loop already handled it.
+		if len(entries) < 2 {
+			continue
+		}
+
+		// Aggregate: highest prices, best description, most complete modalities.
+		bestInputPrice := baseModel.InputPricePerMillion
+		bestOutputPrice := baseModel.OutputPricePerMillion
+		bestCachedPrice := baseModel.CachedPricePerMillion
+		bestModalities := struct {
+			input  []string
+			output []string
+		}{baseModel.InputModalities, baseModel.OutputModalities}
+		bestDesc := ""
+
+		for _, e := range entries {
+			price := openRouterPricePerMillion(e.model.Pricing.Prompt)
+			if price > bestInputPrice {
+				bestInputPrice = price
+			}
+			price = openRouterPricePerMillion(e.model.Pricing.Completion)
+			if price > bestOutputPrice {
+				bestOutputPrice = price
+			}
+			price = openRouterPricePerMillion(e.model.Pricing.InputCacheRead)
+			if price > bestCachedPrice {
+				bestCachedPrice = price
+			}
+			if desc := openRouterModelDescription(e.model); desc != "" && (bestDesc == "" || len(desc) > len(bestDesc)) {
+				bestDesc = desc
+			}
+			inMod, outMod := openRouterModelModalities(e.model)
+			if len(inMod) > len(bestModalities.input) {
+				bestModalities.input = inMod
+			}
+			if len(outMod) > len(bestModalities.output) {
+				bestModalities.output = outMod
+			}
+		}
+
+		// Apply the merged data back to the base model.
+		updated := false
+
+		if bestInputPrice != baseModel.InputPricePerMillion ||
+			bestOutputPrice != baseModel.OutputPricePerMillion ||
+			bestCachedPrice != baseModel.CachedPricePerMillion {
+			baseModel.PricingMode = "token"
+			baseModel.InputPricePerMillion = bestInputPrice
+			baseModel.OutputPricePerMillion = bestOutputPrice
+			baseModel.CachedPricePerMillion = bestCachedPrice
+			updated = true
+		}
+
+		if len(bestModalities.input) > len(baseModel.InputModalities) ||
+			len(bestModalities.output) > len(baseModel.OutputModalities) {
+			baseModel.InputModalities = bestModalities.input
+			baseModel.OutputModalities = bestModalities.output
+			updated = true
+		}
+
+		if bestDesc != "" && openRouterShouldSyncDescription(baseModel) {
+			baseModel.Description = bestDesc
+			updated = true
+		}
+
+		if updated {
+			if err := UpsertModelConfig(baseModel); err != nil {
+				return fmt.Errorf("merge variant group for %s: %w", baseID, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func ownerMatchesOpenRouterAliasPrefix(owner, cleanOwner string) bool {

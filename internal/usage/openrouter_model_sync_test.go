@@ -441,3 +441,355 @@ func TestOpenRouterPricePerMillionRoundsFloatArtifacts(t *testing.T) {
 		t.Fatalf("expected clean per-million price, got %.17g", got)
 	}
 }
+
+func TestOpenRouterStripDateSuffix(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"qwen3.5-plus-20260420", "qwen3.5-plus"},
+		{"claude-3-5-haiku-20241022", "claude-3-5-haiku"},
+		{"deepseek-r1-20250101", "deepseek-r1"},
+		{"qwen3.5-plus-02-15", "qwen3.5-plus"},
+		{"model-name-12-31", "model-name"},
+		{"model-2026-04-20", "model"},
+		{"test-2025-01-01", "test"},
+		{"qwen3.5-plus", "qwen3.5-plus"},
+		{"qwen3.5-plus-thinking", "qwen3.5-plus-thinking"},
+		{"qwen3.5-max", "qwen3.5-max"},
+		{"gpt-4-turbo", "gpt-4-turbo"},
+		{"gpt-4o", "gpt-4o"},
+		{"deepseek-r1", "deepseek-r1"},
+		{"", ""},
+		{"model-v2", "model-v2"},
+		{"claude-3-5-haiku", "claude-3-5-haiku"},
+	}
+	for _, tt := range tests {
+		got := openRouterStripDateSuffix(tt.input)
+		if got != tt.expected {
+			t.Errorf("openRouterStripDateSuffix(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+// seedBaseModelForTest creates a base model with zero pricing so variant-merging
+// tests can verify that the base is updated correctly.
+func seedBaseModelForTest(t *testing.T, modelID, owner string) {
+	t.Helper()
+	if err := UpsertModelConfig(ModelConfigRow{
+		ModelID:               modelID,
+		OwnedBy:               owner,
+		Description:           "",
+		Enabled:               true,
+		PricingMode:           "token",
+		InputPricePerMillion:  0,
+		OutputPricePerMillion: 0,
+		Source:                "seed",
+	}); err != nil {
+		t.Fatalf("UpsertModelConfig(%s) error = %v", modelID, err)
+	}
+}
+
+func TestSyncOpenRouterModelsQwen8DigitDateSuffixUpdatesBaseModel(t *testing.T) {
+	initModelConfigTestDB(t)
+	seedBaseModelForTest(t, "qwen3.5-plus", "qwen")
+
+	baseModel, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to exist after seeding")
+	}
+	if baseModel.InputPricePerMillion != 0 || baseModel.OutputPricePerMillion != 0 {
+		t.Fatalf("expected seeded qwen3.5-plus to have zero pricing, got %+v", baseModel)
+	}
+
+	result, err := SyncOpenRouterModelList(context.Background(), []OpenRouterRemoteModel{
+		{
+			ID:          "qwen/qwen3.5-plus-20260420",
+			Name:        "Qwen 3.5 Plus (2026-04-20)",
+			Description: "Qwen 3.5 Plus with 8-digit date suffix",
+			Architecture: OpenRouterRemoteArchitecture{
+				Modality:         "text+image->text",
+				InputModalities:  []string{"text", "image"},
+				OutputModalities: []string{"text"},
+			},
+			Pricing: OpenRouterRemotePricing{
+				Prompt:         "0.00000175",
+				Completion:     "0.000014",
+				InputCacheRead: "0.000000175",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncOpenRouterModelList() error = %v", err)
+	}
+	if result.Seen != 1 || result.Added != 0 || result.Updated != 1 || result.Skipped != 0 {
+		t.Fatalf("unexpected sync result: %+v", result)
+	}
+
+	updated, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to still exist")
+	}
+	if updated.InputPricePerMillion != 1.75 || updated.OutputPricePerMillion != 14 || updated.CachedPricePerMillion != 0.175 {
+		t.Fatalf("expected qwen3.5-plus pricing to be synced from variant, got %+v", updated)
+	}
+	if strings.Join(updated.InputModalities, ",") != "text,image" || strings.Join(updated.OutputModalities, ",") != "text" {
+		t.Fatalf("expected qwen3.5-plus modalities to be synced from variant, got input=%v output=%v",
+			updated.InputModalities, updated.OutputModalities)
+	}
+	if updated.Description != "Qwen 3.5 Plus with 8-digit date suffix" {
+		t.Fatalf("expected qwen3.5-plus description to be synced from variant, got %q", updated.Description)
+	}
+	if updated.OwnedBy != "qwen" {
+		t.Fatalf("expected qwen3.5-plus owner to be qwen, got %q", updated.OwnedBy)
+	}
+}
+
+func TestSyncOpenRouterModelsQwenSegmentedDateSuffixUpdatesBaseModel(t *testing.T) {
+	initModelConfigTestDB(t)
+	seedBaseModelForTest(t, "qwen3.5-plus", "qwen")
+
+	_, err := SyncOpenRouterModelList(context.Background(), []OpenRouterRemoteModel{
+		{
+			ID:          "qwen/qwen3.5-plus-02-15",
+			Name:        "Qwen 3.5 Plus (Feb 15)",
+			Description: "Qwen 3.5 Plus with MM-DD suffix",
+			Architecture: OpenRouterRemoteArchitecture{
+				Modality: "text->text",
+			},
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000002",
+				Completion: "0.000015",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncOpenRouterModelList() error = %v", err)
+	}
+
+	updated, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to exist")
+	}
+	if updated.InputPricePerMillion != 2 || updated.OutputPricePerMillion != 15 {
+		t.Fatalf("expected qwen3.5-plus pricing from MM-DD variant, got %+v", updated)
+	}
+}
+
+func TestSyncOpenRouterModelsVariantGroupHighestPricing(t *testing.T) {
+	initModelConfigTestDB(t)
+
+	// Both variants map to the same base qwen3.5-plus. The first sync creates the
+	// base row; the merge pass aggregates the highest prices from both variants.
+	result, err := SyncOpenRouterModelList(context.Background(), []OpenRouterRemoteModel{
+		{
+			ID:          "qwen/qwen3.5-plus-20260420",
+			Name:        "High price variant",
+			Description: "Qwen 3.5 Plus high price",
+			Architecture: OpenRouterRemoteArchitecture{
+				Modality: "text+image->text",
+			},
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000003",
+				Completion: "0.000020",
+			},
+		},
+		{
+			ID:          "qwen/qwen3.5-plus-02-15",
+			Name:        "Low price variant",
+			Description: "Qwen 3.5 Plus low price",
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000001",
+				Completion: "0.000008",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncOpenRouterModelList() error = %v", err)
+	}
+	if result.Seen != 2 || result.Updated < 1 {
+		t.Fatalf("expected 2 seen and at least 1 updated, got %+v", result)
+	}
+
+	updated, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to exist")
+	}
+	if updated.InputPricePerMillion != 3 {
+		t.Fatalf("expected highest input price (3), got %v", updated.InputPricePerMillion)
+	}
+	if updated.OutputPricePerMillion != 20 {
+		t.Fatalf("expected highest output price (20), got %v", updated.OutputPricePerMillion)
+	}
+}
+
+func TestSyncOpenRouterModelsVariantGroupTwoVariantsSecondHasHigherCachedPrice(t *testing.T) {
+	initModelConfigTestDB(t)
+
+	_, err := SyncOpenRouterModelList(context.Background(), []OpenRouterRemoteModel{
+		{
+			ID:          "qwen/qwen3.5-plus-20260420",
+			Description: "Qwen 3.5 Plus v1",
+			Pricing: OpenRouterRemotePricing{
+				Prompt:         "0.000003",
+				Completion:     "0.000020",
+				InputCacheRead: "0.0000001",
+			},
+		},
+		{
+			ID:          "qwen/qwen3.5-plus-02-15",
+			Description: "Qwen 3.5 Plus v2",
+			Pricing: OpenRouterRemotePricing{
+				Prompt:         "0.000001",
+				Completion:     "0.000008",
+				InputCacheRead: "0.0000005",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncOpenRouterModelList() error = %v", err)
+	}
+
+	updated, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to exist")
+	}
+	if updated.InputPricePerMillion != 3 {
+		t.Fatalf("expected input price 3 (from variant 1), got %v", updated.InputPricePerMillion)
+	}
+	if updated.OutputPricePerMillion != 20 {
+		t.Fatalf("expected output price 20 (from variant 1), got %v", updated.OutputPricePerMillion)
+	}
+	if updated.CachedPricePerMillion != 0.5 {
+		t.Fatalf("expected cached price 0.5 (from variant 2), got %v", updated.CachedPricePerMillion)
+	}
+}
+
+func TestSyncOpenRouterModelsPreservesNonDateSuffix(t *testing.T) {
+	initModelConfigTestDB(t)
+	seedBaseModelForTest(t, "qwen3.5-plus", "qwen")
+
+	result, err := SyncOpenRouterModelList(context.Background(), []OpenRouterRemoteModel{
+		{
+			ID:          "qwen/qwen3.5-plus-thinking",
+			Description: "Qwen 3.5 Plus Thinking",
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000002",
+				Completion: "0.000010",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncOpenRouterModelList() error = %v", err)
+	}
+	if result.Seen != 1 || result.Added != 1 {
+		t.Fatalf("expected qwen3.5-plus-thinking to be added as new model, got %+v", result)
+	}
+	if _, ok := GetModelConfig("qwen3.5-plus-thinking"); !ok {
+		t.Fatal("expected qwen3.5-plus-thinking to exist")
+	}
+	base, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to exist")
+	}
+	if base.InputPricePerMillion != 0 || base.OutputPricePerMillion != 0 {
+		t.Fatalf("expected qwen3.5-plus pricing to remain zero (not affected by -thinking variant), got %+v", base)
+	}
+}
+
+func TestSyncOpenRouterModelsExactBaseMatchBeforeVariant(t *testing.T) {
+	initModelConfigTestDB(t)
+
+	// The exact-match Qwen model creates qwen3.5-plus first, then the variant
+	// overwrites. The merge pass restores the higher prices from the exact match.
+	result, err := SyncOpenRouterModelList(context.Background(), []OpenRouterRemoteModel{
+		{
+			ID:          "chat/qwen3.5-plus",
+			Name:        "Qwen 3.5 Plus (exact)",
+			Description: "Exact match description",
+			Architecture: OpenRouterRemoteArchitecture{
+				Modality: "text+image->text",
+			},
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000003",
+				Completion: "0.000020",
+			},
+		},
+		{
+			ID:          "qwen/qwen3.5-plus-20260420",
+			Name:        "Qwen 3.5 Plus (dated)",
+			Description: "Lower price dated variant",
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000001",
+				Completion: "0.000008",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncOpenRouterModelList() error = %v", err)
+	}
+	// First model: exact match → modelID="qwen3.5-plus" (no strip) → added=1
+	// Second model: variant → modelID="qwen3.5-plus" (stripped) → updated=1
+	if result.Seen != 2 || result.Added != 1 || result.Updated < 1 {
+		t.Fatalf("unexpected sync result: %+v", result)
+	}
+
+	updated, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to exist")
+	}
+	if updated.InputPricePerMillion != 3 || updated.OutputPricePerMillion != 20 {
+		t.Fatalf("expected highest pricing across both variants, got input=%v output=%v (expected 3, 20)",
+			updated.InputPricePerMillion, updated.OutputPricePerMillion)
+	}
+}
+
+func TestSyncOpenRouterModelsUserDescriptionNotOverwrittenByVariantMerge(t *testing.T) {
+	initModelConfigTestDB(t)
+
+	if err := UpsertModelConfig(ModelConfigRow{
+		ModelID:               "qwen3.5-plus",
+		OwnedBy:               "custom-owner",
+		Description:           "User defined description",
+		Enabled:               true,
+		PricingMode:           "token",
+		InputPricePerMillion:  5,
+		OutputPricePerMillion: 10,
+		Source:                "user",
+	}); err != nil {
+		t.Fatalf("UpsertModelConfig() error = %v", err)
+	}
+
+	_, err := SyncOpenRouterModelList(context.Background(), []OpenRouterRemoteModel{
+		{
+			ID:          "qwen/qwen3.5-plus-20260420",
+			Description: "OpenRouter variant description",
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000002",
+				Completion: "0.000015",
+			},
+		},
+		{
+			ID:          "qwen/qwen3.5-plus-02-15",
+			Description: "Another variant description",
+			Pricing: OpenRouterRemotePricing{
+				Prompt:     "0.000003",
+				Completion: "0.000020",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncOpenRouterModelList() error = %v", err)
+	}
+
+	model, ok := GetModelConfig("qwen3.5-plus")
+	if !ok {
+		t.Fatal("expected qwen3.5-plus to exist")
+	}
+	if model.Description != "User defined description" {
+		t.Fatalf("user description should NOT be overwritten by variant merge, got %q", model.Description)
+	}
+	if model.Source != "user" {
+		t.Fatalf("user source should be preserved, got %q", model.Source)
+	}
+}
