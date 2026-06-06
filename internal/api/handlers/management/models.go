@@ -60,13 +60,13 @@ type modelConfigPayload struct {
 	InputModalities  *[]string `json:"input_modalities"`
 	OutputModalities *[]string `json:"output_modalities"`
 	Pricing          struct {
-		Mode                    string  `json:"mode"`
-		InputPricePerMillion    float64 `json:"input_price_per_million"`
-		OutputPricePerMillion   float64 `json:"output_price_per_million"`
-		CachedPricePerMillion   float64 `json:"cached_price_per_million"`
+		Mode                      string  `json:"mode"`
+		InputPricePerMillion      float64 `json:"input_price_per_million"`
+		OutputPricePerMillion     float64 `json:"output_price_per_million"`
+		CachedPricePerMillion     float64 `json:"cached_price_per_million"`
 		CacheReadPricePerMillion  float64 `json:"cache_read_price_per_million"`
 		CacheWritePricePerMillion float64 `json:"cache_write_price_per_million"`
-		PricePerCall            float64 `json:"price_per_call"`
+		PricePerCall              float64 `json:"price_per_call"`
 	} `json:"pricing"`
 }
 
@@ -77,13 +77,13 @@ func modelConfigResponse(row usage.ModelConfigRow) map[string]any {
 		"description": row.Description,
 		"enabled":     row.Enabled,
 		"pricing": map[string]any{
-			"mode":                       row.PricingMode,
-			"input_price_per_million":    row.InputPricePerMillion,
-			"output_price_per_million":   row.OutputPricePerMillion,
-			"cached_price_per_million":   row.CachedPricePerMillion,
+			"mode":                          row.PricingMode,
+			"input_price_per_million":       row.InputPricePerMillion,
+			"output_price_per_million":      row.OutputPricePerMillion,
+			"cached_price_per_million":      row.CachedPricePerMillion,
 			"cache_read_price_per_million":  row.CacheReadPricePerMillion,
 			"cache_write_price_per_million": row.CacheWritePricePerMillion,
-			"price_per_call":             row.PricePerCall,
+			"price_per_call":                row.PricePerCall,
 		},
 		"source":     row.Source,
 		"updated_at": row.UpdatedAt,
@@ -335,18 +335,18 @@ func modelConfigPayloadToRow(payload modelConfigPayload, scope string) usage.Mod
 		source = "seed"
 	}
 	row := usage.ModelConfigRow{
-		ModelID:                 strings.TrimSpace(payload.ID),
-		OwnedBy:                 strings.TrimSpace(payload.OwnedBy),
-		Description:             strings.TrimSpace(payload.Description),
-		Enabled:                 payload.Enabled,
-		PricingMode:             strings.TrimSpace(payload.Pricing.Mode),
-		InputPricePerMillion:    payload.Pricing.InputPricePerMillion,
-		OutputPricePerMillion:   payload.Pricing.OutputPricePerMillion,
-		CachedPricePerMillion:   payload.Pricing.CachedPricePerMillion,
+		ModelID:                   strings.TrimSpace(payload.ID),
+		OwnedBy:                   strings.TrimSpace(payload.OwnedBy),
+		Description:               strings.TrimSpace(payload.Description),
+		Enabled:                   payload.Enabled,
+		PricingMode:               strings.TrimSpace(payload.Pricing.Mode),
+		InputPricePerMillion:      payload.Pricing.InputPricePerMillion,
+		OutputPricePerMillion:     payload.Pricing.OutputPricePerMillion,
+		CachedPricePerMillion:     payload.Pricing.CachedPricePerMillion,
 		CacheReadPricePerMillion:  payload.Pricing.CacheReadPricePerMillion,
 		CacheWritePricePerMillion: payload.Pricing.CacheWritePricePerMillion,
-		PricePerCall:            payload.Pricing.PricePerCall,
-		Source:                  source,
+		PricePerCall:              payload.Pricing.PricePerCall,
+		Source:                    source,
 	}
 	if payload.InputModalities != nil {
 		row.InputModalities = *payload.InputModalities
@@ -459,13 +459,13 @@ func (h *Handler) GetConfiguredModelAvailability(c *gin.Context) {
 		if row, ok := configByID[strings.ToLower(id)]; ok {
 			attachModelConfigCapabilities(entry, row)
 			entry["pricing"] = map[string]any{
-				"mode":                       row.PricingMode,
-				"input_price_per_million":    row.InputPricePerMillion,
-				"output_price_per_million":   row.OutputPricePerMillion,
-				"cached_price_per_million":   row.CachedPricePerMillion,
+				"mode":                          row.PricingMode,
+				"input_price_per_million":       row.InputPricePerMillion,
+				"output_price_per_million":      row.OutputPricePerMillion,
+				"cached_price_per_million":      row.CachedPricePerMillion,
 				"cache_read_price_per_million":  row.CacheReadPricePerMillion,
 				"cache_write_price_per_million": row.CacheWritePricePerMillion,
-				"price_per_call":             row.PricePerCall,
+				"price_per_call":                row.PricePerCall,
 			}
 			if row.Description != "" {
 				entry["description"] = row.Description
@@ -829,13 +829,13 @@ func (h *Handler) GetModelPricing(c *gin.Context) {
 	items := make([]map[string]any, 0, len(pricingMap))
 	for _, row := range pricingMap {
 		items = append(items, map[string]any{
-			"model_id":                    row.ModelID,
-			"input_price_per_million":     row.InputPricePerMillion,
-			"output_price_per_million":    row.OutputPricePerMillion,
-			"cached_price_per_million":    row.CachedPricePerMillion,
+			"model_id":                      row.ModelID,
+			"input_price_per_million":       row.InputPricePerMillion,
+			"output_price_per_million":      row.OutputPricePerMillion,
+			"cached_price_per_million":      row.CachedPricePerMillion,
 			"cache_read_price_per_million":  row.CacheReadPricePerMillion,
 			"cache_write_price_per_million": row.CacheWritePricePerMillion,
-			"updated_at":                  row.UpdatedAt,
+			"updated_at":                    row.UpdatedAt,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
@@ -851,10 +851,10 @@ func (h *Handler) GetModelPricing(c *gin.Context) {
 func (h *Handler) PutModelPricing(c *gin.Context) {
 	var body struct {
 		Items []struct {
-			ModelID               string  `json:"model_id"`
-			InputPricePerMillion  float64 `json:"input_price_per_million"`
-			OutputPricePerMillion float64 `json:"output_price_per_million"`
-			CachedPricePerMillion float64 `json:"cached_price_per_million"`
+			ModelID                   string  `json:"model_id"`
+			InputPricePerMillion      float64 `json:"input_price_per_million"`
+			OutputPricePerMillion     float64 `json:"output_price_per_million"`
+			CachedPricePerMillion     float64 `json:"cached_price_per_million"`
 			CacheReadPricePerMillion  float64 `json:"cache_read_price_per_million"`
 			CacheWritePricePerMillion float64 `json:"cache_write_price_per_million"`
 		} `json:"items"`

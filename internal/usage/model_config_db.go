@@ -14,21 +14,21 @@ import (
 )
 
 type ModelConfigRow struct {
-	ModelID                 string   `json:"model_id"`
-	OwnedBy                 string   `json:"owned_by"`
-	Description             string   `json:"description"`
-	Enabled                 bool     `json:"enabled"`
-	InputModalities         []string `json:"input_modalities,omitempty"`
-	OutputModalities        []string `json:"output_modalities,omitempty"`
-	PricingMode             string   `json:"pricing_mode"`
-	InputPricePerMillion    float64  `json:"input_price_per_million"`
-	OutputPricePerMillion   float64  `json:"output_price_per_million"`
-	CachedPricePerMillion   float64  `json:"cached_price_per_million"`
-	CacheReadPricePerMillion  float64 `json:"cache_read_price_per_million,omitempty"`
-	CacheWritePricePerMillion float64 `json:"cache_write_price_per_million,omitempty"`
-	PricePerCall            float64  `json:"price_per_call"`
-	Source                  string   `json:"source"`
-	UpdatedAt               string   `json:"updated_at"`
+	ModelID                   string   `json:"model_id"`
+	OwnedBy                   string   `json:"owned_by"`
+	Description               string   `json:"description"`
+	Enabled                   bool     `json:"enabled"`
+	InputModalities           []string `json:"input_modalities,omitempty"`
+	OutputModalities          []string `json:"output_modalities,omitempty"`
+	PricingMode               string   `json:"pricing_mode"`
+	InputPricePerMillion      float64  `json:"input_price_per_million"`
+	OutputPricePerMillion     float64  `json:"output_price_per_million"`
+	CachedPricePerMillion     float64  `json:"cached_price_per_million"`
+	CacheReadPricePerMillion  float64  `json:"cache_read_price_per_million,omitempty"`
+	CacheWritePricePerMillion float64  `json:"cache_write_price_per_million,omitempty"`
+	PricePerCall              float64  `json:"price_per_call"`
+	Source                    string   `json:"source"`
+	UpdatedAt                 string   `json:"updated_at"`
 }
 
 type ModelOwnerPresetRow struct {

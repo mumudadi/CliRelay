@@ -12,13 +12,13 @@ import (
 
 // ModelPricingRow represents a single model's pricing configuration.
 type ModelPricingRow struct {
-	ModelID                 string  `json:"model_id"`
-	InputPricePerMillion    float64 `json:"input_price_per_million"`
-	OutputPricePerMillion   float64 `json:"output_price_per_million"`
-	CachedPricePerMillion   float64 `json:"cached_price_per_million"`
+	ModelID                   string  `json:"model_id"`
+	InputPricePerMillion      float64 `json:"input_price_per_million"`
+	OutputPricePerMillion     float64 `json:"output_price_per_million"`
+	CachedPricePerMillion     float64 `json:"cached_price_per_million"`
 	CacheReadPricePerMillion  float64 `json:"cache_read_price_per_million,omitempty"`
 	CacheWritePricePerMillion float64 `json:"cache_write_price_per_million,omitempty"`
-	UpdatedAt               string  `json:"updated_at"`
+	UpdatedAt                 string  `json:"updated_at"`
 }
 
 const createPricingTableSQL = `
@@ -130,13 +130,13 @@ func UpsertModelPricingV2(modelID string, input, output, cached, cacheRead, cach
 		pricingCache = make(map[string]ModelPricingRow)
 	}
 	pricingCache[modelID] = ModelPricingRow{
-		ModelID:                 modelID,
-		InputPricePerMillion:    input,
-		OutputPricePerMillion:   output,
-		CachedPricePerMillion:   cached,
+		ModelID:                   modelID,
+		InputPricePerMillion:      input,
+		OutputPricePerMillion:     output,
+		CachedPricePerMillion:     cached,
 		CacheReadPricePerMillion:  cacheRead,
 		CacheWritePricePerMillion: cacheWrite,
-		UpdatedAt:               now,
+		UpdatedAt:                 now,
 	}
 	pricingCacheMu.Unlock()
 	upsertLegacyPricingIntoModelConfig(db, modelID, input, output, cached, now)

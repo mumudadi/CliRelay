@@ -70,12 +70,12 @@ func TestCalculateCostV2CacheReadIncludedInInput(t *testing.T) {
 	initModelConfigTestDB(t)
 
 	if err := UpsertModelConfig(ModelConfigRow{
-		ModelID:                 "openai-cache-model",
-		Enabled:                 true,
-		PricingMode:             "token",
-		InputPricePerMillion:    10,
-		OutputPricePerMillion:   20,
-		CachedPricePerMillion:   1.5,
+		ModelID:                  "openai-cache-model",
+		Enabled:                  true,
+		PricingMode:              "token",
+		InputPricePerMillion:     10,
+		OutputPricePerMillion:    20,
+		CachedPricePerMillion:    1.5,
 		CacheReadPricePerMillion: 0.5,
 	}); err != nil {
 		t.Fatalf("UpsertModelConfig() error = %v", err)
@@ -105,11 +105,11 @@ func TestCalculateCostV2CacheReadSeparate(t *testing.T) {
 	initModelConfigTestDB(t)
 
 	if err := UpsertModelConfig(ModelConfigRow{
-		ModelID:                 "claude-cache-model",
-		Enabled:                 true,
-		PricingMode:             "token",
-		InputPricePerMillion:    10,
-		OutputPricePerMillion:   20,
+		ModelID:                  "claude-cache-model",
+		Enabled:                  true,
+		PricingMode:              "token",
+		InputPricePerMillion:     10,
+		OutputPricePerMillion:    20,
 		CacheReadPricePerMillion: 0.3,
 	}); err != nil {
 		t.Fatalf("UpsertModelConfig() error = %v", err)
@@ -138,21 +138,21 @@ func TestCalculateCostV2CacheWriteOnly(t *testing.T) {
 	initModelConfigTestDB(t)
 
 	if err := UpsertModelConfig(ModelConfigRow{
-		ModelID:                  "creation-model",
-		Enabled:                  true,
-		PricingMode:              "token",
-		InputPricePerMillion:     10,
-		OutputPricePerMillion:    20,
+		ModelID:                   "creation-model",
+		Enabled:                   true,
+		PricingMode:               "token",
+		InputPricePerMillion:      10,
+		OutputPricePerMillion:     20,
 		CacheWritePricePerMillion: 5,
 	}); err != nil {
 		t.Fatalf("UpsertModelConfig() error = %v", err)
 	}
 
 	tokens := TokenStats{
-		InputTokens:     1000,
-		OutputTokens:    500,
+		InputTokens:      1000,
+		OutputTokens:     500,
 		CacheWriteTokens: 800,
-		CachedTokens:    800,
+		CachedTokens:     800,
 	}
 
 	cost := CalculateCostV2("creation-model", tokens)
@@ -170,12 +170,12 @@ func TestCalculateCostV2CacheReadAndWriteBothPresent(t *testing.T) {
 	initModelConfigTestDB(t)
 
 	if err := UpsertModelConfig(ModelConfigRow{
-		ModelID:                  "claude-both-cache-model",
-		Enabled:                  true,
-		PricingMode:              "token",
-		InputPricePerMillion:     10,
-		OutputPricePerMillion:    20,
-		CachedPricePerMillion:    0.3,
+		ModelID:                   "claude-both-cache-model",
+		Enabled:                   true,
+		PricingMode:               "token",
+		InputPricePerMillion:      10,
+		OutputPricePerMillion:     20,
+		CachedPricePerMillion:     0.3,
 		CacheReadPricePerMillion:  0.3,
 		CacheWritePricePerMillion: 8,
 	}); err != nil {
@@ -183,11 +183,11 @@ func TestCalculateCostV2CacheReadAndWriteBothPresent(t *testing.T) {
 	}
 
 	tokens := TokenStats{
-		InputTokens:     1000,
-		OutputTokens:    500,
+		InputTokens:      1000,
+		OutputTokens:     500,
 		CacheReadTokens:  700,
 		CacheWriteTokens: 300,
-		CachedTokens:    700,
+		CachedTokens:     700,
 	}
 
 	cost := CalculateCostV2("claude-both-cache-model", tokens)

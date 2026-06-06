@@ -62,9 +62,11 @@ bun run check
 - 页面主文件目标：`400-600` 行
 - 告警阈值：`> 800` 行
 - 阻塞阈值：`> 1200` 行
+- 后端结构基线与 allowlist 见 [`backend-structure-baseline.md`](backend-structure-baseline.md)。
 
 配套扫描脚本：
 
 ```bash
 /Users/kittors/Developer/opensource/CliProxy/scripts/scan-large-files.sh
+python3 scripts/check-backend-structure.py
 ```
