@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -121,7 +120,8 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 
 // Upload auth file: multipart or raw JSON with ?name=
 func (h *Handler) UploadAuthFile(c *gin.Context) {
-	if h.authManager == nil {
+	service := newAuthFileUploadService(h)
+	if !service.Available() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
@@ -144,35 +144,39 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file too large"})
 			return
 		}
-		name, errValidate := managementauthfiles.ValidateUploadedFileName(file.Filename)
-		if errValidate != nil {
-			c.JSON(400, gin.H{"error": errValidate.Error()})
+		if _, errValidate := service.ValidateMultipartFilename(file.Filename); errValidate != nil {
+			writeAuthFileUploadError(c, errValidate)
 			return
 		}
-		dst := managementauthfiles.FilePath(h.cfg.AuthDir, name)
-		if errSave := c.SaveUploadedFile(file, dst); errSave != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to save file: %v", errSave)})
+		src, errOpen := file.Open()
+		if errOpen != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read file: %v", errOpen)})
 			return
 		}
-		data, errRead := os.ReadFile(dst)
+		defer func() {
+			if errClose := src.Close(); errClose != nil {
+				log.WithError(errClose).Warn("failed to close uploaded auth file")
+			}
+		}()
+		data, errRead := bodyutil.ReadAll(src, bodyutil.AuthFileBodyLimit)
 		if errRead != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read saved file: %v", errRead)})
+			if bodyutil.IsTooLarge(errRead) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file too large"})
+				return
+			}
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read file: %v", errRead)})
 			return
 		}
-		if errReg := h.registerAuthFromFile(ctx, dst, data); errReg != nil {
-			c.JSON(500, gin.H{"error": errReg.Error()})
-			return
-		}
-		if errPersist := h.persistAuthFileChange(ctx, "Update auth "+name, dst); errPersist != nil {
-			c.JSON(500, gin.H{"error": errPersist.Error()})
+		if _, errUpload := service.UploadMultipart(ctx, file.Filename, data); errUpload != nil {
+			writeAuthFileUploadError(c, errUpload)
 			return
 		}
 		c.JSON(200, gin.H{"status": "ok"})
 		return
 	}
-	name, errValidate := managementauthfiles.ValidateFileQueryName(c.Query("name"), true)
+	rawName, errValidate := service.ValidateRawName(c.Query("name"))
 	if errValidate != nil {
-		c.JSON(400, gin.H{"error": errValidate.Error()})
+		writeAuthFileUploadError(c, errValidate)
 		return
 	}
 	data, err := bodyutil.ReadRequestBody(c, bodyutil.AuthFileBodyLimit)
@@ -184,17 +188,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	dst := managementauthfiles.FilePath(h.cfg.AuthDir, name)
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to write file: %v", errWrite)})
-		return
-	}
-	if err = h.registerAuthFromFile(ctx, dst, data); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	if errPersist := h.persistAuthFileChange(ctx, "Update auth "+filepath.Base(name), dst); errPersist != nil {
-		c.JSON(500, gin.H{"error": errPersist.Error()})
+	if _, errUpload := service.UploadRaw(ctx, rawName, data); errUpload != nil {
+		writeAuthFileUploadError(c, errUpload)
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -257,6 +252,33 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 		Manager: h.authManager,
 		AuthDir: authDir,
 	}.RegisterFile(ctx, path, data)
+}
+
+func newAuthFileUploadService(h *Handler) managementauthfiles.UploadService {
+	authDir := ""
+	if h != nil && h.cfg != nil {
+		authDir = h.cfg.AuthDir
+	}
+	var manager *coreauth.Manager
+	if h != nil {
+		manager = h.authManager
+	}
+	return managementauthfiles.UploadService{
+		AuthDir:    authDir,
+		Manager:    manager,
+		Repository: h.authFileRepository(),
+	}
+}
+
+func writeAuthFileUploadError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, managementauthfiles.ErrAuthManagerUnavailable):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+	case managementauthfiles.IsUploadValidationError(err):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	}
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
