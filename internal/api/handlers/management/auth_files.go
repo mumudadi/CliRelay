@@ -29,6 +29,7 @@ import (
 	claudeprovider "github.com/router-for-me/CLIProxyAPI/v6/internal/management/oauth/providers/claude"
 	codexprovider "github.com/router-for-me/CLIProxyAPI/v6/internal/management/oauth/providers/codex"
 	geminicli "github.com/router-for-me/CLIProxyAPI/v6/internal/management/oauth/providers/geminicli"
+	qwenprovider "github.com/router-for-me/CLIProxyAPI/v6/internal/management/oauth/providers/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -1415,14 +1416,7 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 		// Create token storage
 		tokenStorage := qwenAuth.CreateTokenStorage(tokenData)
 
-		tokenStorage.Email = fmt.Sprintf("%d", time.Now().UnixMilli())
-		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Provider: "qwen",
-			FileName: fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
-		}
+		record := qwenprovider.RecordFromTokenStorage(tokenStorage, time.Now())
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
