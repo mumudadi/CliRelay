@@ -17,7 +17,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
-	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	managementauthfiles "github.com/router-for-me/CLIProxyAPI/v6/internal/management/authfiles"
 	oauthcallback "github.com/router-for-me/CLIProxyAPI/v6/internal/management/oauth/callback"
@@ -1063,92 +1062,36 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 func (h *Handler) RequestIFlowToken(c *gin.Context) {
 	ctx := detachedAuthContext(c)
 
-	fmt.Println("Initializing iFlow authentication...")
-
-	state := fmt.Sprintf("ifl-%d", time.Now().UnixNano())
-	authSvc := iflowauth.NewIFlowAuth(h.cfg)
-	authURL, redirectURI := authSvc.AuthorizationURL(state, iflowauth.CallbackPort)
-
-	RegisterOAuthSession(state, "iflow")
-
-	isWebUI := isWebUIRequest(c)
-	var forwarder *oauthcallback.Forwarder
-	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/iflow/callback")
-		if errTarget != nil {
-			log.WithError(errTarget).Error("failed to compute iflow callback target")
+	result, err := iflowprovider.StartOAuthLogin(ctx, iflowprovider.OAuthLoginOptions{
+		Config:              h.cfg,
+		WebUI:               isWebUIRequest(c),
+		CallbackTarget:      h.managementCallbackURL,
+		WaitCallback:        WaitOAuthCallbackFile,
+		CallbackWaitTimeout: oauthCallbackWaitTimeout,
+		SaveRecord:          h.saveTokenRecord,
+		Sessions: iflowprovider.SessionCallbacks{
+			Register:         RegisterOAuthSession,
+			SetError:         SetOAuthSessionError,
+			Complete:         CompleteOAuthSession,
+			CompleteProvider: CompleteOAuthSessionsByProvider,
+		},
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, iflowprovider.ErrCallbackUnavailable):
+			log.WithError(err).Error("failed to compute iflow callback target")
 			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "callback server unavailable"})
-			return
-		}
-		var errStart error
-		if forwarder, errStart = oauthcallback.Start(iflowauth.CallbackPort, "iflow", targetURL); errStart != nil {
-			log.WithError(errStart).Error("failed to start iflow callback forwarder")
+		case errors.Is(err, iflowprovider.ErrCallbackStart):
+			log.WithError(err).Error("failed to start iflow callback forwarder")
 			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to start callback server"})
-			return
+		default:
+			log.WithError(err).Error("failed to start iflow oauth flow")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to start oauth flow"})
 		}
+		return
 	}
 
-	go func() {
-		if isWebUI {
-			defer oauthcallback.StopInstance(ctx, iflowauth.CallbackPort, forwarder)
-		}
-		fmt.Println("Waiting for authentication...")
-
-		resultMap, errWait := WaitOAuthCallbackFile(h.cfg.AuthDir, "iflow", state, oauthCallbackWaitTimeout)
-		if errWait != nil {
-			if errors.Is(errWait, errOAuthSessionNotPending) {
-				return
-			}
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Println("Authentication failed: timeout waiting for callback")
-			return
-		}
-
-		if errStr := strings.TrimSpace(resultMap["error"]); errStr != "" {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %s\n", errStr)
-			return
-		}
-		if resultState := strings.TrimSpace(resultMap["state"]); resultState != state {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Println("Authentication failed: state mismatch")
-			return
-		}
-
-		code := strings.TrimSpace(resultMap["code"])
-		if code == "" {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Println("Authentication failed: code missing")
-			return
-		}
-
-		tokenData, errExchange := authSvc.ExchangeCodeForTokens(ctx, code, redirectURI)
-		if errExchange != nil {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %v\n", errExchange)
-			return
-		}
-
-		tokenStorage := authSvc.CreateTokenStorage(tokenData)
-		record := iflowprovider.RecordFromTokenStorage(tokenStorage, time.Now())
-
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			return
-		}
-
-		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		if tokenStorage.APIKey != "" {
-			fmt.Println("API key obtained and saved")
-		}
-		fmt.Println("You can now use iFlow services through this CLI")
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("iflow")
-	}()
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": result.AuthURL, "state": result.State})
 }
 
 func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
@@ -1162,61 +1105,35 @@ func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
 		return
 	}
 
-	cookieValue := strings.TrimSpace(payload.Cookie)
-
-	if cookieValue == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
+	result, err := iflowprovider.AuthenticateCookie(ctx, payload.Cookie, iflowprovider.CookieLoginOptions{
+		Config:     h.cfg,
+		SaveRecord: h.saveTokenRecord,
+	})
+	if err != nil {
+		var duplicate iflowprovider.DuplicateBXAuthError
+		switch {
+		case errors.Is(err, iflowprovider.ErrCookieRequired):
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
+		case errors.Is(err, iflowprovider.ErrDuplicateCheck):
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to check duplicate"})
+		case errors.As(err, &duplicate):
+			c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "duplicate BXAuth found", "existing_file": duplicate.ExistingFileName()})
+		case errors.Is(err, iflowprovider.ErrExtractEmail):
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "failed to extract email from token"})
+		case errors.Is(err, iflowprovider.ErrSaveTokens):
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		}
 		return
 	}
 
-	cookieValue, errNormalize := iflowauth.NormalizeCookie(cookieValue)
-	if errNormalize != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errNormalize.Error()})
-		return
-	}
-
-	// Check for duplicate BXAuth before authentication
-	bxAuth := iflowauth.ExtractBXAuth(cookieValue)
-	if existingFile, err := iflowauth.CheckDuplicateBXAuth(h.cfg.AuthDir, bxAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to check duplicate"})
-		return
-	} else if existingFile != "" {
-		existingFileName := filepath.Base(existingFile)
-		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "duplicate BXAuth found", "existing_file": existingFileName})
-		return
-	}
-
-	authSvc := iflowauth.NewIFlowAuth(h.cfg)
-	tokenData, errAuth := authSvc.AuthenticateWithCookie(ctx, cookieValue)
-	if errAuth != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errAuth.Error()})
-		return
-	}
-
-	tokenData.Cookie = cookieValue
-
-	tokenStorage := authSvc.CreateCookieTokenStorage(tokenData)
-	email := strings.TrimSpace(tokenStorage.Email)
-	if email == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "failed to extract email from token"})
-		return
-	}
-
-	record := iflowprovider.CookieRecordFromTokenStorage(tokenStorage, time.Now())
-
-	savedPath, errSave := h.saveTokenRecord(ctx, record)
-	if errSave != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
-		return
-	}
-
-	fmt.Printf("iFlow cookie authentication successful. Token saved to %s\n", savedPath)
 	c.JSON(http.StatusOK, gin.H{
 		"status":     "ok",
-		"saved_path": savedPath,
-		"email":      email,
-		"expired":    tokenStorage.Expire,
-		"type":       tokenStorage.Type,
+		"saved_path": result.SavedPath,
+		"email":      result.Email,
+		"expired":    result.Expired,
+		"type":       result.Type,
 	})
 }
 

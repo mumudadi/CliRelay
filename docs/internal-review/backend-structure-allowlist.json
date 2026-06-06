@@ -2,11 +2,6 @@
   "large_files": {
     "allow_above_1200": [
       {
-        "path": "internal/api/handlers/management/auth_files.go",
-        "max_lines": 1281,
-        "reason": "Phase 1 legacy management auth-files handler debt; move transport/use cases into internal/management/authfiles and oauth."
-      },
-      {
         "path": "internal/api/handlers/management/config_lists.go",
         "max_lines": 2307,
         "reason": "Phase 1/2 legacy management config-list debt; move settings/API-key/provider-key use cases behind services and DB-first stores."
