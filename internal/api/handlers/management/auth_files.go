@@ -152,38 +152,10 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 
 // List auth files from disk when the auth manager is unavailable.
 func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
-	entries, err := os.ReadDir(h.cfg.AuthDir)
+	files, err := managementauthfiles.ListDiskEntries(h.cfg.AuthDir, time.Now())
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
-	}
-	files := make([]gin.H, 0)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			continue
-		}
-		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
-
-			// Read file to get type field
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if data, errRead := os.ReadFile(full); errRead == nil {
-				typeValue := gjson.GetBytes(data, "type").String()
-				emailValue := gjson.GetBytes(data, "email").String()
-				fileData["type"] = typeValue
-				fileData["email"] = emailValue
-				metadata := make(map[string]any)
-				if errJSON := json.Unmarshal(data, &metadata); errJSON == nil {
-					managementauthfiles.AddSubscriptionFields(fileData, metadata, time.Now())
-				}
-			}
-
-			files = append(files, fileData)
-		}
 	}
 	c.JSON(200, gin.H{"files": files})
 }
