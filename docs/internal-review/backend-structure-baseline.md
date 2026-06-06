@@ -18,16 +18,16 @@ docs/internal-review/backend-structure-allowlist.json
 
 ## 当前结构指标
 
-基于 2026-06-06 Phase 1 management route domains 拆分后的基线：
+基于 2026-06-06 Phase 1 management route smoke test 后的基线：
 
 | 指标 | 数量 |
 | --- | ---: |
-| Go 文件总数 | 664 |
+| Go 文件总数 | 665 |
 | 生产 Go 文件 | 450 |
-| 测试 Go 文件 | 214 |
-| `internal/` Go 文件 | 541 |
+| 测试 Go 文件 | 215 |
+| `internal/` Go 文件 | 542 |
 | `internal/` 生产 Go 文件 | 379 |
-| `internal/` 测试 Go 文件 | 162 |
+| `internal/` 测试 Go 文件 | 163 |
 | 生产 Go 文件中 `>800` 行 | 25 |
 | 生产 Go 文件中 `>1200` 行 | 13 |
 | `internal/` 生产 Go 文件中 `>800` 行 | 22 |
@@ -36,8 +36,8 @@ docs/internal-review/backend-structure-allowlist.json
 | 管理端 `Handler` receiver 方法 | 245 |
 | `server.go` 内管理路由注册 | 0 |
 | `internal/` 生产目录 | 91 |
-| `internal/` 有同级测试目录 | 45 |
-| `internal/` 无同级测试目录 | 46 |
+| `internal/` 有同级测试目录 | 46 |
+| `internal/` 无同级测试目录 | 45 |
 
 ## 当前 `>1200` 行生产文件
 
