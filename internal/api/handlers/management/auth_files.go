@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	managementauthfiles "github.com/router-for-me/CLIProxyAPI/v6/internal/management/authfiles"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -41,21 +41,6 @@ import (
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-)
-
-var (
-	lastRefreshKeys               = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
-	subscriptionStartKeys         = []string{"subscription_started_at", "subscriptionStartedAt", "subscription_start_at", "subscriptionStartAt"}
-	subscriptionPeriodKeys        = []string{"subscription_period", "subscriptionPeriod"}
-	subscriptionExpirationKeys    = []string{"subscription_expires_at", "subscriptionExpiresAt"}
-	subscriptionExpirationLayouts = []string{
-		time.RFC3339,
-		time.RFC3339Nano,
-		"2006-01-02 15:04:05",
-		"2006-01-02 15:04",
-		"2006-01-02T15:04:05Z07:00",
-		"2006-01-02T15:04",
-	}
 )
 
 const (
@@ -84,304 +69,6 @@ var (
 	callbackForwardersMu sync.Mutex
 	callbackForwarders   = make(map[int]*callbackForwarder)
 )
-
-func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
-	if len(meta) == 0 {
-		return time.Time{}, false
-	}
-	for _, key := range lastRefreshKeys {
-		if val, ok := meta[key]; ok {
-			if ts, ok1 := parseLastRefreshValue(val); ok1 {
-				return ts, true
-			}
-		}
-	}
-	return time.Time{}, false
-}
-
-func parseLastRefreshValue(v any) (time.Time, bool) {
-	switch val := v.(type) {
-	case string:
-		s := strings.TrimSpace(val)
-		if s == "" {
-			return time.Time{}, false
-		}
-		layouts := []string{time.RFC3339, time.RFC3339Nano, "2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00"}
-		for _, layout := range layouts {
-			if ts, err := time.Parse(layout, s); err == nil {
-				return ts.UTC(), true
-			}
-		}
-		if unix, err := strconv.ParseInt(s, 10, 64); err == nil && unix > 0 {
-			return time.Unix(unix, 0).UTC(), true
-		}
-	case float64:
-		if val <= 0 {
-			return time.Time{}, false
-		}
-		return time.Unix(int64(val), 0).UTC(), true
-	case int64:
-		if val <= 0 {
-			return time.Time{}, false
-		}
-		return time.Unix(val, 0).UTC(), true
-	case int:
-		if val <= 0 {
-			return time.Time{}, false
-		}
-		return time.Unix(int64(val), 0).UTC(), true
-	case json.Number:
-		if i, err := val.Int64(); err == nil && i > 0 {
-			return time.Unix(i, 0).UTC(), true
-		}
-	}
-	return time.Time{}, false
-}
-
-func extractSubscriptionExpirationTimestamp(meta map[string]any) (time.Time, bool) {
-	if len(meta) == 0 {
-		return time.Time{}, false
-	}
-	for _, key := range subscriptionExpirationKeys {
-		if val, ok := meta[key]; ok {
-			if ts, okParse := parseSubscriptionExpirationValue(val); okParse && !ts.IsZero() {
-				return ts.UTC(), true
-			}
-		}
-	}
-	return time.Time{}, false
-}
-
-func extractSubscriptionStartTimestamp(meta map[string]any) (time.Time, bool) {
-	if len(meta) == 0 {
-		return time.Time{}, false
-	}
-	for _, key := range subscriptionStartKeys {
-		if val, ok := meta[key]; ok {
-			if ts, okParse := parseSubscriptionExpirationValue(val); okParse && !ts.IsZero() {
-				return ts.UTC(), true
-			}
-		}
-	}
-	return time.Time{}, false
-}
-
-func extractSubscriptionPeriod(meta map[string]any) (string, bool) {
-	if len(meta) == 0 {
-		return "", false
-	}
-	for _, key := range subscriptionPeriodKeys {
-		if val, ok := meta[key]; ok {
-			if period, okParse := normalizeSubscriptionPeriodValue(val); okParse {
-				return period, true
-			}
-		}
-	}
-	return "", false
-}
-
-func normalizeSubscriptionPeriodValue(v any) (string, bool) {
-	switch val := v.(type) {
-	case string:
-		switch strings.ToLower(strings.TrimSpace(val)) {
-		case "monthly", "month":
-			return "monthly", true
-		case "yearly", "annual", "annually", "year":
-			return "yearly", true
-		default:
-			return "", false
-		}
-	case json.Number:
-		i, err := val.Int64()
-		if err != nil {
-			return "", false
-		}
-		if i == 12 {
-			return "yearly", true
-		}
-		if i == 1 {
-			return "monthly", true
-		}
-	case float64:
-		if val == 12 {
-			return "yearly", true
-		}
-		if val == 1 {
-			return "monthly", true
-		}
-	case int:
-		if val == 12 {
-			return "yearly", true
-		}
-		if val == 1 {
-			return "monthly", true
-		}
-	case int64:
-		if val == 12 {
-			return "yearly", true
-		}
-		if val == 1 {
-			return "monthly", true
-		}
-	}
-	return "", false
-}
-
-func parseSubscriptionExpirationValue(v any) (time.Time, bool) {
-	switch val := v.(type) {
-	case string:
-		s := strings.TrimSpace(val)
-		if s == "" {
-			return time.Time{}, false
-		}
-		for _, layout := range subscriptionExpirationLayouts {
-			if ts, err := time.Parse(layout, s); err == nil {
-				return ts.UTC(), true
-			}
-		}
-		if unix, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return normalizeSubscriptionUnix(unix), true
-		}
-	case float64:
-		return normalizeSubscriptionUnix(int64(val)), true
-	case int64:
-		return normalizeSubscriptionUnix(val), true
-	case int:
-		return normalizeSubscriptionUnix(int64(val)), true
-	case json.Number:
-		if i, err := val.Int64(); err == nil {
-			return normalizeSubscriptionUnix(i), true
-		}
-		if f, err := val.Float64(); err == nil {
-			return normalizeSubscriptionUnix(int64(f)), true
-		}
-	}
-	return time.Time{}, false
-}
-
-func normalizeSubscriptionUnix(raw int64) time.Time {
-	if raw <= 0 {
-		return time.Time{}
-	}
-	if raw > 1_000_000_000_000 {
-		return time.UnixMilli(raw).UTC()
-	}
-	return time.Unix(raw, 0).UTC()
-}
-
-func routingMetadataString(metadata map[string]any, keys ...string) string {
-	if len(metadata) == 0 {
-		return ""
-	}
-	for _, key := range keys {
-		if key == "" {
-			continue
-		}
-		if raw, ok := metadata[key].(string); ok {
-			if value := strings.TrimSpace(raw); value != "" {
-				return value
-			}
-		}
-	}
-	return ""
-}
-
-func subscriptionExpirationFromStart(startedAt time.Time, period string) time.Time {
-	if strings.EqualFold(period, "yearly") {
-		return startedAt.AddDate(1, 0, 0).UTC()
-	}
-	return startedAt.AddDate(0, 1, 0).UTC()
-}
-
-func subscriptionRemainingMinutes(now, expiresAt time.Time) int64 {
-	diff := expiresAt.Sub(now)
-	if diff == 0 {
-		return 0
-	}
-	if diff > 0 {
-		return int64((diff + time.Minute - time.Nanosecond) / time.Minute)
-	}
-	return -int64((-diff + time.Minute - time.Nanosecond) / time.Minute)
-}
-
-func subscriptionRemainingDays(now, expiresAt time.Time) int64 {
-	diff := expiresAt.Sub(now)
-	if diff == 0 {
-		return 0
-	}
-	day := 24 * time.Hour
-	if diff > 0 {
-		return int64((diff + day - time.Nanosecond) / day)
-	}
-	return -int64((-diff + day - time.Nanosecond) / day)
-}
-
-func addSubscriptionExpirationFields(entry gin.H, meta map[string]any, now time.Time) {
-	expiresAt, ok := extractSubscriptionExpirationTimestamp(meta)
-	if !ok {
-		return
-	}
-	entry["subscription_expires_at"] = expiresAt.Format(time.RFC3339)
-	entry["subscription_expires_at_ms"] = expiresAt.UnixMilli()
-	entry["subscription_remaining_days"] = subscriptionRemainingDays(now, expiresAt)
-	entry["subscription_remaining_minutes"] = subscriptionRemainingMinutes(now, expiresAt)
-	entry["subscription_expired"] = !now.Before(expiresAt)
-}
-
-func addSubscriptionFields(entry gin.H, meta map[string]any, now time.Time) {
-	startedAt, ok := extractSubscriptionStartTimestamp(meta)
-	if !ok {
-		addSubscriptionExpirationFields(entry, meta, now)
-		return
-	}
-	period, ok := extractSubscriptionPeriod(meta)
-	if !ok {
-		period = "monthly"
-	}
-	expiresAt := subscriptionExpirationFromStart(startedAt, period)
-	entry["subscription_started_at"] = startedAt.Format(time.RFC3339)
-	entry["subscription_started_at_ms"] = startedAt.UnixMilli()
-	entry["subscription_period"] = period
-	entry["subscription_expires_at"] = expiresAt.Format(time.RFC3339)
-	entry["subscription_expires_at_ms"] = expiresAt.UnixMilli()
-	entry["subscription_remaining_days"] = subscriptionRemainingDays(now, expiresAt)
-	entry["subscription_remaining_minutes"] = subscriptionRemainingMinutes(now, expiresAt)
-	entry["subscription_expired"] = !now.Before(expiresAt)
-}
-
-func deleteSubscriptionStartMetadata(meta map[string]any) {
-	for _, key := range subscriptionStartKeys {
-		delete(meta, key)
-	}
-	delete(meta, "subscription_started_at_ms")
-	delete(meta, "subscriptionStartedAtMs")
-}
-
-func deleteSubscriptionPeriodMetadata(meta map[string]any) {
-	for _, key := range subscriptionPeriodKeys {
-		delete(meta, key)
-	}
-}
-
-func deleteSubscriptionExpirationMetadata(meta map[string]any) {
-	for _, key := range subscriptionExpirationKeys {
-		delete(meta, key)
-	}
-	delete(meta, "subscription_expires_at_ms")
-	delete(meta, "subscriptionExpiresAtMs")
-	delete(meta, "subscription_remaining_minutes")
-	delete(meta, "subscriptionRemainingMinutes")
-	delete(meta, "subscription_remaining_days")
-	delete(meta, "subscriptionRemainingDays")
-	delete(meta, "subscription_expired")
-	delete(meta, "subscriptionExpired")
-}
-
-func clearSubscriptionMetadata(meta map[string]any) {
-	deleteSubscriptionStartMetadata(meta)
-	deleteSubscriptionPeriodMetadata(meta)
-	deleteSubscriptionExpirationMetadata(meta)
-}
 
 func isWebUIRequest(c *gin.Context) bool {
 	raw := strings.TrimSpace(c.Query("is_webui"))
@@ -639,7 +326,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				fileData["email"] = emailValue
 				metadata := make(map[string]any)
 				if errJSON := json.Unmarshal(data, &metadata); errJSON == nil {
-					addSubscriptionFields(fileData, metadata, time.Now())
+					managementauthfiles.AddSubscriptionFields(fileData, metadata, time.Now())
 				}
 			}
 
@@ -700,7 +387,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if planType := normalizeTagValue(metadataString(auth.Metadata, "plan_type", "planType")); planType != "" {
 		entry["plan_type"] = planType
 	}
-	addSubscriptionFields(entry, auth.Metadata, time.Now())
+	managementauthfiles.AddSubscriptionFields(entry, auth.Metadata, time.Now())
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
 	}
@@ -1333,7 +1020,7 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 		}
 	}
 	label := authChannelLabelFromMetadata(metadata, provider)
-	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
+	lastRefresh, hasLastRefresh := managementauthfiles.ExtractLastRefreshTimestamp(metadata)
 
 	authID := h.authIDForPath(path)
 	if authID == "" {
@@ -1346,9 +1033,9 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
-		Prefix:     routingMetadataString(metadata, "prefix"),
-		ProxyURL:   routingMetadataString(metadata, "proxy_url", "proxy-url", "proxyUrl"),
-		ProxyID:    routingMetadataString(metadata, "proxy_id", "proxy-id", "proxyId"),
+		Prefix:     managementauthfiles.MetadataString(metadata, "prefix"),
+		ProxyURL:   managementauthfiles.MetadataString(metadata, "proxy_url", "proxy-url", "proxyUrl"),
+		ProxyID:    managementauthfiles.MetadataString(metadata, "proxy_id", "proxy-id", "proxyId"),
 		FileName:   filepath.Base(path),
 		Label:      label,
 		Status:     coreauth.StatusActive,
@@ -1611,18 +1298,18 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			targetAuth.Metadata = make(map[string]any)
 		}
 		if value == "" {
-			clearSubscriptionMetadata(targetAuth.Metadata)
+			managementauthfiles.ClearSubscriptionMetadata(targetAuth.Metadata)
 		} else {
-			ts, ok := parseSubscriptionExpirationValue(value)
+			ts, ok := managementauthfiles.ParseSubscriptionTimestampValue(value)
 			if !ok || ts.IsZero() {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "subscription_started_at must be a valid time"})
 				return
 			}
-			deleteSubscriptionStartMetadata(targetAuth.Metadata)
-			deleteSubscriptionExpirationMetadata(targetAuth.Metadata)
+			managementauthfiles.DeleteSubscriptionStartMetadata(targetAuth.Metadata)
+			managementauthfiles.DeleteSubscriptionExpirationMetadata(targetAuth.Metadata)
 			targetAuth.Metadata["subscription_started_at"] = ts.UTC().Format(time.RFC3339)
 			if req.SubscriptionPeriod == nil {
-				if period, okPeriod := extractSubscriptionPeriod(targetAuth.Metadata); okPeriod {
+				if period, okPeriod := managementauthfiles.ExtractSubscriptionPeriod(targetAuth.Metadata); okPeriod {
 					targetAuth.Metadata["subscription_period"] = period
 					delete(targetAuth.Metadata, "subscriptionPeriod")
 				} else {
@@ -1638,14 +1325,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			targetAuth.Metadata = make(map[string]any)
 		}
 		if value == "" {
-			deleteSubscriptionPeriodMetadata(targetAuth.Metadata)
+			managementauthfiles.DeleteSubscriptionPeriodMetadata(targetAuth.Metadata)
 		} else {
-			period, ok := normalizeSubscriptionPeriodValue(value)
+			period, ok := managementauthfiles.NormalizeSubscriptionPeriodValue(value)
 			if !ok {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "subscription_period must be monthly or yearly"})
 				return
 			}
-			deleteSubscriptionPeriodMetadata(targetAuth.Metadata)
+			managementauthfiles.DeleteSubscriptionPeriodMetadata(targetAuth.Metadata)
 			targetAuth.Metadata["subscription_period"] = period
 		}
 		changed = true
@@ -1656,16 +1343,16 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			targetAuth.Metadata = make(map[string]any)
 		}
 		if value == "" {
-			clearSubscriptionMetadata(targetAuth.Metadata)
+			managementauthfiles.ClearSubscriptionMetadata(targetAuth.Metadata)
 		} else {
-			ts, ok := parseSubscriptionExpirationValue(value)
+			ts, ok := managementauthfiles.ParseSubscriptionTimestampValue(value)
 			if !ok || ts.IsZero() {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "subscription_expires_at must be a valid time"})
 				return
 			}
-			deleteSubscriptionStartMetadata(targetAuth.Metadata)
-			deleteSubscriptionPeriodMetadata(targetAuth.Metadata)
-			deleteSubscriptionExpirationMetadata(targetAuth.Metadata)
+			managementauthfiles.DeleteSubscriptionStartMetadata(targetAuth.Metadata)
+			managementauthfiles.DeleteSubscriptionPeriodMetadata(targetAuth.Metadata)
+			managementauthfiles.DeleteSubscriptionExpirationMetadata(targetAuth.Metadata)
 			targetAuth.Metadata["subscription_expires_at"] = ts.UTC().Format(time.RFC3339)
 		}
 		changed = true
