@@ -15,6 +15,7 @@ import (
 	ampsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/amp"
 	apikeysettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/apikey"
 	oauthsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/oauth"
+	providersettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/providers"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -39,6 +40,13 @@ func (h *Handler) apiKeySettings() *apikeysettings.Service {
 		return apikeysettings.NewService(nil)
 	}
 	return apikeysettings.NewService(h.sanitizeAllowedChannelsForSave)
+}
+
+func providerSettingsService(h *Handler) *providersettings.Service {
+	if h == nil {
+		return providersettings.NewService(nil, nil)
+	}
+	return providersettings.NewService(h.cfg, h.validateChannelNames)
 }
 
 // Generic helpers for list[string]
@@ -1169,7 +1177,7 @@ func (h *Handler) DeleteOpenCodeGoKey(c *gin.Context) {
 
 // openai-compatibility: []OpenAICompatibility
 func (h *Handler) GetOpenAICompat(c *gin.Context) {
-	c.JSON(200, gin.H{"openai-compatibility": normalizedOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)})
+	c.JSON(200, gin.H{"openai-compatibility": providerSettingsService(h).OpenAICompatibility()})
 }
 func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	data, err := c.GetRawData()
@@ -1188,95 +1196,27 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
-	filtered := make([]config.OpenAICompatibility, 0, len(arr))
-	for i := range arr {
-		normalizeOpenAICompatibilityEntry(&arr[i])
-		if strings.TrimSpace(arr[i].BaseURL) != "" {
-			filtered = append(filtered, arr[i])
-		}
-	}
-	prev := append([]config.OpenAICompatibility(nil), h.cfg.OpenAICompatibility...)
-	h.cfg.OpenAICompatibility = filtered
-	h.cfg.SanitizeOpenAICompatibility()
-	if err := h.validateChannelNames(); err != nil {
-		h.cfg.OpenAICompatibility = prev
+	if err := providerSettingsService(h).ReplaceOpenAICompatibility(arr); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	h.persist(c)
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
-	type openAICompatPatch struct {
-		Name          *string                             `json:"name"`
-		Disabled      *bool                               `json:"disabled"`
-		Prefix        *string                             `json:"prefix"`
-		BaseURL       *string                             `json:"base-url"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
-	}
 	var body struct {
-		Name  *string            `json:"name"`
-		Index *int               `json:"index"`
-		Value *openAICompatPatch `json:"value"`
+		Name  *string                                    `json:"name"`
+		Index *int                                       `json:"index"`
+		Value *providersettings.OpenAICompatibilityPatch `json:"value"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
-	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.OpenAICompatibility) {
-		targetIndex = *body.Index
-	}
-	if targetIndex == -1 && body.Name != nil {
-		match := strings.TrimSpace(*body.Name)
-		for i := range h.cfg.OpenAICompatibility {
-			if h.cfg.OpenAICompatibility[i].Name == match {
-				targetIndex = i
-				break
-			}
-		}
-	}
-	if targetIndex == -1 {
-		c.JSON(404, gin.H{"error": "item not found"})
-		return
-	}
-
-	entry := h.cfg.OpenAICompatibility[targetIndex]
-	if body.Value.Name != nil {
-		entry.Name = strings.TrimSpace(*body.Value.Name)
-	}
-	if body.Value.Disabled != nil {
-		entry.Disabled = *body.Value.Disabled
-	}
-	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
-	}
-	if body.Value.BaseURL != nil {
-		trimmed := strings.TrimSpace(*body.Value.BaseURL)
-		if trimmed == "" {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:targetIndex], h.cfg.OpenAICompatibility[targetIndex+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
-			h.persist(c)
+	if err := providerSettingsService(h).PatchOpenAICompatibility(body.Index, body.Name, *body.Value); err != nil {
+		if errors.Is(err, providersettings.ErrItemNotFound) {
+			c.JSON(404, gin.H{"error": "item not found"})
 			return
 		}
-		entry.BaseURL = trimmed
-	}
-	if body.Value.APIKeyEntries != nil {
-		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
-	}
-	if body.Value.Models != nil {
-		entry.Models = append([]config.OpenAICompatibilityModel(nil), (*body.Value.Models)...)
-	}
-	if body.Value.Headers != nil {
-		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
-	}
-	normalizeOpenAICompatibilityEntry(&entry)
-	prev := append([]config.OpenAICompatibility(nil), h.cfg.OpenAICompatibility...)
-	h.cfg.OpenAICompatibility[targetIndex] = entry
-	h.cfg.SanitizeOpenAICompatibility()
-	if err := h.validateChannelNames(); err != nil {
-		h.cfg.OpenAICompatibility = prev
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -1285,23 +1225,14 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 	if name := c.Query("name"); name != "" {
-		out := make([]config.OpenAICompatibility, 0, len(h.cfg.OpenAICompatibility))
-		for _, v := range h.cfg.OpenAICompatibility {
-			if v.Name != name {
-				out = append(out, v)
-			}
-		}
-		h.cfg.OpenAICompatibility = out
-		h.cfg.SanitizeOpenAICompatibility()
+		providerSettingsService(h).DeleteOpenAICompatibilityByName(name)
 		h.persist(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, err := fmt.Sscanf(idxStr, "%d", &idx)
-		if err == nil && idx >= 0 && idx < len(h.cfg.OpenAICompatibility) {
-			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:idx], h.cfg.OpenAICompatibility[idx+1:]...)
-			h.cfg.SanitizeOpenAICompatibility()
+		if err == nil && providerSettingsService(h).DeleteOpenAICompatibilityByIndex(idx) {
 			h.persist(c)
 			return
 		}
@@ -1311,7 +1242,7 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 
 // vertex-api-key: []VertexCompatKey
 func (h *Handler) GetVertexCompatKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"vertex-api-key": h.cfg.VertexCompatAPIKey})
+	c.JSON(200, gin.H{"vertex-api-key": providerSettingsService(h).VertexCompatKeys()})
 }
 func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	data, err := c.GetRawData()
@@ -1330,113 +1261,36 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
-	for i := range arr {
-		normalizeVertexCompatKey(&arr[i])
-	}
-	h.cfg.VertexCompatAPIKey = arr
-	h.cfg.SanitizeVertexCompatKeys()
+	providerSettingsService(h).ReplaceVertexCompatKeys(arr)
 	h.persist(c)
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
-	type vertexCompatPatch struct {
-		APIKey   *string                     `json:"api-key"`
-		Prefix   *string                     `json:"prefix"`
-		BaseURL  *string                     `json:"base-url"`
-		ProxyURL *string                     `json:"proxy-url"`
-		ProxyID  *string                     `json:"proxy-id"`
-		Headers  *map[string]string          `json:"headers"`
-		Models   *[]config.VertexCompatModel `json:"models"`
-	}
 	var body struct {
-		Index *int               `json:"index"`
-		Match *string            `json:"match"`
-		Value *vertexCompatPatch `json:"value"`
+		Index *int                                `json:"index"`
+		Match *string                             `json:"match"`
+		Value *providersettings.VertexCompatPatch `json:"value"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
-	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.VertexCompatAPIKey) {
-		targetIndex = *body.Index
-	}
-	if targetIndex == -1 && body.Match != nil {
-		match := strings.TrimSpace(*body.Match)
-		if match != "" {
-			for i := range h.cfg.VertexCompatAPIKey {
-				if h.cfg.VertexCompatAPIKey[i].APIKey == match {
-					targetIndex = i
-					break
-				}
-			}
-		}
-	}
-	if targetIndex == -1 {
+	if err := providerSettingsService(h).PatchVertexCompatKey(body.Index, body.Match, *body.Value); err != nil {
 		c.JSON(404, gin.H{"error": "item not found"})
 		return
 	}
-
-	entry := h.cfg.VertexCompatAPIKey[targetIndex]
-	if body.Value.APIKey != nil {
-		trimmed := strings.TrimSpace(*body.Value.APIKey)
-		if trimmed == "" {
-			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:targetIndex], h.cfg.VertexCompatAPIKey[targetIndex+1:]...)
-			h.cfg.SanitizeVertexCompatKeys()
-			h.persist(c)
-			return
-		}
-		entry.APIKey = trimmed
-	}
-	if body.Value.Prefix != nil {
-		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
-	}
-	if body.Value.BaseURL != nil {
-		trimmed := strings.TrimSpace(*body.Value.BaseURL)
-		if trimmed == "" {
-			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:targetIndex], h.cfg.VertexCompatAPIKey[targetIndex+1:]...)
-			h.cfg.SanitizeVertexCompatKeys()
-			h.persist(c)
-			return
-		}
-		entry.BaseURL = trimmed
-	}
-	if body.Value.ProxyURL != nil {
-		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
-	}
-	if body.Value.ProxyID != nil {
-		entry.ProxyID = strings.TrimSpace(*body.Value.ProxyID)
-	}
-	if body.Value.Headers != nil {
-		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
-	}
-	if body.Value.Models != nil {
-		entry.Models = append([]config.VertexCompatModel(nil), (*body.Value.Models)...)
-	}
-	normalizeVertexCompatKey(&entry)
-	h.cfg.VertexCompatAPIKey[targetIndex] = entry
-	h.cfg.SanitizeVertexCompatKeys()
 	h.persist(c)
 }
 
 func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
-		out := make([]config.VertexCompatKey, 0, len(h.cfg.VertexCompatAPIKey))
-		for _, v := range h.cfg.VertexCompatAPIKey {
-			if v.APIKey != val {
-				out = append(out, v)
-			}
-		}
-		h.cfg.VertexCompatAPIKey = out
-		h.cfg.SanitizeVertexCompatKeys()
+		providerSettingsService(h).DeleteVertexCompatKeyByAPIKey(val)
 		h.persist(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
-		if errScan == nil && idx >= 0 && idx < len(h.cfg.VertexCompatAPIKey) {
-			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:idx], h.cfg.VertexCompatAPIKey[idx+1:]...)
-			h.cfg.SanitizeVertexCompatKeys()
+		if errScan == nil && providerSettingsService(h).DeleteVertexCompatKeyByIndex(idx) {
 			h.persist(c)
 			return
 		}
@@ -1731,25 +1585,6 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 	c.JSON(400, gin.H{"error": "missing api-key or index"})
 }
 
-func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {
-	if entry == nil {
-		return
-	}
-	// Trim base-url; empty base-url indicates provider should be removed by sanitization
-	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
-	entry.Headers = config.NormalizeHeaders(entry.Headers)
-	existing := make(map[string]struct{}, len(entry.APIKeyEntries))
-	for i := range entry.APIKeyEntries {
-		trimmed := strings.TrimSpace(entry.APIKeyEntries[i].APIKey)
-		entry.APIKeyEntries[i].APIKey = trimmed
-		entry.APIKeyEntries[i].ProxyURL = strings.TrimSpace(entry.APIKeyEntries[i].ProxyURL)
-		entry.APIKeyEntries[i].ProxyID = strings.TrimSpace(entry.APIKeyEntries[i].ProxyID)
-		if trimmed != "" {
-			existing[trimmed] = struct{}{}
-		}
-	}
-}
-
 func normalizeOpenCodeGoKey(entry *config.OpenCodeGoKey) {
 	if entry == nil {
 		return
@@ -1778,22 +1613,6 @@ func normalizedOpenCodeGoKeyEntries(entries []config.OpenCodeGoKey) []config.Ope
 	for i := range entries {
 		out[i] = entries[i]
 		normalizeOpenCodeGoKey(&out[i])
-	}
-	return out
-}
-
-func normalizedOpenAICompatibilityEntries(entries []config.OpenAICompatibility) []config.OpenAICompatibility {
-	if len(entries) == 0 {
-		return nil
-	}
-	out := make([]config.OpenAICompatibility, len(entries))
-	for i := range entries {
-		copyEntry := entries[i]
-		if len(copyEntry.APIKeyEntries) > 0 {
-			copyEntry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), copyEntry.APIKeyEntries...)
-		}
-		normalizeOpenAICompatibilityEntry(&copyEntry)
-		out[i] = copyEntry
 	}
 	return out
 }
@@ -1878,32 +1697,6 @@ func normalizeCodexKey(entry *config.CodexKey) {
 		model.Name = strings.TrimSpace(model.Name)
 		model.Alias = strings.TrimSpace(model.Alias)
 		if model.Name == "" && model.Alias == "" {
-			continue
-		}
-		normalized = append(normalized, model)
-	}
-	entry.Models = normalized
-}
-
-func normalizeVertexCompatKey(entry *config.VertexCompatKey) {
-	if entry == nil {
-		return
-	}
-	entry.APIKey = strings.TrimSpace(entry.APIKey)
-	entry.Prefix = strings.TrimSpace(entry.Prefix)
-	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
-	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-	entry.ProxyID = strings.TrimSpace(entry.ProxyID)
-	entry.Headers = config.NormalizeHeaders(entry.Headers)
-	if len(entry.Models) == 0 {
-		return
-	}
-	normalized := make([]config.VertexCompatModel, 0, len(entry.Models))
-	for i := range entry.Models {
-		model := entry.Models[i]
-		model.Name = strings.TrimSpace(model.Name)
-		model.Alias = strings.TrimSpace(model.Alias)
-		if model.Name == "" || model.Alias == "" {
 			continue
 		}
 		normalized = append(normalized, model)
