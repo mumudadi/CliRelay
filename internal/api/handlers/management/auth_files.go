@@ -369,39 +369,14 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 }
 
 func (h *Handler) findAuthByNameOrID(name string) *coreauth.Auth {
-	if h == nil || h.authManager == nil {
+	if h == nil {
 		return nil
 	}
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return nil
-	}
-	if auth, ok := h.authManager.GetByID(name); ok {
-		return auth
-	}
-	for _, auth := range h.authManager.List() {
-		if auth == nil {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(auth.FileName), name) {
-			return auth
-		}
-		if path := strings.TrimSpace(managementauthfiles.Attribute(auth, "path")); path != "" && strings.EqualFold(filepath.Base(path), name) {
-			return auth
-		}
-	}
-	return nil
+	return managementauthfiles.FindByNameOrID(h.authManager, name)
 }
 
 func deletedAuthChannelIdentifiers(auth *coreauth.Auth) []string {
-	if auth == nil {
-		return nil
-	}
-	accountType, _ := auth.AccountInfo()
-	if !strings.EqualFold(accountType, "oauth") {
-		return nil
-	}
-	return auth.ChannelIdentifiers()
+	return managementauthfiles.DeletedChannelIdentifiers(auth)
 }
 
 func (h *Handler) authIDForPath(path string) string {
@@ -608,28 +583,11 @@ func (h *Handler) removeAuth(ctx context.Context, id string) {
 	if h == nil || h.authManager == nil {
 		return
 	}
-	candidates := []string{
-		h.authIDForPath(id),
-		strings.TrimSpace(id),
-		filepath.Base(strings.TrimSpace(id)),
+	authDir := ""
+	if h.cfg != nil {
+		authDir = h.cfg.AuthDir
 	}
-	seen := make(map[string]struct{}, len(candidates))
-	for _, candidate := range candidates {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" || candidate == "." {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		if deleted, _ := h.authManager.Delete(coreauth.WithSkipPersist(ctx), candidate); deleted != nil {
-			return
-		}
-	}
-	if auth := h.findAuthByNameOrID(filepath.Base(strings.TrimSpace(id))); auth != nil {
-		_, _ = h.authManager.Delete(coreauth.WithSkipPersist(ctx), auth.ID)
-	}
+	managementauthfiles.RemoveFromManager(ctx, h.authManager, authDir, id)
 }
 
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
