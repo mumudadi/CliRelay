@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
@@ -11,16 +12,28 @@ var (
 	ErrInvalidProfileID   = errors.New("id is required")
 	ErrInvalidProfileName = errors.New("name is required")
 	ErrMissingValue       = errors.New("missing value")
+	ErrItemNotFound       = errors.New("item not found")
+	ErrKeyRequired        = errors.New("key is required")
+	ErrAPIKeyExists       = errors.New("api key already exists")
+	ErrInvalidEntry       = errors.New("invalid api key entry")
 )
 
 type ChannelSanitizer func([]string) ([]string, error)
+type ChannelGroupSanitizer func([]string) ([]string, error)
+type EntryValidator func(config.APIKeyEntry) error
 
 type Service struct {
-	sanitizeChannels ChannelSanitizer
+	sanitizeChannels      ChannelSanitizer
+	sanitizeChannelGroups ChannelGroupSanitizer
+	validateEntry         EntryValidator
 }
 
-func NewService(sanitizeChannels ChannelSanitizer) *Service {
-	return &Service{sanitizeChannels: sanitizeChannels}
+func NewService(sanitizeChannels ChannelSanitizer, sanitizeChannelGroups ChannelGroupSanitizer, validateEntry EntryValidator) *Service {
+	return &Service{
+		sanitizeChannels:      sanitizeChannels,
+		sanitizeChannelGroups: sanitizeChannelGroups,
+		validateEntry:         validateEntry,
+	}
 }
 
 func (s *Service) EnabledKeys() []string {

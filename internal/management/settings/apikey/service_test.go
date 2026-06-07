@@ -32,7 +32,7 @@ func setupTestDB(t *testing.T) {
 
 func TestReplaceKeysNormalizesAndListsEnabledKeys(t *testing.T) {
 	setupTestDB(t)
-	svc := NewService(nil)
+	svc := NewService(nil, nil, nil)
 
 	if err := svc.ReplaceKeys([]string{" sk-one ", "", "sk-two"}); err != nil {
 		t.Fatalf("ReplaceKeys() error = %v, want nil", err)
@@ -48,7 +48,7 @@ func TestReplaceKeysNormalizesAndListsEnabledKeys(t *testing.T) {
 
 func TestPatchAndDeleteKey(t *testing.T) {
 	setupTestDB(t)
-	svc := NewService(nil)
+	svc := NewService(nil, nil, nil)
 
 	if err := svc.PatchKey("", " sk-created "); err != nil {
 		t.Fatalf("PatchKey(create) error = %v, want nil", err)
@@ -87,7 +87,7 @@ func TestReplacePermissionProfilesValidatesAndSanitizes(t *testing.T) {
 			out = append(out, channel)
 		}
 		return out, nil
-	})
+	}, nil, nil)
 
 	err := svc.ReplacePermissionProfiles([]usage.APIKeyPermissionProfileRow{{
 		ID:              " standard ",
@@ -112,7 +112,7 @@ func TestReplacePermissionProfilesValidatesAndSanitizes(t *testing.T) {
 
 func TestReplacePermissionProfilesRejectsMissingIdentity(t *testing.T) {
 	setupTestDB(t)
-	svc := NewService(nil)
+	svc := NewService(nil, nil, nil)
 
 	if err := svc.ReplacePermissionProfiles([]usage.APIKeyPermissionProfileRow{{Name: "Name"}}); !errors.Is(err, ErrInvalidProfileID) {
 		t.Fatalf("missing id error = %v, want ErrInvalidProfileID", err)
