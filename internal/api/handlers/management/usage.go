@@ -67,21 +67,24 @@ func (h *Handler) GetPublicUsageByAPIKey(c *gin.Context) {
 
 	// Find the matching API key entry
 	apiData, found := snapshot.APIs[apiKey]
+	maskedAPIKey := maskKey(apiKey)
 	if !found {
 		c.JSON(http.StatusOK, gin.H{
 			"usage": usage.StatisticsSnapshot{
 				APIs: map[string]usage.APISnapshot{},
 			},
-			"api_key": apiKey,
-			"found":   false,
+			"api_key":        maskedAPIKey,
+			"api_key_masked": maskedAPIKey,
+			"found":          false,
 		})
 		return
 	}
 
-	// Return only the matched API key's data
+	// Return only the matched API key's data. Use the masked key as the public
+	// map key so the response never leaks the full credential.
 	filteredSnapshot := usage.StatisticsSnapshot{
 		APIs: map[string]usage.APISnapshot{
-			apiKey: apiData,
+			maskedAPIKey: apiData,
 		},
 	}
 
@@ -90,9 +93,10 @@ func (h *Handler) GetPublicUsageByAPIKey(c *gin.Context) {
 	filteredSnapshot.SanitizeForPublic()
 
 	c.JSON(http.StatusOK, gin.H{
-		"usage":   filteredSnapshot,
-		"api_key": apiKey,
-		"found":   true,
+		"usage":          filteredSnapshot,
+		"api_key":        maskedAPIKey,
+		"api_key_masked": maskedAPIKey,
+		"found":          true,
 	})
 }
 

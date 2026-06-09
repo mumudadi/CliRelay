@@ -554,6 +554,20 @@ func TestNewServerUsesConfiguredMainReadTimeout(t *testing.T) {
 	}
 }
 
+func TestBuildHTTPServerHandlesNilConfig(t *testing.T) {
+	engine := gin.New()
+	server := buildHTTPServer(nil, engine)
+	if server == nil {
+		t.Fatal("expected http server")
+	}
+	if got := server.Addr; got != ":8315" {
+		t.Fatalf("Addr = %q, want :8315", got)
+	}
+	if got := server.ReadTimeout; got != proxyconfig.DefaultMainAPIReadTimeout {
+		t.Fatalf("ReadTimeout = %s, want %s", got, proxyconfig.DefaultMainAPIReadTimeout)
+	}
+}
+
 func TestOAuthCallbackRouteStillServesSuccessHTML(t *testing.T) {
 	server := newTestServer(t)
 

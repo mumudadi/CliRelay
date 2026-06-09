@@ -15,6 +15,10 @@ func TestValidateFileQueryName(t *testing.T) {
 	}{
 		{name: "", requireJSON: true, wantErr: "invalid name"},
 		{name: "nested/auth.json", requireJSON: true, wantErr: "invalid name"},
+		{name: `nested\auth.json`, requireJSON: true, wantErr: "invalid name"},
+		{name: "../auth.json", requireJSON: true, wantErr: "invalid name"},
+		{name: `..\auth.json`, requireJSON: true, wantErr: "invalid name"},
+		{name: ".", requireJSON: false, wantErr: "invalid name"},
 		{name: "auth.txt", requireJSON: true, wantErr: "name must end with .json"},
 		{name: "auth.txt", requireJSON: false, want: "auth.txt"},
 		{name: "auth.json", requireJSON: true, want: "auth.json"},
@@ -38,17 +42,24 @@ func TestValidateFileQueryName(t *testing.T) {
 }
 
 func TestValidateUploadedFileName(t *testing.T) {
-	got, err := ValidateUploadedFileName("nested/auth.json")
-	if err != nil {
-		t.Fatalf("ValidateUploadedFileName() error = %v", err)
-	}
-	if got != "auth.json" {
-		t.Fatalf("ValidateUploadedFileName() = %q, want auth.json", got)
+	for _, filename := range []string{"nested/auth.json", `nested\auth.json`} {
+		got, err := ValidateUploadedFileName(filename)
+		if err != nil {
+			t.Fatalf("ValidateUploadedFileName(%q) error = %v", filename, err)
+		}
+		if got != "auth.json" {
+			t.Fatalf("ValidateUploadedFileName(%q) = %q, want auth.json", filename, got)
+		}
 	}
 
-	_, err = ValidateUploadedFileName("auth.txt")
+	_, err := ValidateUploadedFileName("auth.txt")
 	if err == nil || err.Error() != "file must be .json" {
 		t.Fatalf("ValidateUploadedFileName() error = %v, want file must be .json", err)
+	}
+
+	_, err = ValidateUploadedFileName("../")
+	if err == nil || err.Error() != "invalid name" {
+		t.Fatalf("ValidateUploadedFileName() error = %v, want invalid name", err)
 	}
 }
 
@@ -56,6 +67,15 @@ func TestFilePathReturnsAbsoluteBasePath(t *testing.T) {
 	authDir := t.TempDir()
 	got := FilePath(authDir, "nested/auth.json")
 	want := filepath.Join(authDir, "auth.json")
+	if got != want {
+		t.Fatalf("FilePath() = %q, want %q", got, want)
+	}
+}
+
+func TestFilePathRejectsInvalidBaseNameFallback(t *testing.T) {
+	authDir := t.TempDir()
+	got := FilePath(authDir, "../")
+	want := filepath.Join(authDir, invalidFilePathPlaceholder)
 	if got != want {
 		t.Fatalf("FilePath() = %q, want %q", got, want)
 	}

@@ -217,11 +217,17 @@ func (s *Server) configureInitialKeepAlive(optionState *serverOptionConfig) {
 
 func buildHTTPServer(cfg *config.Config, engine *gin.Engine) *http.Server {
 	readTimeout := config.DefaultMainAPIReadTimeout
+	host := ""
+	port := 8315
 	if cfg != nil {
 		readTimeout = cfg.MainAPIReadTimeout()
+		host = strings.TrimSpace(cfg.Host)
+		if cfg.Port > 0 {
+			port = cfg.Port
+		}
 	}
 	return &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Addr:              fmt.Sprintf("%s:%d", host, port),
 		Handler:           engine,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       readTimeout,

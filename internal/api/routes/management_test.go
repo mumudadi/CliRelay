@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -45,5 +47,26 @@ func TestRegisterManagementRouteTable(t *testing.T) {
 		if _, ok := routes[key]; !ok {
 			t.Fatalf("required route %s was not registered", key)
 		}
+	}
+}
+
+func TestManagementRoutesApplySecurityHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	engine := gin.New()
+	RegisterManagement(engine, &managementhandlers.Handler{}, ManagementOptions{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Cache-Control"); got != "no-store, private, max-age=0" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q", got)
+	}
+	if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("Referrer-Policy = %q", got)
 	}
 }

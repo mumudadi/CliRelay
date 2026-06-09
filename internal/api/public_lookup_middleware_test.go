@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +36,12 @@ func TestPublicLookupMiddlewareAppliesNoStoreHeaders(t *testing.T) {
 	}
 	if got := rec.Header().Get("Expires"); got != "0" {
 		t.Fatalf("Expires = %q", got)
+	}
+	if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("Referrer-Policy = %q", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q", got)
 	}
 }
 
@@ -112,5 +119,37 @@ func TestPublicLookupRateLimitMiddlewareKeepsFailureResponseStable(t *testing.T)
 	}
 	if firstReject.Header().Get("Retry-After") == "" || secondReject.Header().Get("Retry-After") == "" {
 		t.Fatal("Retry-After header missing on repeated rejection")
+	}
+}
+
+func TestPublicLookupRateLimitIgnoresUserAgentRotation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	server := &Server{}
+	router := gin.New()
+	router.Use(publicLookupNoStoreMiddleware(), server.publicLookupRateLimitMiddleware())
+	router.POST("/v0/management/public/test", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	for i := 0; i < publicLookupRateLimitMaxRequests; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v0/management/public/test", nil)
+		req.RemoteAddr = "198.51.100.40:4321"
+		req.Header.Set("User-Agent", strconv.Itoa(i))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("request %d status = %d, want %d", i+1, rec.Code, http.StatusNoContent)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/public/test", nil)
+	req.RemoteAddr = "198.51.100.40:4321"
+	req.Header.Set("User-Agent", "rotated-agent")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusTooManyRequests)
 	}
 }
