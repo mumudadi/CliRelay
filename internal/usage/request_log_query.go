@@ -384,6 +384,9 @@ func normalizeStringList(values []string) []string {
 
 func buildWhereClause(params LogQueryParams) (string, []interface{}) {
 	params = normalizeLogQueryParams(params)
+	if params.MatchNoAPIKeys || params.MatchNoModels || params.MatchNoStatuses || params.MatchNoChannels {
+		return " WHERE 1 = 0", nil
+	}
 	conditions := make([]string, 0, 4)
 	args := make([]interface{}, 0, 4)
 

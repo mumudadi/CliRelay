@@ -284,6 +284,47 @@ func TestQueryLogsSupportsSystemRequestLogFilterValue(t *testing.T) {
 	}
 }
 
+func TestQueryLogsSupportsExplicitEmptyMultiSelectFilters(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	now := time.Now().UTC()
+	InsertLog("sk-live-123", "Primary", "gpt-5.4", "codex", "Codex", "auth-1", false, now, 140, 14, TokenStats{
+		InputTokens: 1, OutputTokens: 1, TotalTokens: 2,
+	}, "", "")
+
+	result, err := QueryLogs(LogQueryParams{
+		Page:           1,
+		Size:           10,
+		Days:           1,
+		MatchNoAPIKeys: true,
+	})
+	if err != nil {
+		t.Fatalf("QueryLogs() with MatchNoAPIKeys error = %v", err)
+	}
+	if len(result.Items) != 0 {
+		t.Fatalf("MatchNoAPIKeys items = %d, want 0", len(result.Items))
+	}
+	if result.Total != 0 {
+		t.Fatalf("MatchNoAPIKeys total = %d, want 0", result.Total)
+	}
+
+	stats, err := QueryStats(LogQueryParams{
+		Page:          1,
+		Size:          10,
+		Days:          1,
+		MatchNoModels: true,
+	})
+	if err != nil {
+		t.Fatalf("QueryStats() with MatchNoModels error = %v", err)
+	}
+	if stats.Total != 0 {
+		t.Fatalf("MatchNoModels stats.Total = %d, want 0", stats.Total)
+	}
+	if stats.TotalTokens != 0 || stats.TotalCost != 0 || stats.SuccessRate != 0 {
+		t.Fatalf("MatchNoModels stats = %+v, want all zero values", stats)
+	}
+}
+
 func TestQueryLogContentKeepsMissingFailedOutputEmpty(t *testing.T) {
 	initTestUsageDB(t, config.RequestLogStorageConfig{
 		StoreContent:           true,

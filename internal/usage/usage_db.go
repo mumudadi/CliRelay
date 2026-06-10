@@ -37,17 +37,21 @@ type LogRow struct {
 
 // LogQueryParams holds filter/pagination parameters for QueryLogs.
 type LogQueryParams struct {
-	Page         int      // 1-based
-	Size         int      // rows per page
-	Days         int      // time range in days
-	APIKey       string   // exact match filter (deprecated, use APIKeys)
-	Model        string   // exact match filter (deprecated, use Models)
-	Status       string   // "success", "failed", or "" (all) (deprecated, use Statuses)
-	APIKeys      []string // multi-value API key filter
-	Models       []string // multi-value model filter
-	Statuses     []string // multi-value status filter
-	AuthIndexes  []string // optional auth_index IN (...) filter
-	ChannelNames []string // optional channel_name IN (...) filter
+	Page            int      // 1-based
+	Size            int      // rows per page
+	Days            int      // time range in days
+	APIKey          string   // exact match filter (deprecated, use APIKeys)
+	Model           string   // exact match filter (deprecated, use Models)
+	Status          string   // "success", "failed", or "" (all) (deprecated, use Statuses)
+	APIKeys         []string // multi-value API key filter
+	Models          []string // multi-value model filter
+	Statuses        []string // multi-value status filter
+	MatchNoAPIKeys  bool     // explicit empty API key filter
+	MatchNoModels   bool     // explicit empty model filter
+	MatchNoStatuses bool     // explicit empty status filter
+	MatchNoChannels bool     // explicit empty channel filter
+	AuthIndexes     []string // optional auth_index IN (...) filter
+	ChannelNames    []string // optional channel_name IN (...) filter
 	// Optional precise legacy matches for renamed auth channels whose stored
 	// channel_name was a shared provider/source value.
 	AuthIndexChannelNames map[string][]string

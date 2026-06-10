@@ -3,13 +3,17 @@ package usagelogs
 import "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 
 type ManagementLogQueryInput struct {
-	Page     int
-	Size     int
-	Days     int
-	APIKeys  []string
-	Models   []string
-	Statuses []string
-	Channels []string
+	Page            int
+	Size            int
+	Days            int
+	APIKeys         []string
+	Models          []string
+	Statuses        []string
+	Channels        []string
+	MatchNoAPIKeys  bool
+	MatchNoModels   bool
+	MatchNoStatuses bool
+	MatchNoChannels bool
 }
 
 type PublicLogQueryInput struct {
