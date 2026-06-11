@@ -40,6 +40,11 @@ func ReplaceProxyPool(entries []config.ProxyPoolEntry) error {
 	return proxyPoolStore().Replace(entries)
 }
 
+// UpdateProxyPoolEntry updates one reusable proxy identified by its stable ID.
+func UpdateProxyPoolEntry(id string, entry config.ProxyPoolEntry) error {
+	return proxyPoolStore().Update(id, entry)
+}
+
 // ApplyStoredProxyPool overlays the DB-backed proxy pool onto the runtime config.
 func ApplyStoredProxyPool(cfg *config.Config) bool {
 	if cfg == nil || !ProxyPoolStoreAvailable() {

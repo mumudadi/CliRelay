@@ -101,6 +101,12 @@ func (cfg *Config) ResolveProxyURL(proxyID string, fallbackURL string) string {
 	return ""
 }
 
+// NormalizeProxyID exposes the shared proxy ID normalization used by storage,
+// management handlers, and runtime resolution.
+func NormalizeProxyID(raw string) string {
+	return normalizeProxyID(raw)
+}
+
 func normalizeProxyID(raw string) string {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	if trimmed == "" {

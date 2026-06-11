@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -91,6 +92,82 @@ func (h *Handler) PutProxyPool(c *gin.Context) {
 	h.cfg.ProxyPool = normalized
 	h.mu.Unlock()
 
+	h.persist(c)
+}
+
+// PatchProxyPoolEntry updates one reusable proxy entry identified by its stable ID.
+func (h *Handler) PatchProxyPoolEntry(c *gin.Context) {
+	originalID := config.NormalizeProxyID(c.Param("id"))
+	if originalID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+
+	var body struct {
+		Name        *string `json:"name"`
+		URL         *string `json:"url"`
+		Enabled     *bool   `json:"enabled"`
+		Description *string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Name == nil || body.URL == nil || body.Enabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	normalized := config.NormalizeProxyPool([]config.ProxyPoolEntry{{
+		ID:          originalID,
+		Name:        *body.Name,
+		URL:         *body.URL,
+		Enabled:     *body.Enabled,
+		Description: stringValue(body.Description),
+	}})
+	if len(normalized) != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no valid proxy entries"})
+		return
+	}
+	updated := normalized[0]
+
+	if proxypoolsettings.StoreAvailable() {
+		if err := proxypoolsettings.Update(originalID, updated); err != nil {
+			if errors.Is(err, proxypoolsettings.ErrItemNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update proxy pool entry: %v", err)})
+			return
+		}
+		h.mu.Lock()
+		if h.cfg == nil {
+			h.cfg = &config.Config{}
+		}
+		h.cfg.ProxyPool = proxypoolsettings.List()
+		h.mu.Unlock()
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		return
+	}
+
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.cfg = &config.Config{}
+	}
+	found := false
+	for i := range h.cfg.ProxyPool {
+		if config.NormalizeProxyID(h.cfg.ProxyPool[i].ID) != originalID {
+			continue
+		}
+		h.cfg.ProxyPool[i] = updated
+		found = true
+		break
+	}
+	if found {
+		h.cfg.ProxyPool = config.NormalizeProxyPool(h.cfg.ProxyPool)
+	}
+	h.mu.Unlock()
+
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+		return
+	}
 	h.persist(c)
 }
 
@@ -225,4 +302,11 @@ func maskProxyPoolURL(raw string) string {
 		return "***"
 	}
 	return strings.ToLower(parsed.Scheme) + "://" + parsed.Host
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

@@ -73,6 +73,42 @@ func TestProxyPoolReplaceListAndGet(t *testing.T) {
 	}
 }
 
+func TestProxyPoolUpdateByStableID(t *testing.T) {
+	cleanup := setupProxyPoolTestDB(t)
+	defer cleanup()
+
+	if err := ReplaceProxyPool([]config.ProxyPoolEntry{
+		{ID: "hk", Name: "HK Proxy", URL: "http://127.0.0.1:7890", Enabled: true, Description: "primary"},
+	}); err != nil {
+		t.Fatalf("ReplaceProxyPool: %v", err)
+	}
+
+	err := UpdateProxyPoolEntry(" HK ", config.ProxyPoolEntry{
+		ID:          "ignored-during-update",
+		Name:        "Updated HK Proxy",
+		URL:         "http://127.0.0.1:7891",
+		Enabled:     false,
+		Description: "rotated",
+	})
+	if err != nil {
+		t.Fatalf("UpdateProxyPoolEntry: %v", err)
+	}
+
+	rows := ListProxyPool()
+	if len(rows) != 1 {
+		t.Fatalf("ListProxyPool length = %d, want 1: %#v", len(rows), rows)
+	}
+	if rows[0].ID != "hk" {
+		t.Fatalf("updated proxy id = %q, want hk", rows[0].ID)
+	}
+	if rows[0].Name != "Updated HK Proxy" || rows[0].URL != "http://127.0.0.1:7891" || rows[0].Enabled {
+		t.Fatalf("updated proxy row = %#v", rows[0])
+	}
+	if rows[0].Description != "rotated" {
+		t.Fatalf("updated description = %q, want rotated", rows[0].Description)
+	}
+}
+
 func TestProxyPoolMigrationMovesConfigEntriesIntoSQLite(t *testing.T) {
 	cleanup := setupProxyPoolTestDB(t)
 	defer cleanup()

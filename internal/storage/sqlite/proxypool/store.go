@@ -2,10 +2,9 @@ package proxypool
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	log "github.com/sirupsen/logrus"
@@ -26,6 +25,8 @@ CREATE TABLE IF NOT EXISTS proxy_pool (
 type Store struct {
 	db *sql.DB
 }
+
+var ErrEntryNotFound = errors.New("proxy pool entry not found")
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -78,7 +79,7 @@ func (s Store) Get(id string) *config.ProxyPoolEntry {
 		return nil
 	}
 
-	normalizedID := normalizeEntryID(id)
+	normalizedID := config.NormalizeProxyID(id)
 	if normalizedID == "" {
 		return nil
 	}
@@ -131,6 +132,44 @@ func (s Store) Replace(entries []config.ProxyPoolEntry) error {
 	return tx.Commit()
 }
 
+func (s Store) Update(id string, entry config.ProxyPoolEntry) error {
+	if s.db == nil {
+		return fmt.Errorf("database not initialised")
+	}
+
+	normalizedID := config.NormalizeProxyID(id)
+	if normalizedID == "" {
+		return ErrEntryNotFound
+	}
+
+	enabledInt := 0
+	if entry.Enabled {
+		enabledInt = 1
+	}
+	result, err := s.db.Exec(
+		`UPDATE proxy_pool
+		 SET name = ?, url = ?, enabled = ?, description = ?, updated_at = ?
+		 WHERE id = ?`,
+		entry.Name,
+		entry.URL,
+		enabledInt,
+		entry.Description,
+		time.Now().UTC().Format(time.RFC3339),
+		normalizedID,
+	)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrEntryNotFound
+	}
+	return nil
+}
+
 func (s Store) ApplyToConfig(cfg *config.Config) bool {
 	if s.db == nil || cfg == nil {
 		return false
@@ -175,25 +214,4 @@ func scanEntry(scanner scanner) (config.ProxyPoolEntry, bool) {
 	}
 	entry.Enabled = enabledInt != 0
 	return entry, true
-}
-
-func normalizeEntryID(raw string) string {
-	trimmed := strings.ToLower(strings.TrimSpace(raw))
-	if trimmed == "" {
-		return ""
-	}
-	var b strings.Builder
-	lastDash := false
-	for _, r := range trimmed {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-			lastDash = false
-			continue
-		}
-		if !lastDash {
-			b.WriteByte('-')
-			lastDash = true
-		}
-	}
-	return strings.Trim(b.String(), "-")
 }
