@@ -53,6 +53,33 @@ func TestLoadConfigReadsMainAPIReadTimeoutOverride(t *testing.T) {
 	}
 }
 
+func TestLoadConfigSanitizesProxyWarmupDefaults(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("proxy-warmup:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+
+	if !cfg.ProxyWarmup.Enabled {
+		t.Fatal("ProxyWarmup.Enabled = false, want true")
+	}
+	if cfg.ProxyWarmup.IntervalSeconds <= 0 {
+		t.Fatalf("ProxyWarmup.IntervalSeconds = %d, want default > 0", cfg.ProxyWarmup.IntervalSeconds)
+	}
+	if len(cfg.ProxyWarmup.Targets) == 0 {
+		t.Fatal("ProxyWarmup.Targets is empty, want default warm targets")
+	}
+	if cfg.ProxyWarmup.Targets[0].Method == "" {
+		t.Fatal("ProxyWarmup target method is empty, want sanitized default")
+	}
+}
+
 func TestSanitizeRoutingPreservesChannelGroupSettings(t *testing.T) {
 	t.Parallel()
 

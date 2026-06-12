@@ -102,6 +102,10 @@ func (s *Service) GetRow(key string) *usage.APIKeyRow {
 	return usage.GetAPIKey(strings.TrimSpace(key))
 }
 
+func (s *Service) GetRowByID(id string) *usage.APIKeyRow {
+	return usage.GetAPIKeyByID(strings.TrimSpace(id))
+}
+
 func (s *Service) ReplaceKeys(keys []string) error {
 	rows := make([]usage.APIKeyRow, 0, len(keys))
 	for _, key := range keys {
@@ -116,13 +120,25 @@ func (s *Service) ReplaceKeys(keys []string) error {
 func (s *Service) PatchKey(oldKey string, newKey string) error {
 	oldKey = strings.TrimSpace(oldKey)
 	newKey = strings.TrimSpace(newKey)
-	if oldKey != "" {
-		_ = usage.DeleteAPIKey(oldKey)
+	if oldKey == "" {
+		if newKey == "" {
+			return nil
+		}
+		return usage.UpsertAPIKey(usage.APIKeyRow{Key: newKey})
+	}
+	existing := usage.GetAPIKey(oldKey)
+	if existing == nil {
+		if newKey == "" {
+			return nil
+		}
+		return usage.UpsertAPIKey(usage.APIKeyRow{Key: newKey})
 	}
 	if newKey == "" {
-		return nil
+		return usage.DeleteAPIKeyByID(existing.ID)
 	}
-	return usage.UpsertAPIKey(usage.APIKeyRow{Key: newKey})
+	updated := *existing
+	updated.Key = newKey
+	return usage.UpdateAPIKeyByID(updated)
 }
 
 func (s *Service) DeleteKey(key string) error {
@@ -243,20 +259,14 @@ func (s *Service) ReplaceEntries(entries []config.APIKeyEntry) error {
 	return usage.ReplaceAllAPIKeys(rows)
 }
 
-func (s *Service) PatchEntry(index *int, match *string, patch EntryPatch) error {
-	targetKey := resolvePatchTargetKey(index, match)
-	if targetKey == "" {
+func (s *Service) PatchEntry(id *string, index *int, match *string, patch EntryPatch) error {
+	existing := resolvePatchTargetRow(id, index, match)
+	if existing == nil {
 		return ErrItemNotFound
 	}
-
-	existing := usage.GetAPIKey(targetKey)
-	entry := usage.APIKeyRow{}
-	if existing != nil {
-		entry = *existing
-	} else {
-		entry.Key = targetKey
-	}
+	entry := *existing
 	originalKey := strings.TrimSpace(entry.Key)
+	originalID := strings.TrimSpace(entry.ID)
 
 	if patch.Key != nil {
 		entry.Key = strings.TrimSpace(*patch.Key)
@@ -306,34 +316,24 @@ func (s *Service) PatchEntry(index *int, match *string, patch EntryPatch) error 
 		return err
 	}
 	desiredKey := strings.TrimSpace(normalized.Key)
-	if desiredKey != targetKey {
-		if existingKey := usage.GetAPIKey(desiredKey); existingKey != nil {
+	if desiredKey != originalKey {
+		if existingKey := usage.GetAPIKey(desiredKey); existingKey != nil && strings.TrimSpace(existingKey.ID) != originalID {
 			return ErrDuplicateKey
 		}
 	}
-
-	if existing != nil && originalKey != "" && desiredKey != originalKey {
-		if err := usage.DeleteAPIKey(originalKey); err != nil {
-			return err
-		}
-	}
-	return usage.UpsertAPIKey(usage.APIKeyRowFromConfig(normalized))
+	updated := usage.APIKeyRowFromConfig(normalized)
+	updated.ID = originalID
+	return usage.UpdateAPIKeyByID(updated)
 }
 
-func (s *Service) DeleteEntry(key string, index *int, deleteLogs bool) (DeleteEntryResult, error) {
+func (s *Service) DeleteEntry(key string, id *string, index *int, deleteLogs bool) (DeleteEntryResult, error) {
 	targetKey := strings.TrimSpace(key)
-	if targetKey == "" {
-		if index == nil || *index < 0 {
-			return DeleteEntryResult{}, ErrMissingKeyOrIndex
-		}
-		rows := usage.ListAPIKeys()
-		if *index >= len(rows) {
-			return DeleteEntryResult{}, ErrMissingKeyOrIndex
-		}
-		targetKey = rows[*index].Key
+	row := resolvePatchTargetRow(id, index, &targetKey)
+	if row == nil {
+		return DeleteEntryResult{}, ErrMissingKeyOrIndex
 	}
-
-	if err := usage.DeleteAPIKey(targetKey); err != nil {
+	targetKey = row.Key
+	if err := usage.DeleteAPIKeyByID(row.ID); err != nil {
 		return DeleteEntryResult{}, err
 	}
 
@@ -378,20 +378,26 @@ func (s *Service) prepareEntryForSave(entry config.APIKeyEntry) (config.APIKeyEn
 	return entry, nil
 }
 
-func resolvePatchTargetKey(index *int, match *string) string {
+func resolvePatchTargetRow(id *string, index *int, match *string) *usage.APIKeyRow {
+	if id != nil {
+		if targetID := strings.TrimSpace(*id); targetID != "" {
+			return usage.GetAPIKeyByID(targetID)
+		}
+	}
 	if match != nil {
 		if targetKey := strings.TrimSpace(*match); targetKey != "" {
-			return targetKey
+			return usage.GetAPIKey(targetKey)
 		}
 	}
 	if index == nil || *index < 0 {
-		return ""
+		return nil
 	}
 	rows := usage.ListAPIKeys()
 	if *index >= len(rows) {
-		return ""
+		return nil
 	}
-	return strings.TrimSpace(rows[*index].Key)
+	row := rows[*index]
+	return &row
 }
 
 func normalizeChannelGroups(values []string) []string {

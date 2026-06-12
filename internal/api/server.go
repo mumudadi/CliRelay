@@ -91,6 +91,10 @@ type Server struct {
 	publicLookupRateMu          sync.Mutex
 	publicLookupRate            map[string]publicLookupRateLimitEntry
 	publicLookupRateLastCleanup time.Time
+
+	proxyWarmMu        sync.Mutex
+	proxyWarmManager   interface{ Stop() }
+	proxyWarmSignature string
 }
 
 // Start begins listening for and serving HTTP or HTTPS requests.
@@ -137,6 +141,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.mgmt != nil {
 		s.mgmt.Close()
 	}
+	s.stopProxyWarmup()
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {

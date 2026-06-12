@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"database/sql"
 	"math"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 func makePseudoRandomText(size int) string {
@@ -249,6 +252,162 @@ func TestQuotaSnapshotPointsKeepFineGrainedSeries(t *testing.T) {
 	}
 }
 
+func TestRecordQuotaSnapshotPointsIdentityStoresWeeklyCycleBySubject(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	recordedAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	resetAt := recordedAt.Add(6 * 24 * time.Hour)
+	remaining := 93.0
+
+	err := RecordQuotaSnapshotPointsIdentity("auth-pro", "authsub_test", "codex", []QuotaSnapshotPoint{
+		{
+			RecordedAt:    recordedAt,
+			QuotaKey:      "code_week",
+			QuotaLabel:    "m_quota.code_weekly",
+			Percent:       &remaining,
+			ResetAt:       &resetAt,
+			WindowSeconds: 604800,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RecordQuotaSnapshotPointsIdentity() error = %v", err)
+	}
+
+	cycle, err := QueryLatestWeeklyQuotaCycleByAuthSubject("authsub_test")
+	if err != nil {
+		t.Fatalf("QueryLatestWeeklyQuotaCycleByAuthSubject() error = %v", err)
+	}
+	if cycle == nil {
+		t.Fatal("expected weekly cycle, got nil")
+	}
+	if cycle.AuthIndex != "auth-pro" {
+		t.Fatalf("AuthIndex = %q, want auth-pro", cycle.AuthIndex)
+	}
+	if cycle.QuotaKey != "code_week" {
+		t.Fatalf("QuotaKey = %q, want code_week", cycle.QuotaKey)
+	}
+	wantStart := resetAt.Add(-7 * 24 * time.Hour)
+	if !cycle.CycleStartAt.Equal(wantStart) {
+		t.Fatalf("CycleStartAt = %s, want %s", cycle.CycleStartAt.Format(time.RFC3339), wantStart.Format(time.RFC3339))
+	}
+	if !cycle.ResetAt.Equal(resetAt) {
+		t.Fatalf("ResetAt = %s, want %s", cycle.ResetAt.Format(time.RFC3339), resetAt.Format(time.RFC3339))
+	}
+}
+
+func TestQueryLatestWeeklyQuotaCycleByAuthSubjectFiltersPreferredQuotaKeys(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	recordedAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	codeResetAt := recordedAt.Add(6 * 24 * time.Hour)
+	additionalResetAt := codeResetAt.Add(3 * time.Hour)
+	codeRemaining := 99.0
+	additionalRemaining := 100.0
+
+	err := RecordQuotaSnapshotPointsIdentity("auth-pro", "authsub_test", "codex", []QuotaSnapshotPoint{
+		{
+			RecordedAt:    recordedAt,
+			QuotaKey:      "code_week",
+			QuotaLabel:    "m_quota.code_weekly",
+			Percent:       &codeRemaining,
+			ResetAt:       &codeResetAt,
+			WindowSeconds: 604800,
+		},
+		{
+			RecordedAt:    recordedAt,
+			QuotaKey:      "additional:codex_bengalfox:week",
+			QuotaLabel:    "GPT-5.3-Codex-Spark: Weekly",
+			Percent:       &additionalRemaining,
+			ResetAt:       &additionalResetAt,
+			WindowSeconds: 604800,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RecordQuotaSnapshotPointsIdentity() error = %v", err)
+	}
+
+	cycle, err := QueryLatestWeeklyQuotaCycleByAuthSubject("authsub_test", "code_week")
+	if err != nil {
+		t.Fatalf("QueryLatestWeeklyQuotaCycleByAuthSubject() error = %v", err)
+	}
+	if cycle == nil {
+		t.Fatal("expected filtered weekly cycle, got nil")
+	}
+	if cycle.QuotaKey != "code_week" {
+		t.Fatalf("QuotaKey = %q, want code_week", cycle.QuotaKey)
+	}
+	if !cycle.CycleStartAt.Equal(codeResetAt.Add(-7 * 24 * time.Hour)) {
+		t.Fatalf("CycleStartAt = %s, want %s", cycle.CycleStartAt.Format(time.RFC3339), codeResetAt.Add(-7*24*time.Hour).Format(time.RFC3339))
+	}
+}
+
+func TestQueryUsageByAuthSubjectMatchesLegacyEmailRows(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	auth := &coreauth.Auth{
+		ID:       "codex-pro-auth",
+		FileName: "codex-user@example.com-pro.json",
+		Provider: "codex",
+		Label:    "user@example.com",
+		Metadata: map[string]any{
+			"email":      "user@example.com",
+			"account_id": "acct_user_1",
+			"plan_type":  "pro",
+		},
+	}
+	auth.EnsureIndex()
+	identity := ResolveAuthSubjectIdentity(auth)
+	if identity == nil || identity.ID == "" {
+		t.Fatalf("ResolveAuthSubjectIdentity() = %+v, want non-empty subject id", identity)
+	}
+	matcher := BuildAuthSubjectMatcher(auth, []*coreauth.Auth{auth})
+
+	if err := UpsertModelPricing("gpt-5.4", 1, 2, 0); err != nil {
+		t.Fatalf("UpsertModelPricing: %v", err)
+	}
+
+	now := time.Now().UTC()
+	start := now.Add(-24 * time.Hour)
+	InsertLog("", "", "gpt-5.4", "user@example.com", "user@example.com", "legacy-plus-index", false, now.Add(-2*time.Hour), 1, 1, TokenStats{
+		InputTokens:  1000,
+		OutputTokens: 2000,
+		TotalTokens:  3000,
+	}, "", "")
+	InsertLogWithDetailsIdentitySubject("", "", identity.ID, "", "gpt-5.4", "user@example.com", "user@example.com", auth.Index, false, now.Add(-time.Hour), 1, 1, TokenStats{
+		InputTokens:  1000,
+		OutputTokens: 1000,
+		TotalTokens:  2000,
+	}, "", "", "")
+
+	count, err := QueryRequestCountByAuthSubjectSince(matcher, start)
+	if err != nil {
+		t.Fatalf("QueryRequestCountByAuthSubjectSince() error = %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+
+	cost, err := QueryCostByAuthSubjectSince(matcher, start)
+	if err != nil {
+		t.Fatalf("QueryCostByAuthSubjectSince() error = %v", err)
+	}
+	if math.Abs(cost-0.008) > 1e-12 {
+		t.Fatalf("cost = %v, want 0.008", cost)
+	}
+
+	daily, err := QueryDailyCallsByAuthSubject(matcher, 2)
+	if err != nil {
+		t.Fatalf("QueryDailyCallsByAuthSubject() error = %v", err)
+	}
+	var total int64
+	for _, point := range daily {
+		total += point.Requests
+	}
+	if total != 2 {
+		t.Fatalf("daily total requests = %d, want 2 (%+v)", total, daily)
+	}
+}
+
 func TestQueryLogsSupportsSystemRequestLogFilterValue(t *testing.T) {
 	initTestUsageDB(t, config.RequestLogStorageConfig{})
 
@@ -279,6 +438,47 @@ func TestQueryLogsSupportsSystemRequestLogFilterValue(t *testing.T) {
 		if item.APIKey == "sk-live-123" {
 			t.Fatalf("unexpected non-system api key in system filter result: %q", item.APIKey)
 		}
+	}
+}
+
+func TestQueryLogsSupportsExplicitEmptyMultiSelectFilters(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	now := time.Now().UTC()
+	InsertLog("sk-live-123", "Primary", "gpt-5.4", "codex", "Codex", "auth-1", false, now, 140, 14, TokenStats{
+		InputTokens: 1, OutputTokens: 1, TotalTokens: 2,
+	}, "", "")
+
+	result, err := QueryLogs(LogQueryParams{
+		Page:           1,
+		Size:           10,
+		Days:           1,
+		MatchNoAPIKeys: true,
+	})
+	if err != nil {
+		t.Fatalf("QueryLogs() with MatchNoAPIKeys error = %v", err)
+	}
+	if len(result.Items) != 0 {
+		t.Fatalf("MatchNoAPIKeys items = %d, want 0", len(result.Items))
+	}
+	if result.Total != 0 {
+		t.Fatalf("MatchNoAPIKeys total = %d, want 0", result.Total)
+	}
+
+	stats, err := QueryStats(LogQueryParams{
+		Page:          1,
+		Size:          10,
+		Days:          1,
+		MatchNoModels: true,
+	})
+	if err != nil {
+		t.Fatalf("QueryStats() with MatchNoModels error = %v", err)
+	}
+	if stats.Total != 0 {
+		t.Fatalf("MatchNoModels stats.Total = %d, want 0", stats.Total)
+	}
+	if stats.TotalTokens != 0 || stats.TotalCost != 0 || stats.SuccessRate != 0 {
+		t.Fatalf("MatchNoModels stats = %+v, want all zero values", stats)
 	}
 }
 
@@ -419,6 +619,107 @@ func TestInitDBMigratesFirstTokenColumn(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected first_token_ms column to exist after InitDB migration")
+	}
+}
+
+func TestInitDBMigratesAuthSubjectColumnsAndCycleTable(t *testing.T) {
+	CloseDB()
+	dbPath := filepath.Join(t.TempDir(), "usage.db")
+
+	legacyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacyDB.Exec(`
+		CREATE TABLE request_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp DATETIME NOT NULL,
+			api_key TEXT NOT NULL DEFAULT '',
+			api_key_name TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT '',
+			channel_name TEXT NOT NULL DEFAULT '',
+			auth_index TEXT NOT NULL DEFAULT '',
+			failed INTEGER NOT NULL DEFAULT 0,
+			latency_ms INTEGER NOT NULL DEFAULT 0,
+			first_token_ms INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			cached_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			cost REAL NOT NULL DEFAULT 0,
+			input_content TEXT NOT NULL DEFAULT '',
+			output_content TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE auth_file_quota_snapshots (
+			date_key TEXT NOT NULL,
+			auth_index TEXT NOT NULL,
+			provider TEXT NOT NULL DEFAULT '',
+			quota_key TEXT NOT NULL,
+			percent REAL,
+			recorded_at DATETIME NOT NULL,
+			PRIMARY KEY (date_key, auth_index, quota_key)
+		);
+		CREATE TABLE auth_file_quota_snapshot_points (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			recorded_at DATETIME NOT NULL,
+			auth_index TEXT NOT NULL,
+			provider TEXT NOT NULL DEFAULT '',
+			quota_key TEXT NOT NULL,
+			quota_label TEXT NOT NULL DEFAULT '',
+			percent REAL,
+			reset_at DATETIME,
+			window_seconds INTEGER NOT NULL DEFAULT 0
+		);
+	`); err != nil {
+		t.Fatalf("create legacy tables: %v", err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	if err := InitDB(dbPath, config.RequestLogStorageConfig{}, time.UTC); err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	stopRequestLogMaintenance()
+	t.Cleanup(CloseDB)
+
+	db := getDB()
+	assertColumnExists := func(table string, want string) {
+		t.Helper()
+		rows, err := db.Query("PRAGMA table_info(" + table + ")")
+		if err != nil {
+			t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var cid int
+			var name, dataType string
+			var notNull int
+			var defaultValue any
+			var pk int
+			if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+				t.Fatalf("scan table info for %s: %v", table, err)
+			}
+			if name == want {
+				return
+			}
+		}
+		t.Fatalf("expected %s.%s to exist after InitDB migration", table, want)
+	}
+
+	assertColumnExists("request_logs", "auth_subject_id")
+	assertColumnExists("auth_file_quota_snapshots", "auth_subject_id")
+	assertColumnExists("auth_file_quota_snapshot_points", "auth_subject_id")
+
+	var cycleTableName string
+	if err := db.QueryRow("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'auth_subject_quota_cycles'").Scan(&cycleTableName); err != nil {
+		t.Fatalf("query auth_subject_quota_cycles existence: %v", err)
+	}
+	if cycleTableName != "auth_subject_quota_cycles" {
+		t.Fatalf("cycle table name = %q, want auth_subject_quota_cycles", cycleTableName)
 	}
 }
 
@@ -1074,6 +1375,178 @@ func TestDeleteLogsByAPIKeyRemovesLogsAndContent(t *testing.T) {
 	// Only sk-other's content should remain (1 row)
 	if contentCount != 1 {
 		t.Fatalf("expected 1 content row (sk-other only), got %d", contentCount)
+	}
+}
+
+func TestBackfillRequestLogAPIKeyIDsUsesUniqueAPIKeyName(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	if err := UpsertAPIKey(APIKeyRow{ID: "stable-key-1", Key: "sk-current", Name: "袁蔚"}); err != nil {
+		t.Fatalf("UpsertAPIKey(sk-current): %v", err)
+	}
+
+	db := getDB()
+	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(
+		`INSERT INTO request_logs
+			(timestamp, api_key, api_key_name, model, source, channel_name, auth_index,
+			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		timestamp, "sk-legacy", "袁蔚", "gpt-test", "source", "channel", "auth-1",
+		0, 123, 45, 10, 20, 0, 0, 30, 0,
+	); err != nil {
+		t.Fatalf("insert legacy request_log: %v", err)
+	}
+
+	backfillRequestLogAPIKeyIDs(db)
+
+	var apiKeyID string
+	if err := db.QueryRow("SELECT api_key_id FROM request_logs WHERE api_key = ?", "sk-legacy").Scan(&apiKeyID); err != nil {
+		t.Fatalf("query api_key_id: %v", err)
+	}
+	if apiKeyID != "stable-key-1" {
+		t.Fatalf("api_key_id = %q, want stable-key-1", apiKeyID)
+	}
+}
+
+func TestBackfillRequestLogAPIKeyIDsUsesHistoricalRawKeyIdentity(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	if err := UpsertAPIKey(APIKeyRow{ID: "stable-key-1", Key: "sk-current", Name: "袁蔚"}); err != nil {
+		t.Fatalf("UpsertAPIKey(sk-current): %v", err)
+	}
+
+	db := getDB()
+	firstTS := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	secondTS := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(
+		`INSERT INTO request_logs
+			(timestamp, api_key, api_key_id, api_key_name, model, source, channel_name, auth_index,
+			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		firstTS, "sk-legacy", "stable-key-1", "袁蔚", "gpt-test", "source", "channel", "auth-1",
+		0, 123, 45, 10, 20, 0, 0, 30, 0,
+	); err != nil {
+		t.Fatalf("insert resolved request_log: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO request_logs
+			(timestamp, api_key, api_key_id, api_key_name, model, source, channel_name, auth_index,
+			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		secondTS, "sk-legacy", "", "", "gpt-test", "source", "channel", "auth-1",
+		0, 123, 45, 10, 20, 0, 0, 30, 0,
+	); err != nil {
+		t.Fatalf("insert orphan request_log: %v", err)
+	}
+
+	backfillRequestLogAPIKeyIDs(db)
+
+	var apiKeyID string
+	if err := db.QueryRow(
+		"SELECT api_key_id FROM request_logs WHERE api_key = ? AND timestamp = ?",
+		"sk-legacy", secondTS,
+	).Scan(&apiKeyID); err != nil {
+		t.Fatalf("query orphan api_key_id: %v", err)
+	}
+	if apiKeyID != "stable-key-1" {
+		t.Fatalf("orphan api_key_id = %q, want stable-key-1", apiKeyID)
+	}
+}
+
+func TestQueryAPIKeySelectorsHandleLegacyRowsWithoutAPIKeyID(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	db := getDB()
+	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(
+		`INSERT INTO request_logs
+			(timestamp, api_key, api_key_name, model, source, channel_name, auth_index,
+			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		timestamp, "sk-legacy", "袁蔚", "gpt-test", "source", "channel", "auth-1",
+		0, 123, 45, 10, 20, 0, 0, 30, 0,
+	); err != nil {
+		t.Fatalf("insert legacy request_log: %v", err)
+	}
+
+	filters, err := QueryFilters(7)
+	if err != nil {
+		t.Fatalf("QueryFilters() error = %v", err)
+	}
+	if len(filters.APIKeys) != 1 || filters.APIKeys[0] != "sk-legacy" {
+		t.Fatalf("filters.APIKeys = %#v, want [sk-legacy]", filters.APIKeys)
+	}
+	if filters.APIKeyNames["sk-legacy"] != "袁蔚" {
+		t.Fatalf("filters.APIKeyNames[sk-legacy] = %q, want 袁蔚", filters.APIKeyNames["sk-legacy"])
+	}
+
+	dist, err := QueryAPIKeyDistribution(7)
+	if err != nil {
+		t.Fatalf("QueryAPIKeyDistribution() error = %v", err)
+	}
+	if len(dist) != 1 {
+		t.Fatalf("distribution len = %d, want 1: %#v", len(dist), dist)
+	}
+	if dist[0].APIKey != "sk-legacy" {
+		t.Fatalf("distribution api_key = %q, want sk-legacy", dist[0].APIKey)
+	}
+	if dist[0].Name != "袁蔚" {
+		t.Fatalf("distribution name = %q, want 袁蔚", dist[0].Name)
+	}
+	if dist[0].Requests != 1 || dist[0].Tokens != 30 {
+		t.Fatalf("distribution point = %#v, want one request and 30 tokens", dist[0])
+	}
+}
+
+func TestRequestStatisticsPersistsAPIKeyIdentitySnapshotAcrossRename(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	const stableID = "stable-key-1"
+	if err := UpsertAPIKey(APIKeyRow{ID: stableID, Key: "sk-old", Name: "袁蔚"}); err != nil {
+		t.Fatalf("UpsertAPIKey(sk-old): %v", err)
+	}
+	if err := UpdateAPIKeyByID(APIKeyRow{ID: stableID, Key: "sk-new", Name: "袁蔚"}); err != nil {
+		t.Fatalf("UpdateAPIKeyByID(sk-new): %v", err)
+	}
+
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "sk-old",
+		APIKeyID:    stableID,
+		APIKeyName:  "袁蔚",
+		Model:       "gpt-5.5",
+		Source:      "source",
+		ChannelName: "channel",
+		AuthIndex:   "auth-1",
+		RequestedAt: time.Now().UTC(),
+		Detail: coreusage.Detail{
+			InputTokens:  1,
+			OutputTokens: 2,
+			TotalTokens:  3,
+		},
+	})
+
+	filters, err := QueryFilters(7)
+	if err != nil {
+		t.Fatalf("QueryFilters() error = %v", err)
+	}
+	if len(filters.APIKeys) != 1 || filters.APIKeys[0] != "sk-new" {
+		t.Fatalf("filters.APIKeys = %#v, want [sk-new]", filters.APIKeys)
+	}
+	if filters.APIKeyNames["sk-new"] != "袁蔚" {
+		t.Fatalf("filters.APIKeyNames[sk-new] = %q, want 袁蔚", filters.APIKeyNames["sk-new"])
+	}
+
+	dist, err := QueryAPIKeyDistribution(7)
+	if err != nil {
+		t.Fatalf("QueryAPIKeyDistribution() error = %v", err)
+	}
+	if len(dist) != 1 || dist[0].APIKey != "sk-new" {
+		t.Fatalf("distribution = %#v, want one sk-new point", dist)
+	}
+	if dist[0].Name != "袁蔚" {
+		t.Fatalf("distribution name = %q, want 袁蔚", dist[0].Name)
 	}
 }
 

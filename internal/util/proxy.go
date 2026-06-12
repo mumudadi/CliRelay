@@ -75,15 +75,20 @@ func BuildProxyTransport(proxyURL string, preferIPv4 bool) *http.Transport {
 			password, _ := parsedURL.User.Password()
 			proxyAuth = &proxy.Auth{User: username, Password: password}
 		}
-		dialer, errSOCKS5 := proxy.SOCKS5("tcp", parsedURL.Host, proxyAuth, proxy.Direct)
+		proxyNetwork := "tcp"
+		if preferIPv4 {
+			proxyNetwork = "tcp4"
+		}
+		forwardDialer := &net.Dialer{Timeout: DefaultHTTPDialTimeout, KeepAlive: 30 * time.Second}
+		dialer, errSOCKS5 := proxy.SOCKS5(proxyNetwork, parsedURL.Host, proxyAuth, forwardDialer)
 		if errSOCKS5 != nil {
 			log.Errorf("create SOCKS5 dialer failed: %v", errSOCKS5)
 			return nil
 		}
 		transport.Proxy = nil
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if preferIPv4 {
-				network = "tcp4"
+			if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+				return contextDialer.DialContext(ctx, network, addr)
 			}
 			return dialer.Dial(network, addr)
 		}

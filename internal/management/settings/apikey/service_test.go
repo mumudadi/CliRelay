@@ -76,6 +76,38 @@ func TestPatchAndDeleteKey(t *testing.T) {
 	}
 }
 
+func TestPatchEntryRenamePreservesStableID(t *testing.T) {
+	setupTestDB(t)
+	svc := NewService(nil)
+
+	if err := usage.UpsertAPIKey(usage.APIKeyRow{ID: "key-1", Key: "sk-old", Name: "Old"}); err != nil {
+		t.Fatalf("UpsertAPIKey(sk-old): %v", err)
+	}
+
+	newKey := "sk-new"
+	newName := "Renamed"
+	if err := svc.PatchEntry(&[]string{"key-1"}[0], nil, nil, EntryPatch{
+		Key:  &newKey,
+		Name: &newName,
+	}); err != nil {
+		t.Fatalf("PatchEntry() error = %v", err)
+	}
+
+	if got := usage.GetAPIKey("sk-old"); got != nil {
+		t.Fatalf("old key should not remain addressable by key, got %#v", got)
+	}
+	got := usage.GetAPIKey("sk-new")
+	if got == nil {
+		t.Fatal("expected renamed API key to exist")
+	}
+	if got.ID != "key-1" {
+		t.Fatalf("stable id = %q, want key-1", got.ID)
+	}
+	if got.Name != "Renamed" {
+		t.Fatalf("name = %q, want Renamed", got.Name)
+	}
+}
+
 func TestReplacePermissionProfilesValidatesAndSanitizes(t *testing.T) {
 	setupTestDB(t)
 	svc := NewService(func(channels []string) ([]string, error) {
@@ -232,7 +264,7 @@ func TestPatchEntryValidationFailureKeepsOriginalKey(t *testing.T) {
 
 	newKey := "sk-new"
 	name := "Renamed"
-	err := svc.PatchEntry(nil, &[]string{"sk-old"}[0], EntryPatch{
+	err := svc.PatchEntry(nil, nil, &[]string{"sk-old"}[0], EntryPatch{
 		Key:  &newKey,
 		Name: &name,
 	})
@@ -262,7 +294,7 @@ func TestDeleteEntryByIndexDeletesLogsWhenRequested(t *testing.T) {
 		t.Fatalf("UpsertAPIKey(sk-delete): %v", err)
 	}
 
-	result, err := svc.DeleteEntry("", &[]int{0}[0], true)
+	result, err := svc.DeleteEntry("", nil, &[]int{0}[0], true)
 	if err != nil {
 		t.Fatalf("DeleteEntry() error = %v, want nil", err)
 	}

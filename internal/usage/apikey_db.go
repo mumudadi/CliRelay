@@ -156,14 +156,29 @@ func GetAPIKey(key string) *APIKeyRow {
 	return apiKeyStore().Get(key)
 }
 
+// GetAPIKeyByID retrieves a single API key entry by stable id.
+func GetAPIKeyByID(id string) *APIKeyRow {
+	return apiKeyStore().GetByID(id)
+}
+
 // UpsertAPIKey inserts or updates an API key entry.
 func UpsertAPIKey(entry APIKeyRow) error {
 	return apiKeyStore().Upsert(entry)
 }
 
+// UpdateAPIKeyByID updates an API key entry by stable id.
+func UpdateAPIKeyByID(entry APIKeyRow) error {
+	return apiKeyStore().UpdateByID(entry)
+}
+
 // DeleteAPIKey removes an API key entry by key string.
 func DeleteAPIKey(key string) error {
 	return apiKeyStore().Delete(key)
+}
+
+// DeleteAPIKeyByID removes an API key entry by stable id.
+func DeleteAPIKeyByID(id string) error {
+	return apiKeyStore().DeleteByID(id)
 }
 
 // ReplaceAllAPIKeys atomically replaces all API keys with the given list.

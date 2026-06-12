@@ -2,10 +2,10 @@ package api
 
 import (
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"strings"
 )
 
 const (
@@ -25,6 +25,8 @@ func publicLookupNoStoreMiddleware() gin.HandlerFunc {
 		c.Header("Cache-Control", "no-store, private, max-age=0")
 		c.Header("Pragma", "no-cache")
 		c.Header("Expires", "0")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Header("X-Content-Type-Options", "nosniff")
 		c.Next()
 	}
 }
@@ -43,12 +45,6 @@ func (s *Server) publicLookupRateLimitMiddleware() gin.HandlerFunc {
 		}
 		if key == "" {
 			key = "unknown"
-		}
-		if c != nil && c.Request != nil {
-			userAgent := strings.TrimSpace(c.Request.UserAgent())
-			if userAgent != "" {
-				key += "|" + userAgent
-			}
 		}
 
 		allowed, retryAfter := s.allowPublicLookupRequest(key, now)

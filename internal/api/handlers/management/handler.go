@@ -4,7 +4,6 @@ package management
 
 import (
 	"context"
-	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"os"
@@ -19,6 +18,7 @@ import (
 	imagegeneration "github.com/router-for-me/CLIProxyAPI/v6/internal/management/imagegeneration"
 	settingsstore "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/store"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -281,7 +281,8 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 				h.attemptsMu.Unlock()
 			}
 		}
-		if secretHash == "" && envSecret == "" {
+		localPasswordConfigured := localClient && h.localPassword != ""
+		if secretHash == "" && envSecret == "" && !localPasswordConfigured {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management key not set"})
 			return
 		}
@@ -299,14 +300,16 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		if provided == "" {
 			provided = c.GetHeader("X-Management-Key")
 		}
-		// Fallback: ?token= query param (needed for WebSocket — browsers can't set custom headers)
-		if provided == "" {
+		// Fallback: ?token= query param is accepted only for WebSocket handshakes;
+		// normal HTTP requests must not carry credentials in URLs.
+		if provided == "" && shouldReadManagementTokenFromQuery(c) {
 			provided = c.Query("token")
 		}
 
 		if provided == "" {
 			if !localClient {
 				if remaining, banned := isBanned(); banned {
+					c.Header("Retry-After", retryAfterSecondsHeader(remaining))
 					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)})
 					return
 				}
@@ -318,14 +321,14 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		if localClient {
 			if lp := h.localPassword; lp != "" {
-				if subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
+				if util.ConstantTimeStringEqual(provided, lp) {
 					c.Next()
 					return
 				}
 			}
 		}
 
-		if envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1 {
+		if envSecret != "" && util.ConstantTimeStringEqual(provided, envSecret) {
 			clearFailures()
 			c.Next()
 			return
@@ -334,6 +337,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		if secretHash == "" || bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
 			if !localClient {
 				if remaining, banned := isBanned(); banned {
+					c.Header("Retry-After", retryAfterSecondsHeader(remaining))
 					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)})
 					return
 				}

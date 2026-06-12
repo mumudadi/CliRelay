@@ -128,14 +128,17 @@ func QueryLogContentForKey(id int64, apiKey string) (LogContentResult, error) {
 	if db == nil {
 		return LogContentResult{}, fmt.Errorf("usage: database not initialised")
 	}
+	clause, args := buildSingleAPIKeySelectorClause(apiKey)
+	predicate := strings.TrimPrefix(clause, " WHERE ")
+	queryArgs := append([]interface{}{id}, args...)
 
 	result, err := queryCompressedLogContent(
 		db,
 		`SELECT logs.id, logs.model, content.compression, content.input_content, content.output_content
 		 FROM request_logs logs
 		 JOIN request_log_content content ON content.log_id = logs.id
-		 WHERE logs.id = ? AND logs.api_key = ?`,
-		id, apiKey,
+		 WHERE logs.id = ? AND `+predicate,
+		queryArgs...,
 	)
 	if err == nil {
 		return result, nil
@@ -143,7 +146,8 @@ func QueryLogContentForKey(id int64, apiKey string) (LogContentResult, error) {
 
 	var fallback LogContentResult
 	err = db.QueryRow(
-		"SELECT id, model, input_content, output_content FROM request_logs WHERE id = ? AND api_key = ?", id, apiKey,
+		"SELECT id, model, input_content, output_content FROM request_logs WHERE id = ? AND "+predicate,
+		queryArgs...,
 	).Scan(&fallback.ID, &fallback.Model, &fallback.InputContent, &fallback.OutputContent)
 	if err != nil {
 		return LogContentResult{}, fmt.Errorf("usage: query log content: %w", err)
@@ -170,6 +174,9 @@ func QueryLogContentPartForKey(id int64, apiKey string, part string) (LogContent
 	} else if part == "details" {
 		column = "detail_content"
 	}
+	clause, args := buildSingleAPIKeySelectorClause(apiKey)
+	predicate := strings.TrimPrefix(clause, " WHERE ")
+	queryArgs := append([]interface{}{id}, args...)
 
 	result, err := queryCompressedLogContentPart(
 		db,
@@ -178,10 +185,11 @@ func QueryLogContentPartForKey(id int64, apiKey string, part string) (LogContent
 			`SELECT logs.id, logs.model, content.compression, content.%s
 			 FROM request_logs logs
 			 JOIN request_log_content content ON content.log_id = logs.id
-			 WHERE logs.id = ? AND logs.api_key = ?`,
+			 WHERE logs.id = ? AND %s`,
 			column,
+			predicate,
 		),
-		id, apiKey,
+		queryArgs...,
 	)
 	if err == nil {
 		return result, nil
@@ -189,7 +197,7 @@ func QueryLogContentPartForKey(id int64, apiKey string, part string) (LogContent
 	if part == "details" {
 		var fallback LogContentPartResult
 		fallback.Part = part
-		err = db.QueryRow("SELECT id, model FROM request_logs WHERE id = ? AND api_key = ?", id, apiKey).Scan(&fallback.ID, &fallback.Model)
+		err = db.QueryRow("SELECT id, model FROM request_logs WHERE id = ? AND "+predicate, queryArgs...).Scan(&fallback.ID, &fallback.Model)
 		if err != nil {
 			return LogContentPartResult{}, fmt.Errorf("usage: query log content part: %w", err)
 		}
@@ -199,8 +207,8 @@ func QueryLogContentPartForKey(id int64, apiKey string, part string) (LogContent
 	var fallback LogContentPartResult
 	fallback.Part = part
 	err = db.QueryRow(
-		fmt.Sprintf("SELECT id, model, %s FROM request_logs WHERE id = ? AND api_key = ?", column),
-		id, apiKey,
+		fmt.Sprintf("SELECT id, model, %s FROM request_logs WHERE id = ? AND %s", column, predicate),
+		queryArgs...,
 	).Scan(&fallback.ID, &fallback.Model, &fallback.Content)
 	if err != nil {
 		return LogContentPartResult{}, fmt.Errorf("usage: query log content part: %w", err)

@@ -217,3 +217,44 @@ func TestGetUsageLogEgressHandlesHistoricalLogsWithoutMetadata(t *testing.T) {
 		t.Fatal("using_proxy = true, want false")
 	}
 }
+
+func TestExtractUsageLogProbeIPParsesCloudflareTrace(t *testing.T) {
+	body := []byte("fl=1230f106\nh=chatgpt.com\nip=66.227.101.209\nts=1781158999.000\n")
+	if got := extractUsageLogProbeIP(body); got != "66.227.101.209" {
+		t.Fatalf("extractUsageLogProbeIP(trace) = %q, want %q", got, "66.227.101.209")
+	}
+}
+
+func TestProbeUsageLogEgressIPFallsBackToPlainIPProbe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/trace":
+			_, _ = w.Write([]byte("fl=1230f106\nh=chatgpt.com\nwarp=off\n"))
+		case "/plain":
+			_, _ = w.Write([]byte("203.0.113.50\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	savedProbeURLs := usageLogEgressProbeURLs
+	usageLogEgressProbeURLs = []string{
+		server.URL + "/trace",
+		server.URL + "/plain",
+	}
+	t.Cleanup(func() {
+		usageLogEgressProbeURLs = savedProbeURLs
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	got, err := probeUsageLogEgressIP(ctx, "", nil)
+	if err != nil {
+		t.Fatalf("probeUsageLogEgressIP: %v", err)
+	}
+	if got != "203.0.113.50" {
+		t.Fatalf("probeUsageLogEgressIP = %q, want %q", got, "203.0.113.50")
+	}
+}

@@ -75,6 +75,9 @@ func buildRequestDetailContent(ctx context.Context) string {
 	if egress := requestLogEgressFromContext(ginCtx); len(egress) > 0 {
 		detail["egress"] = egress
 	}
+	if timing := upstreamTimingFromContext(ginCtx); len(timing) > 0 {
+		detail["upstream_timing"] = timing
+	}
 
 	data, err := json.Marshal(detail)
 	if err != nil {

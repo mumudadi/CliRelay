@@ -95,6 +95,10 @@ type StreamingConfig struct {
 
 // APIKeyEntry represents an API key with optional metadata for advanced management.
 type APIKeyEntry struct {
+	// ID is the stable identity of this logical API key entry.
+	// It is API-managed only and is not persisted back into YAML.
+	ID string `yaml:"-" json:"id,omitempty"`
+
 	// Key is the API key string used for authentication.
 	Key string `yaml:"key" json:"key"`
 

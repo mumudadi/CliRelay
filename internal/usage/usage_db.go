@@ -37,17 +37,21 @@ type LogRow struct {
 
 // LogQueryParams holds filter/pagination parameters for QueryLogs.
 type LogQueryParams struct {
-	Page         int      // 1-based
-	Size         int      // rows per page
-	Days         int      // time range in days
-	APIKey       string   // exact match filter (deprecated, use APIKeys)
-	Model        string   // exact match filter (deprecated, use Models)
-	Status       string   // "success", "failed", or "" (all) (deprecated, use Statuses)
-	APIKeys      []string // multi-value API key filter
-	Models       []string // multi-value model filter
-	Statuses     []string // multi-value status filter
-	AuthIndexes  []string // optional auth_index IN (...) filter
-	ChannelNames []string // optional channel_name IN (...) filter
+	Page            int      // 1-based
+	Size            int      // rows per page
+	Days            int      // time range in days
+	APIKey          string   // exact match filter (deprecated, use APIKeys)
+	Model           string   // exact match filter (deprecated, use Models)
+	Status          string   // "success", "failed", or "" (all) (deprecated, use Statuses)
+	APIKeys         []string // multi-value API key filter
+	Models          []string // multi-value model filter
+	Statuses        []string // multi-value status filter
+	MatchNoAPIKeys  bool     // explicit empty API key filter
+	MatchNoModels   bool     // explicit empty model filter
+	MatchNoStatuses bool     // explicit empty status filter
+	MatchNoChannels bool     // explicit empty channel filter
+	AuthIndexes     []string // optional auth_index IN (...) filter
+	ChannelNames    []string // optional channel_name IN (...) filter
 	// Optional precise legacy matches for renamed auth channels whose stored
 	// channel_name was a shared provider/source value.
 	AuthIndexChannelNames map[string][]string
@@ -115,6 +119,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   timestamp        DATETIME NOT NULL,
   api_key          TEXT NOT NULL DEFAULT '',
+  api_key_id       TEXT NOT NULL DEFAULT '',
+  auth_subject_id  TEXT NOT NULL DEFAULT '',
   model            TEXT NOT NULL DEFAULT '',
   source           TEXT NOT NULL DEFAULT '',
   channel_name     TEXT NOT NULL DEFAULT '',
@@ -151,6 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_log_content_timestamp ON request_log_content(time
 CREATE TABLE IF NOT EXISTS auth_file_quota_snapshots (
   date_key      TEXT NOT NULL,
   auth_index    TEXT NOT NULL,
+  auth_subject_id TEXT NOT NULL DEFAULT '',
   provider      TEXT NOT NULL DEFAULT '',
   quota_key     TEXT NOT NULL,
   percent       REAL,
@@ -165,6 +172,7 @@ CREATE TABLE IF NOT EXISTS auth_file_quota_snapshot_points (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   recorded_at    DATETIME NOT NULL,
   auth_index     TEXT NOT NULL,
+  auth_subject_id TEXT NOT NULL DEFAULT '',
   provider       TEXT NOT NULL DEFAULT '',
   quota_key      TEXT NOT NULL,
   quota_label    TEXT NOT NULL DEFAULT '',
@@ -175,6 +183,21 @@ CREATE TABLE IF NOT EXISTS auth_file_quota_snapshot_points (
 
 CREATE INDEX IF NOT EXISTS idx_quota_snapshot_points_auth_time ON auth_file_quota_snapshot_points(auth_index, recorded_at);
 CREATE INDEX IF NOT EXISTS idx_quota_snapshot_points_auth_key_time ON auth_file_quota_snapshot_points(auth_index, quota_key, recorded_at);
+
+CREATE TABLE IF NOT EXISTS auth_subject_quota_cycles (
+  subject_id       TEXT NOT NULL,
+  auth_index       TEXT NOT NULL DEFAULT '',
+  provider         TEXT NOT NULL DEFAULT '',
+  quota_key        TEXT NOT NULL,
+  cycle_start_at   DATETIME NOT NULL,
+  reset_at         DATETIME NOT NULL,
+  window_seconds   INTEGER NOT NULL DEFAULT 0,
+  last_verified_at DATETIME NOT NULL,
+  PRIMARY KEY (subject_id, quota_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_subject_quota_cycles_subject_window
+  ON auth_subject_quota_cycles(subject_id, window_seconds, last_verified_at);
 `
 
 // migrateContentColumns adds input_content/output_content columns to an
@@ -210,6 +233,62 @@ func migrateApiKeyNameColumn(db *sql.DB) {
 		if !strings.Contains(err.Error(), "duplicate") {
 			log.Warnf("usage: migrate column api_key_name: %v", err)
 		}
+	}
+}
+
+func migrateAPIKeyIDColumn(db *sql.DB) {
+	_, err := db.Exec("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT NOT NULL DEFAULT ''")
+	if err != nil {
+		if !strings.Contains(err.Error(), "duplicate") {
+			log.Warnf("usage: migrate column api_key_id: %v", err)
+		}
+	}
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id)"); err != nil {
+		log.Warnf("usage: create idx_logs_api_key_id: %v", err)
+	}
+}
+
+func migrateAuthSubjectIDColumns(db *sql.DB) {
+	for _, stmt := range []string{
+		"ALTER TABLE request_logs ADD COLUMN auth_subject_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE auth_file_quota_snapshots ADD COLUMN auth_subject_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE auth_file_quota_snapshot_points ADD COLUMN auth_subject_id TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			if !strings.Contains(err.Error(), "duplicate") {
+				log.Warnf("usage: migrate auth subject column: %v", err)
+			}
+		}
+	}
+	for _, stmt := range []string{
+		"CREATE INDEX IF NOT EXISTS idx_logs_auth_subject_id ON request_logs(auth_subject_id)",
+		"CREATE INDEX IF NOT EXISTS idx_quota_snapshots_subject ON auth_file_quota_snapshots(auth_subject_id)",
+		"CREATE INDEX IF NOT EXISTS idx_quota_snapshot_points_subject_time ON auth_file_quota_snapshot_points(auth_subject_id, recorded_at)",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Warnf("usage: create auth subject index: %v", err)
+		}
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS auth_subject_quota_cycles (
+		  subject_id       TEXT NOT NULL,
+		  auth_index       TEXT NOT NULL DEFAULT '',
+		  provider         TEXT NOT NULL DEFAULT '',
+		  quota_key        TEXT NOT NULL,
+		  cycle_start_at   DATETIME NOT NULL,
+		  reset_at         DATETIME NOT NULL,
+		  window_seconds   INTEGER NOT NULL DEFAULT 0,
+		  last_verified_at DATETIME NOT NULL,
+		  PRIMARY KEY (subject_id, quota_key)
+		)
+	`); err != nil {
+		log.Warnf("usage: create auth_subject_quota_cycles table: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_auth_subject_quota_cycles_subject_window
+		ON auth_subject_quota_cycles(subject_id, window_seconds, last_verified_at)
+	`); err != nil {
+		log.Warnf("usage: create idx_auth_subject_quota_cycles_subject_window: %v", err)
 	}
 }
 
@@ -297,6 +376,10 @@ func InitDB(dbPath string, storageCfg config.RequestLogStorageConfig, loc *time.
 	migrateCostColumn(db)
 	log.Debugf("usage: running api_key_name column migration")
 	migrateApiKeyNameColumn(db)
+	log.Debugf("usage: running api_key_id column migration")
+	migrateAPIKeyIDColumn(db)
+	log.Debugf("usage: running auth_subject_id column migration")
+	migrateAuthSubjectIDColumns(db)
 	log.Debugf("usage: running first_token_ms column migration")
 	migrateFirstTokenColumn(db)
 	log.Debugf("usage: running request log detail column migration")
@@ -307,6 +390,8 @@ func InitDB(dbPath string, storageCfg config.RequestLogStorageConfig, loc *time.
 	initModelConfigTables(db)
 	log.Debugf("usage: initializing api_keys table")
 	initAPIKeysTable(db)
+	log.Debugf("usage: backfilling request log api_key_id values")
+	backfillRequestLogAPIKeyIDs(db)
 	log.Debugf("usage: initializing api_key_permission_profiles table")
 	initAPIKeyPermissionProfilesTable(db)
 	log.Debugf("usage: initializing ccswitch_import_configs table")
@@ -341,16 +426,28 @@ func CloseDB() {
 func InsertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent string) {
-	insertLog(apiKey, apiKeyName, model, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, "")
+	insertLogIdentity(apiKey, "", "", apiKeyName, model, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, "")
 }
 
 func InsertLogWithDetails(apiKey, apiKeyName, model, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent, detailContent string) {
-	insertLog(apiKey, apiKeyName, model, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+	insertLogIdentity(apiKey, "", "", apiKeyName, model, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
 }
 
-func insertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
+func InsertLogWithDetailsIdentity(apiKey, apiKeyID, apiKeyName, model, source, channelName, authIndex string,
+	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
+	inputContent, outputContent, detailContent string) {
+	insertLogIdentity(apiKey, apiKeyID, "", apiKeyName, model, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+}
+
+func InsertLogWithDetailsIdentitySubject(apiKey, apiKeyID, authSubjectID, apiKeyName, model, source, channelName, authIndex string,
+	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
+	inputContent, outputContent, detailContent string) {
+	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+}
+
+func insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent, detailContent string) {
 	db := getDB()
@@ -366,6 +463,18 @@ func insertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
 	// Calculate cost based on model pricing using semantic cache read/write
 	cost := CalculateCostV2(model, tokens)
 
+	apiKeyID = strings.TrimSpace(apiKeyID)
+	authSubjectID = strings.TrimSpace(authSubjectID)
+	apiKeyName = strings.TrimSpace(apiKeyName)
+	if identity := ResolveAPIKeyIdentity(apiKey); identity != nil {
+		if apiKeyID == "" {
+			apiKeyID = identity.ID
+		}
+		if apiKeyName == "" {
+			apiKeyName = identity.Name
+		}
+	}
+
 	// 插入 request log 的事务由 usage 存储层统一拥有，不从外部 HTTP 请求透传 context，
 	// 以避免请求取消把已经选定要持久化的审计记录中断在半途。
 	tx, err := db.BeginTx(context.Background(), nil)
@@ -376,11 +485,11 @@ func insertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
 
 	result, err := tx.Exec(
 		`INSERT INTO request_logs
-			(timestamp, api_key, api_key_name, model, source, channel_name, auth_index,
+			(timestamp, api_key, api_key_id, auth_subject_id, api_key_name, model, source, channel_name, auth_index,
 			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		timestamp.UTC().Format(time.RFC3339Nano),
-		apiKey, apiKeyName, model, source, channelName, authIndex,
+		apiKey, apiKeyID, authSubjectID, apiKeyName, model, source, channelName, authIndex,
 		failedInt, latencyMs, firstTokenMs,
 		tokens.InputTokens, tokens.OutputTokens, tokens.ReasoningTokens,
 		tokens.CachedTokens, tokens.TotalTokens, cost,

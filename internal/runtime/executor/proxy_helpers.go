@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,13 @@ import (
 	sdkexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
+
+var globalWarmManager atomic.Pointer[ProxyWarmManager]
+
+// SetGlobalWarmManager installs the global warm manager used by newProxyAwareHTTPClient.
+func SetGlobalWarmManager(m *ProxyWarmManager) {
+	globalWarmManager.Store(m)
+}
 
 const requestLogEgressRouteKey = "cliproxy.request_log.egress_route"
 
@@ -58,23 +66,22 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
-		transport := util.BuildProxyTransport(proxyURL, cfg != nil && cfg.PreferIPv4)
+		transport := cachedProxyTransport(proxyURL, cfgToSDKCfg(cfg))
 		if transport != nil {
 			httpClient.Transport = transport
-			if sdkCfg := cfgToSDKCfg(cfg); sdkCfg != nil {
-				util.ApplyTLSConfig(transport, sdkCfg)
-			}
-			return httpClient
+		} else {
+			// If proxy setup failed, log and fall through to context RoundTripper
+			log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", maskProxyURLHost(proxyURL))
 		}
-		// If proxy setup failed, log and fall through to context RoundTripper
-		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
 	}
 
 	// Priority 4: Use RoundTripper from context (typically from RoundTripperFor)
-	if rt := sdkexecutor.RoundTripperFromContext(ctx); rt != nil {
-		httpClient.Transport = rt
-	} else if rt, ok := ctx.Value(util.ContextKeyRoundTripper).(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
+	if httpClient.Transport == nil {
+		if rt := sdkexecutor.RoundTripperFromContext(ctx); rt != nil {
+			httpClient.Transport = rt
+		} else if rt, ok := ctx.Value(util.ContextKeyRoundTripper).(http.RoundTripper); ok && rt != nil {
+			httpClient.Transport = rt
+		}
 	}
 
 	if httpClient.Transport == nil {
@@ -85,6 +92,17 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 	}
 
+	if proxyURL != "" {
+		if manager := globalWarmManager.Load(); manager != nil && httpClient.Transport != nil {
+			httpClient.Transport = &warmingRoundTripper{
+				base:    httpClient.Transport,
+				manager: manager,
+			}
+		}
+	}
+	if ginCtx, ok := ctx.Value(util.ContextKeyGin).(*gin.Context); ok && ginCtx != nil && httpClient.Transport != nil {
+		httpClient.Transport = &upstreamTracingTransport{base: httpClient.Transport, ginCtx: ginCtx}
+	}
 	return httpClient
 }
 

@@ -120,7 +120,7 @@ func shouldLimitRequestBody(req *http.Request) bool {
 		return false
 	}
 	switch req.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch:
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 	default:
 		return false
 	}

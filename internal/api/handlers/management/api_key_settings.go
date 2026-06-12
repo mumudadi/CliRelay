@@ -194,6 +194,7 @@ func (h *Handler) PutAPIKeyEntries(c *gin.Context) {
 
 func (h *Handler) PatchAPIKeyEntry(c *gin.Context) {
 	var body struct {
+		ID    *string                    `json:"id"`
 		Index *int                       `json:"index"`
 		Match *string                    `json:"match"`
 		Value *apikeysettings.EntryPatch `json:"value"`
@@ -202,7 +203,7 @@ func (h *Handler) PatchAPIKeyEntry(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
-	if err := h.apiKeySettings().PatchEntry(body.Index, body.Match, *body.Value); err != nil {
+	if err := h.apiKeySettings().PatchEntry(body.ID, body.Index, body.Match, *body.Value); err != nil {
 		switch {
 		case errors.Is(err, apikeysettings.ErrItemNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
@@ -222,6 +223,10 @@ func (h *Handler) PatchAPIKeyEntry(c *gin.Context) {
 }
 
 func (h *Handler) DeleteAPIKeyEntry(c *gin.Context) {
+	var id *string
+	if value := strings.TrimSpace(c.Query("id")); value != "" {
+		id = &value
+	}
 	var index *int
 	if idxStr := strings.TrimSpace(c.Query("index")); idxStr != "" {
 		parsed, err := strconv.Atoi(idxStr)
@@ -232,7 +237,7 @@ func (h *Handler) DeleteAPIKeyEntry(c *gin.Context) {
 		index = &parsed
 	}
 
-	result, err := h.apiKeySettings().DeleteEntry(c.Query("key"), index, shouldDeleteAPIKeyLogs(c))
+	result, err := h.apiKeySettings().DeleteEntry(c.Query("key"), id, index, shouldDeleteAPIKeyLogs(c))
 	if err != nil {
 		if errors.Is(err, apikeysettings.ErrMissingKeyOrIndex) {
 			c.JSON(400, gin.H{"error": "missing key or index"})

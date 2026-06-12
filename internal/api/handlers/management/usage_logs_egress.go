@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,6 +23,8 @@ import (
 const usageLogEgressProbeTimeout = 6 * time.Second
 
 var usageLogEgressProbeURLs = []string{
+	"https://chatgpt.com/cdn-cgi/trace",
+	"https://openai.com/cdn-cgi/trace",
 	"https://api.ipify.org",
 	"https://ifconfig.me/ip",
 	"https://icanhazip.com",
@@ -292,15 +295,39 @@ func probeUsageLogEgressIP(ctx context.Context, proxyURL string, sdkCfg *config.
 			lastErr = readErr
 			continue
 		}
-		if ip := strings.TrimSpace(string(body)); ip != "" {
+		if ip := extractUsageLogProbeIP(body); ip != "" {
 			return ip, nil
 		}
-		lastErr = fmt.Errorf("probe %s returned empty body", probeURL)
+		lastErr = fmt.Errorf("probe %s returned unusable body", probeURL)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all egress probe services failed")
 	}
 	return "", lastErr
+}
+
+func extractUsageLogProbeIP(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return ""
+	}
+
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(line), "ip=") {
+			continue
+		}
+		value := strings.TrimSpace(line[len("ip="):])
+		if parsed := net.ParseIP(strings.Trim(value, "[]")); parsed != nil {
+			return parsed.String()
+		}
+		return ""
+	}
+
+	if parsed := net.ParseIP(strings.Trim(text, "[]")); parsed != nil {
+		return parsed.String()
+	}
+	return ""
 }
 
 func firstNonEmpty(values ...string) string {

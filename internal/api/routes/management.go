@@ -23,11 +23,16 @@ func RegisterManagement(engine *gin.Engine, h *managementhandlers.Handler, opts 
 		clearWriteDeadline = func(*gin.Context) {}
 	}
 
-	mgmtMiddlewares := make([]gin.HandlerFunc, 0, 3)
+	mgmtMiddlewares := make([]gin.HandlerFunc, 0, 4)
 	if opts.Availability != nil {
 		mgmtMiddlewares = append(mgmtMiddlewares, opts.Availability)
 	}
-	mgmtMiddlewares = append(mgmtMiddlewares, h.Middleware(), bodyutil.LimitBodyMiddleware(bodyutil.ManagementBodyLimit))
+	mgmtMiddlewares = append(
+		mgmtMiddlewares,
+		managementSecurityHeaders(),
+		h.Middleware(),
+		bodyutil.LimitBodyMiddleware(bodyutil.ManagementBodyLimit),
+	)
 
 	mgmt := engine.Group("/v0/management")
 	mgmt.Use(mgmtMiddlewares...)

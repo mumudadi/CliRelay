@@ -34,7 +34,8 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// Stream must be set to true
 	out, _ = sjson.Set(out, "stream", stream)
 
-	// Codex not support temperature, top_p, top_k, max_output_tokens, so comment them
+	// Codex does not support the legacy sampling knobs or token limit fields on
+	// the Responses endpoint, so we intentionally do not forward them here.
 	// if v := gjson.GetBytes(rawJSON, "temperature"); v.Exists() {
 	// 	out, _ = sjson.Set(out, "temperature", v.Value())
 	// }
@@ -43,14 +44,6 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// }
 	// if v := gjson.GetBytes(rawJSON, "top_k"); v.Exists() {
 	// 	out, _ = sjson.Set(out, "top_k", v.Value())
-	// }
-
-	// Map token limits
-	// if v := gjson.GetBytes(rawJSON, "max_tokens"); v.Exists() {
-	// 	out, _ = sjson.Set(out, "max_output_tokens", v.Value())
-	// }
-	// if v := gjson.GetBytes(rawJSON, "max_completion_tokens"); v.Exists() {
-	// 	out, _ = sjson.Set(out, "max_output_tokens", v.Value())
 	// }
 
 	// Map reasoning effort

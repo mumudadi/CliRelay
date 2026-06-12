@@ -107,7 +107,7 @@ func QueryFilters(days int) (FilterOptions, error) {
 
 	cutoff := CutoffStartUTC(days).Format(time.RFC3339)
 
-	keys, err := queryDistinct(db, "api_key", cutoff)
+	keys, keyNames, err := queryDistinctAPIKeys(db, cutoff)
 	if err != nil {
 		return FilterOptions{}, err
 	}
@@ -122,7 +122,7 @@ func QueryFilters(days int) (FilterOptions, error) {
 
 	return FilterOptions{
 		APIKeys:     keys,
-		APIKeyNames: make(map[string]string),
+		APIKeyNames: keyNames,
 		Models:      models,
 		Channels:    channels,
 	}, nil
@@ -176,11 +176,12 @@ func DeleteLogsByAPIKey(apiKey string) (int64, error) {
 
 	// Delete associated content rows first (FK cascade may handle this,
 	// but be explicit to ensure cleanup even without FK enforcement).
+	clause, args := buildSingleAPIKeySelectorClause(apiKey)
 	_, _ = db.Exec(
 		`DELETE FROM request_log_content WHERE log_id IN
-		 (SELECT id FROM request_logs WHERE api_key = ?)`, apiKey)
+		 (SELECT id FROM request_logs`+clause+`)`, args...)
 
-	result, err := db.Exec("DELETE FROM request_logs WHERE api_key = ?", apiKey)
+	result, err := db.Exec("DELETE FROM request_logs"+clause, args...)
 	if err != nil {
 		return 0, fmt.Errorf("usage: delete logs by api_key: %w", err)
 	}
@@ -383,6 +384,9 @@ func normalizeStringList(values []string) []string {
 
 func buildWhereClause(params LogQueryParams) (string, []interface{}) {
 	params = normalizeLogQueryParams(params)
+	if params.MatchNoAPIKeys || params.MatchNoModels || params.MatchNoStatuses || params.MatchNoChannels {
+		return " WHERE 1 = 0", nil
+	}
 	conditions := make([]string, 0, 4)
 	args := make([]interface{}, 0, 4)
 
@@ -416,12 +420,11 @@ func buildWhereClause(params LogQueryParams) (string, []interface{}) {
 			}
 		}
 		if len(normalKeys) > 0 {
-			placeholders := make([]string, 0, len(normalKeys))
 			for _, k := range normalKeys {
-				placeholders = append(placeholders, "?")
-				args = append(args, k)
+				clause, clauseArgs := buildSingleAPIKeySelectorClause(k)
+				apiKeyConds = append(apiKeyConds, strings.TrimPrefix(clause, " WHERE "))
+				args = append(args, clauseArgs...)
 			}
-			apiKeyConds = append(apiKeyConds, "api_key IN ("+strings.Join(placeholders, ",")+")")
 		}
 		apiKeyConds = append(apiKeyConds, systemConds...)
 		if len(apiKeyConds) == 1 {
@@ -547,6 +550,85 @@ func queryDistinct(db *sql.DB, column, cutoff string) ([]string, error) {
 	return result, nil
 }
 
+func queryDistinctAPIKeys(db *sql.DB, cutoff string) ([]string, map[string]string, error) {
+	currentByID := currentAPIKeyRowsByID()
+	rows, err := db.Query(`
+		SELECT
+			CASE
+				WHEN trim(coalesce(api_key_id, '')) <> '' THEN api_key_id
+				ELSE 'raw:' || api_key
+			END AS logical_selector,
+			COALESCE(MAX(NULLIF(trim(coalesce(api_key_id, '')), '')), '') AS logical_id,
+			MAX(api_key) AS snapshot_key,
+			COALESCE(NULLIF(MAX(api_key_name), ''), '') AS snapshot_name
+		FROM request_logs
+		WHERE timestamp >= ? AND api_key != ''
+		GROUP BY logical_selector
+		ORDER BY logical_selector
+	`, cutoff)
+	if err != nil {
+		return nil, nil, fmt.Errorf("usage: distinct api_key logical groups: %w", err)
+	}
+	defer rows.Close()
+
+	values := make([]string, 0)
+	names := make(map[string]string)
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var logicalSelector string
+		var logicalID sql.NullString
+		var snapshotKey string
+		var snapshotName string
+		if err := rows.Scan(&logicalSelector, &logicalID, &snapshotKey, &snapshotName); err != nil {
+			return nil, nil, err
+		}
+
+		value := strings.TrimSpace(snapshotKey)
+		name := strings.TrimSpace(snapshotName)
+		if row, ok := currentByID[trimNullString(logicalID)]; ok {
+			if trimmed := strings.TrimSpace(row.Key); trimmed != "" {
+				value = trimmed
+			}
+			if trimmed := strings.TrimSpace(row.Name); trimmed != "" {
+				name = trimmed
+			}
+		}
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			if name != "" {
+				names[value] = name
+			}
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+		if name != "" {
+			names[value] = name
+		}
+	}
+	return values, names, rows.Err()
+}
+
+func trimNullString(value sql.NullString) string {
+	if !value.Valid {
+		return ""
+	}
+	return strings.TrimSpace(value.String)
+}
+
+func buildSingleAPIKeySelectorClause(selector string) (string, []interface{}) {
+	trimmed := strings.TrimSpace(selector)
+	if trimmed == "" {
+		return "", nil
+	}
+	if identity := ResolveAPIKeyIdentity(trimmed); identity != nil {
+		return " WHERE (api_key_id = ? OR (trim(coalesce(api_key_id, '')) = '' AND api_key = ?))", []interface{}{identity.ID, identity.Key}
+	}
+	return " WHERE api_key = ?", []interface{}{trimmed}
+}
+
 // QueryModelsForKey returns the distinct models used by a specific API key within the time range.
 func QueryModelsForKey(apiKey string, days int) ([]string, error) {
 	db := getDB()
@@ -556,11 +638,11 @@ func QueryModelsForKey(apiKey string, days int) ([]string, error) {
 	if days < 1 {
 		days = 7
 	}
-	cutoff := CutoffStartUTC(days).Format(time.RFC3339)
-
+	params := LogQueryParams{APIKey: apiKey, Days: days}
+	where, args := buildWhereClause(params)
 	rows, err := db.Query(
-		"SELECT DISTINCT model FROM request_logs WHERE api_key = ? AND timestamp >= ? AND model != '' ORDER BY model",
-		apiKey, cutoff,
+		"SELECT DISTINCT model FROM request_logs"+where+" AND model != '' ORDER BY model",
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("usage: distinct models for key: %w", err)

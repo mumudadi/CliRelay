@@ -78,3 +78,97 @@ func TestMiddlewareAllowsValidKeyAfterRemoteIPIsBanned(t *testing.T) {
 		t.Fatalf("missing-key status after valid key cleared ban = %d, want %d; body=%s", rrAfterClear.Code, http.StatusUnauthorized, rrAfterClear.Body.String())
 	}
 }
+
+func TestMiddlewareAllowsLocalPasswordWithoutRemoteSecret(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetLocalPassword("local-management-password")
+	defer h.Close()
+
+	router := gin.New()
+	router.Use(h.Middleware())
+	router.GET("/v0/management/ping", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/ping", nil)
+	req.RemoteAddr = "127.0.0.1:4321"
+	req.Header.Set("Authorization", "Bearer local-management-password")
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("local-password status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+}
+
+func TestMiddlewareRejectsQueryTokenOnNormalHTTPRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const managementKey = "correct-management-key"
+	hashed, err := bcrypt.GenerateFromPassword([]byte(managementKey), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("failed to hash test management key: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		RemoteManagement: config.RemoteManagement{
+			AllowRemote: true,
+			SecretKey:   string(hashed),
+		},
+	}, nil)
+	defer h.Close()
+
+	router := gin.New()
+	router.Use(h.Middleware())
+	router.GET("/v0/management/ping", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/ping?token="+managementKey, nil)
+	req.RemoteAddr = "203.0.113.20:4321"
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "missing management key") {
+		t.Fatalf("expected query token to be ignored on normal route, got body=%s", rr.Body.String())
+	}
+}
+
+func TestMiddlewareAllowsQueryTokenOnlyForSystemStatsWebSocket(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const managementKey = "correct-management-key"
+	hashed, err := bcrypt.GenerateFromPassword([]byte(managementKey), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("failed to hash test management key: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		RemoteManagement: config.RemoteManagement{
+			AllowRemote: true,
+			SecretKey:   string(hashed),
+		},
+	}, nil)
+	defer h.Close()
+
+	router := gin.New()
+	router.Use(h.Middleware())
+	router.GET("/v0/management/system-stats/ws", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/system-stats/ws?token="+managementKey, nil)
+	req.RemoteAddr = "203.0.113.21:4321"
+	req.Header.Set("Upgrade", "websocket")
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+}

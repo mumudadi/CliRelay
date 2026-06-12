@@ -70,13 +70,17 @@ func (h *UsageLogsHandler) GetUsageLogs(c *gin.Context) {
 	}
 
 	payload, err := h.service().ManagementLogs(managementusagelogs.ManagementLogQueryInput{
-		Page:     intQueryDefault(c, "page", 1),
-		Size:     intQueryDefault(c, "size", 50),
-		Days:     intQueryDefault(c, "days", 7),
-		APIKeys:  queryStringListMulti(c, "api_key", "api_keys"),
-		Models:   queryStringListMulti(c, "model", "models"),
-		Statuses: queryStringListMulti(c, "status", "statuses"),
-		Channels: deduped,
+		Page:            intQueryDefault(c, "page", 1),
+		Size:            intQueryDefault(c, "size", 50),
+		Days:            intQueryDefault(c, "days", 7),
+		APIKeys:         queryStringListMulti(c, "api_key", "api_keys"),
+		Models:          queryStringListMulti(c, "model", "models"),
+		Statuses:        queryStringListMulti(c, "status", "statuses"),
+		Channels:        deduped,
+		MatchNoAPIKeys:  queryBool(c, "api_keys_empty"),
+		MatchNoModels:   queryBool(c, "models_empty"),
+		MatchNoStatuses: queryBool(c, "statuses_empty"),
+		MatchNoChannels: queryBool(c, "channels_empty"),
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -308,6 +312,15 @@ func (h *UsageLogsHandler) GetAuthFileTrend(c *gin.Context) {
 
 func intQueryDefault(c *gin.Context, key string, def int) int {
 	return managementusagelogs.IntQueryDefault(c.Query(key), def)
+}
+
+func queryBool(c *gin.Context, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(c.Query(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeLogContentFormatValue(format string) string {

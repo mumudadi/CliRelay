@@ -88,6 +88,53 @@ func TestPutProxyPoolNormalizesAndPersists(t *testing.T) {
 	}
 }
 
+func TestPatchProxyPoolEntryUpdatesConfigWithoutAppending(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	initialConfig := "proxy-pool:\n  - id: hk\n    name: HK Proxy\n    url: http://127.0.0.1:7890\n    enabled: true\n"
+	if err := os.WriteFile(configPath, []byte(initialConfig), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	h := NewHandler(&config.Config{
+		ProxyPool: []config.ProxyPoolEntry{
+			{ID: "hk", Name: "HK Proxy", URL: "http://127.0.0.1:7890", Enabled: true},
+		},
+	}, configPath, nil)
+	defer h.Close()
+
+	payload := []byte(`{"name":"Updated HK Proxy","url":"http://127.0.0.1:7891","enabled":false,"description":"rotated"}`)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "hk"}}
+	c.Request = httptest.NewRequest(http.MethodPatch, "/proxy-pool/hk", bytes.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchProxyPoolEntry(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if len(h.cfg.ProxyPool) != 1 {
+		t.Fatalf("proxy pool length = %d, want 1: %#v", len(h.cfg.ProxyPool), h.cfg.ProxyPool)
+	}
+	if h.cfg.ProxyPool[0].ID != "hk" || h.cfg.ProxyPool[0].Name != "Updated HK Proxy" || h.cfg.ProxyPool[0].URL != "http://127.0.0.1:7891" || h.cfg.ProxyPool[0].Enabled {
+		t.Fatalf("updated proxy pool = %#v", h.cfg.ProxyPool)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Count(string(data), "id: hk") != 1 {
+		t.Fatalf("expected exactly one hk proxy entry after patch:\n%s", string(data))
+	}
+	if !strings.Contains(string(data), "name: Updated HK Proxy") || !strings.Contains(string(data), "url: http://127.0.0.1:7891") {
+		t.Fatalf("persisted config missing updated values:\n%s", string(data))
+	}
+}
+
 func TestPostProxyPoolCheckUsesConfiguredProxy(t *testing.T) {
 	t.Parallel()
 	gin.SetMode(gin.TestMode)
@@ -129,6 +176,21 @@ func TestPostProxyPoolCheckUsesConfiguredProxy(t *testing.T) {
 	if !body.OK || body.StatusCode != http.StatusNoContent {
 		t.Fatalf("check response = %#v", body)
 	}
+	if body.Message != "" {
+		t.Fatalf("success message = %q, want empty", body.Message)
+	}
+}
+
+func TestDefaultProxyCheckURLPrefersForwardedOrigin(t *testing.T) {
+	t.Parallel()
+	req := httptest.NewRequest(http.MethodPost, "/proxy-pool/check", nil)
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("X-Forwarded-Host", "panel.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	if got, want := defaultProxyCheckURL(req), "https://panel.example.com/v0/management/public/ping"; got != want {
+		t.Fatalf("defaultProxyCheckURL = %q, want %q", got, want)
+	}
 }
 
 func TestProxyPoolHandlersUseSQLiteWhenAvailable(t *testing.T) {
@@ -148,6 +210,14 @@ func TestProxyPoolHandlersUseSQLiteWhenAvailable(t *testing.T) {
 		},
 	}, "", nil)
 	defer h.Close()
+	var hookCalled bool
+	var hookProxyPool []config.ProxyPoolEntry
+	h.SetConfigMutatedHook(func(updated *config.Config) {
+		hookCalled = true
+		if updated != nil {
+			hookProxyPool = append([]config.ProxyPoolEntry(nil), updated.ProxyPool...)
+		}
+	})
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -177,6 +247,71 @@ func TestProxyPoolHandlersUseSQLiteWhenAvailable(t *testing.T) {
 	}
 	if len(h.cfg.ProxyPool) != 1 || h.cfg.ProxyPool[0].ID != "new" {
 		t.Fatalf("runtime proxy pool = %#v", h.cfg.ProxyPool)
+	}
+	if !hookCalled {
+		t.Fatal("config mutation hook was not called")
+	}
+	if len(hookProxyPool) != 1 || hookProxyPool[0].ID != "new" {
+		t.Fatalf("hook proxy pool = %#v", hookProxyPool)
+	}
+}
+
+func TestPatchProxyPoolEntryUsesSQLiteWhenAvailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cleanup := usageTestProxyPoolDB(t)
+	defer cleanup()
+
+	if err := usage.ReplaceProxyPool([]config.ProxyPoolEntry{
+		{ID: "db", Name: "DB Proxy", URL: "http://127.0.0.1:7890", Enabled: true},
+	}); err != nil {
+		t.Fatalf("ReplaceProxyPool: %v", err)
+	}
+
+	h := NewHandler(&config.Config{
+		ProxyPool: []config.ProxyPoolEntry{
+			{ID: "yaml", Name: "YAML Proxy", URL: "http://127.0.0.1:8888", Enabled: true},
+		},
+	}, "", nil)
+	defer h.Close()
+	var hookCalled bool
+	var hookProxyPool []config.ProxyPoolEntry
+	h.SetConfigMutatedHook(func(updated *config.Config) {
+		hookCalled = true
+		if updated != nil {
+			hookProxyPool = append([]config.ProxyPoolEntry(nil), updated.ProxyPool...)
+		}
+	})
+
+	payload := []byte(`{"name":"Updated DB Proxy","url":"http://127.0.0.1:9001","enabled":false,"description":"rotated"}`)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "db"}}
+	c.Request = httptest.NewRequest(http.MethodPatch, "/proxy-pool/db", bytes.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchProxyPoolEntry(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	rows := usage.ListProxyPool()
+	if len(rows) != 1 {
+		t.Fatalf("SQLite proxy pool length = %d, want 1: %#v", len(rows), rows)
+	}
+	if rows[0].ID != "db" || rows[0].Name != "Updated DB Proxy" || rows[0].URL != "http://127.0.0.1:9001" || rows[0].Enabled {
+		t.Fatalf("SQLite proxy pool = %#v", rows)
+	}
+	if rows[0].Description != "rotated" {
+		t.Fatalf("SQLite description = %q, want rotated", rows[0].Description)
+	}
+	if len(h.cfg.ProxyPool) != 1 || h.cfg.ProxyPool[0].ID != "db" || h.cfg.ProxyPool[0].Name != "Updated DB Proxy" {
+		t.Fatalf("runtime proxy pool = %#v", h.cfg.ProxyPool)
+	}
+	if !hookCalled {
+		t.Fatal("config mutation hook was not called")
+	}
+	if len(hookProxyPool) != 1 || hookProxyPool[0].ID != "db" || hookProxyPool[0].Name != "Updated DB Proxy" {
+		t.Fatalf("hook proxy pool = %#v", hookProxyPool)
 	}
 }
 

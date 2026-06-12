@@ -84,10 +84,12 @@ func CountTodayByKey(apiKey string) (int64, error) {
 	if db == nil {
 		return 0, nil
 	}
+	clause, args := buildSingleAPIKeySelectorClause(apiKey)
 	var count int64
+	queryArgs := append(args, CutoffStartUTC(1).Format(time.RFC3339))
 	err := db.QueryRow(
-		"SELECT COUNT(*) FROM request_logs WHERE api_key = ? AND timestamp >= ?",
-		apiKey, CutoffStartUTC(1).Format(time.RFC3339),
+		"SELECT COUNT(*) FROM request_logs"+clause+" AND timestamp >= ?",
+		queryArgs...,
 	).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("usage: count today: %w", err)
@@ -101,11 +103,9 @@ func CountTotalByKey(apiKey string) (int64, error) {
 	if db == nil {
 		return 0, nil
 	}
+	clause, args := buildSingleAPIKeySelectorClause(apiKey)
 	var count int64
-	err := db.QueryRow(
-		"SELECT COUNT(*) FROM request_logs WHERE api_key = ?",
-		apiKey,
-	).Scan(&count)
+	err := db.QueryRow("SELECT COUNT(*) FROM request_logs"+clause, args...).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("usage: count total: %w", err)
 	}

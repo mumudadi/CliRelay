@@ -48,6 +48,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	s.applyUsageStatisticsConfig(oldCfg, cfg)
 	s.applyAuthRuntimeConfig(oldCfg, cfg)
 	s.applyRuntimeLogLevel(oldCfg, cfg)
+	s.applyProxyWarmupConfig(cfg)
 	s.updateManagementRouteAvailability(oldCfg, cfg)
 	s.applyAccessConfig(oldCfg, cfg)
 	s.commitUpdatedConfig(oldCfg, cfg)

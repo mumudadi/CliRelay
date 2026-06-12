@@ -75,14 +75,18 @@ func TestPublicCcSwitchImportConfigsFiltersByAPIKeyPermissions(t *testing.T) {
 	}
 
 	var got struct {
-		Items []usage.CcSwitchImportConfigRow `json:"items"`
-		Found bool                            `json:"found"`
+		Items  []usage.CcSwitchImportConfigRow `json:"items"`
+		Found  bool                            `json:"found"`
+		APIKey string                          `json:"api_key"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
 	if !got.Found {
 		t.Fatalf("found = false, want true")
+	}
+	if got.APIKey == apiKey || got.APIKey == "" {
+		t.Fatalf("api_key should be masked, got %q", got.APIKey)
 	}
 	if len(got.Items) != 2 {
 		t.Fatalf("items len = %d, want 2", len(got.Items))

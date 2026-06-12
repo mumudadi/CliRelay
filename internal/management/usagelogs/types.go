@@ -3,13 +3,17 @@ package usagelogs
 import "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 
 type ManagementLogQueryInput struct {
-	Page     int
-	Size     int
-	Days     int
-	APIKeys  []string
-	Models   []string
-	Statuses []string
-	Channels []string
+	Page            int
+	Size            int
+	Days            int
+	APIKeys         []string
+	Models          []string
+	Statuses        []string
+	Channels        []string
+	MatchNoAPIKeys  bool
+	MatchNoModels   bool
+	MatchNoStatuses bool
+	MatchNoChannels bool
 }
 
 type PublicLogQueryInput struct {
@@ -43,8 +47,10 @@ type AuthFileTrendResponse struct {
 	RequestTotal      int64                       `json:"request_total"`
 	CycleRequestTotal int64                       `json:"cycle_request_total"`
 	CycleCostTotal    float64                     `json:"cycle_cost_total"`
+	WeeklyQuotaUsed   *float64                    `json:"weekly_quota_used_percent"`
+	CycleKnown        bool                        `json:"cycle_known"`
 	CycleStart        string                      `json:"cycle_start"`
-	DailyUsage        []usage.DailyCountPoint     `json:"daily_usage"`
-	HourlyUsage       []usage.HourlyCountPoint    `json:"hourly_usage"`
+	DailyUsage        []usage.DailyUsagePoint     `json:"daily_usage"`
+	HourlyUsage       []usage.HourlyUsagePoint    `json:"hourly_usage"`
 	QuotaSeries       []usage.QuotaSnapshotSeries `json:"quota_series"`
 }

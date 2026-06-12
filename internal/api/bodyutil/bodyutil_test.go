@@ -55,3 +55,23 @@ func TestLimitBodyMiddlewareRestoresBodyForHandler(t *testing.T) {
 		t.Fatalf("unexpected response body: %s", got)
 	}
 }
+
+func TestLimitBodyMiddlewareRejectsOversizedDeleteRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	r.Use(LimitBodyMiddleware(8))
+	r.DELETE("/management", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodDelete, "/management", bytes.NewReader([]byte(`{"value":"too-large"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status %d, got %d", http.StatusRequestEntityTooLarge, w.Code)
+	}
+}

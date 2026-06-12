@@ -47,6 +47,7 @@ func registerManagementSettingsRoutes(group *gin.RouterGroup, h *managementhandl
 	group.DELETE("/proxy-url", h.DeleteProxyURL)
 	group.GET("/proxy-pool", h.GetProxyPool)
 	group.PUT("/proxy-pool", h.PutProxyPool)
+	group.PATCH("/proxy-pool/:id", h.PatchProxyPoolEntry)
 	group.POST("/proxy-pool/check", h.PostProxyPoolCheck)
 
 	group.POST("/api-call", h.APITools().APICall)

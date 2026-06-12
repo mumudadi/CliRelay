@@ -63,6 +63,10 @@ func (s *Service) ManagementLogs(input ManagementLogQueryInput) (map[string]any,
 		APIKeys:               input.APIKeys,
 		Models:                input.Models,
 		Statuses:              input.Statuses,
+		MatchNoAPIKeys:        input.MatchNoAPIKeys,
+		MatchNoModels:         input.MatchNoModels,
+		MatchNoStatuses:       input.MatchNoStatuses,
+		MatchNoChannels:       input.MatchNoChannels,
 		AuthIndexes:           authIndexes,
 		ChannelNames:          channelNames,
 		AuthIndexChannelNames: authIndexChannelNames,
@@ -109,7 +113,9 @@ func (s *Service) ManagementLogs(input ManagementLogQueryInput) (map[string]any,
 		}
 	}
 
-	filters.APIKeyNames = make(map[string]string, len(filters.APIKeys))
+	if filters.APIKeyNames == nil {
+		filters.APIKeyNames = make(map[string]string, len(filters.APIKeys))
+	}
 	for _, key := range filters.APIKeys {
 		if name, ok := keyNameMap[key]; ok {
 			filters.APIKeyNames[key] = name

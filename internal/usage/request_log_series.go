@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -118,14 +119,21 @@ func QueryAPIKeyDistribution(days int) ([]APIKeyDistributionPoint, error) {
 
 	params := LogQueryParams{Days: days}
 	where, args := buildWhereClause(params)
+	currentByID := currentAPIKeyRowsByID()
 
-	q := `SELECT api_key,
-	             COALESCE(NULLIF(MAX(api_key_name),''), '') as name,
+	q := `SELECT
+	             CASE
+	               WHEN trim(coalesce(api_key_id, '')) <> '' THEN api_key_id
+	               ELSE 'raw:' || api_key
+	             END as logical_selector,
+	             COALESCE(MAX(NULLIF(trim(coalesce(api_key_id, '')), '')), '') as logical_id,
+	             MAX(api_key) as snapshot_key,
+	             COALESCE(NULLIF(MAX(api_key_name),''), '') as snapshot_name,
 	             COUNT(*) as reqs,
 	             COALESCE(SUM(total_tokens),0)
 	      FROM request_logs` + where + `
 	      AND api_key != ''
-	      GROUP BY api_key ORDER BY reqs DESC`
+	      GROUP BY logical_selector ORDER BY reqs DESC`
 
 	rows, err := db.Query(q, args...)
 	if err != nil {
@@ -135,9 +143,26 @@ func QueryAPIKeyDistribution(days int) ([]APIKeyDistributionPoint, error) {
 
 	var result []APIKeyDistributionPoint
 	for rows.Next() {
+		var logicalSelector string
+		var logicalID sql.NullString
+		var snapshotKey string
+		var snapshotName string
 		var p APIKeyDistributionPoint
-		if err := rows.Scan(&p.APIKey, &p.Name, &p.Requests, &p.Tokens); err != nil {
+		if err := rows.Scan(&logicalSelector, &logicalID, &snapshotKey, &snapshotName, &p.Requests, &p.Tokens); err != nil {
 			return nil, fmt.Errorf("usage: apikey distribution scan: %w", err)
+		}
+		p.APIKey = strings.TrimSpace(snapshotKey)
+		p.Name = strings.TrimSpace(snapshotName)
+		if row, ok := currentByID[trimNullString(logicalID)]; ok {
+			if trimmed := strings.TrimSpace(row.Key); trimmed != "" {
+				p.APIKey = trimmed
+			}
+			if trimmed := strings.TrimSpace(row.Name); trimmed != "" {
+				p.Name = trimmed
+			}
+		}
+		if p.APIKey == "" {
+			continue
 		}
 		result = append(result, p)
 	}
@@ -180,8 +205,13 @@ func QueryHourlySeries(apiKey string, hours int) ([]HourlyTokenPoint, []HourlyMo
 	conditions := []string{"timestamp >= ?"}
 	args := []interface{}{cutoff}
 	if apiKey != "" {
-		conditions = append(conditions, "api_key = ?")
-		args = append(args, apiKey)
+		if identity := ResolveAPIKeyIdentity(apiKey); identity != nil {
+			conditions = append(conditions, "(api_key_id = ? OR (trim(coalesce(api_key_id, '')) = '' AND api_key = ?))")
+			args = append(args, identity.ID, identity.Key)
+		} else {
+			conditions = append(conditions, "api_key = ?")
+			args = append(args, apiKey)
+		}
 	}
 	where := " WHERE " + strings.Join(conditions, " AND ")
 

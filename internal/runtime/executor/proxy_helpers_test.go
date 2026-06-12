@@ -2,13 +2,16 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -115,5 +118,111 @@ func TestNewProxyAwareHTTPClientHonorsPreferIPv4ForHTTPProxy(t *testing.T) {
 	}
 	if proxyHits != 0 {
 		t.Fatalf("proxy hits = %d, want 0 when preferIPv4 blocks IPv6-only proxy", proxyHits)
+	}
+}
+
+func TestNewProxyAwareHTTPClientReusesProxyTransport(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{ProxyURL: "http://proxy-reuse.example:8080"}
+
+	first := newProxyAwareHTTPClient(context.Background(), cfg, auth, 0)
+	second := newProxyAwareHTTPClient(context.Background(), cfg, auth, 0)
+
+	if first.Transport == nil || second.Transport == nil {
+		t.Fatalf("expected proxy transports to be configured")
+	}
+	if first.Transport != second.Transport {
+		t.Fatalf("expected same proxy transport to be reused")
+	}
+}
+
+func TestNewProxyAwareHTTPClientSeparatesProxyTransportByPreferIPv4(t *testing.T) {
+	t.Parallel()
+
+	auth := &cliproxyauth.Auth{ProxyURL: "http://proxy-ip-mode.example:8080"}
+	ipv6Allowed := &config.Config{}
+	ipv4Only := &config.Config{}
+	ipv4Only.PreferIPv4 = true
+
+	first := newProxyAwareHTTPClient(context.Background(), ipv6Allowed, auth, 0)
+	second := newProxyAwareHTTPClient(context.Background(), ipv4Only, auth, 0)
+
+	if first.Transport == nil || second.Transport == nil {
+		t.Fatalf("expected proxy transports to be configured")
+	}
+	if first.Transport == second.Transport {
+		t.Fatalf("expected prefer-ipv4 change to use a distinct proxy transport")
+	}
+}
+
+func TestNewProxyAwareHTTPClientSeparatesProxyTransportByTLSConfig(t *testing.T) {
+	t.Parallel()
+
+	auth := &cliproxyauth.Auth{ProxyURL: "http://proxy-tls-mode.example:8080"}
+	normalTLS := &config.Config{}
+	insecureTLS := &config.Config{}
+	insecureTLS.InsecureSkipVerify = true
+
+	first := newProxyAwareHTTPClient(context.Background(), normalTLS, auth, 0)
+	second := newProxyAwareHTTPClient(context.Background(), insecureTLS, auth, 0)
+
+	if first.Transport == nil || second.Transport == nil {
+		t.Fatalf("expected proxy transports to be configured")
+	}
+	if first.Transport == second.Transport {
+		t.Fatalf("expected TLS config change to use a distinct proxy transport")
+	}
+	transport, ok := second.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("second transport type = %T, want *http.Transport", second.Transport)
+	}
+	if transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("expected insecure TLS setting to be applied to cached proxy transport")
+	}
+}
+
+func TestNewProxyAwareHTTPClientRecordsProxyUpstreamTiming(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.String() != "http://target.example/check" {
+			t.Fatalf("proxy received URL %q", r.URL.String())
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxyServer.Close()
+
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	inbound := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request = inbound
+	ctx := context.WithValue(inbound.Context(), util.ContextKeyGin, ginCtx)
+
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{ProxyURL: proxyServer.URL}
+	client := newProxyAwareHTTPClient(ctx, cfg, auth, 0)
+
+	resp, err := client.Get("http://target.example/check")
+	if err != nil {
+		t.Fatalf("client.Get returned error: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	var detail struct {
+		Egress map[string]any `json:"egress"`
+		Timing map[string]any `json:"upstream_timing"`
+	}
+	if err := json.Unmarshal([]byte(buildRequestDetailContent(ctx)), &detail); err != nil {
+		t.Fatalf("unmarshal request details: %v", err)
+	}
+	if detail.Egress["route_kind"] != "proxy" {
+		t.Fatalf("egress.route_kind = %v, want proxy", detail.Egress["route_kind"])
+	}
+	if detail.Timing["host"] != "target.example" {
+		t.Fatalf("upstream_timing.host = %v, want target.example", detail.Timing["host"])
+	}
+	if _, ok := detail.Timing["got_conn_reused"]; !ok {
+		t.Fatalf("upstream_timing missing got_conn_reused: %#v", detail.Timing)
 	}
 }

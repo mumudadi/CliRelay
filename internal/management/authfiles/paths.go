@@ -2,15 +2,18 @@ package authfiles
 
 import (
 	"fmt"
-	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
+const invalidFilePathPlaceholder = "__invalid_auth_file_name__"
+
 func ValidateFileQueryName(name string, requireJSON bool) (string, error) {
-	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
+	name = strings.TrimSpace(name)
+	if !isSafeSingleFileName(name) {
 		return "", fmt.Errorf("invalid name")
 	}
 	if requireJSON && !IsJSONFileName(name) {
@@ -20,11 +23,31 @@ func ValidateFileQueryName(name string, requireJSON bool) (string, error) {
 }
 
 func ValidateUploadedFileName(filename string) (string, error) {
-	name := filepath.Base(filename)
+	name := singleFileBaseName(filename)
+	if !isSafeSingleFileName(name) {
+		return "", fmt.Errorf("invalid name")
+	}
 	if !IsJSONFileName(name) {
 		return "", fmt.Errorf("file must be .json")
 	}
 	return name, nil
+}
+
+func singleFileBaseName(name string) string {
+	return path.Base(strings.ReplaceAll(strings.TrimSpace(name), "\\", "/"))
+}
+
+func isSafeSingleFileName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return false
+	}
+	if strings.ContainsAny(name, "\r\n\t") {
+		return false
+	}
+	return filepath.Base(name) == name && singleFileBaseName(name) == name
 }
 
 func IsDeleteAllValue(value string) bool {
@@ -36,7 +59,11 @@ func IsJSONFileName(name string) bool {
 }
 
 func FilePath(authDir, name string) string {
-	full := filepath.Join(authDir, filepath.Base(name))
+	baseName := singleFileBaseName(name)
+	if !isSafeSingleFileName(baseName) {
+		baseName = invalidFilePathPlaceholder
+	}
+	full := filepath.Join(authDir, baseName)
 	if filepath.IsAbs(full) {
 		return full
 	}

@@ -2,7 +2,9 @@ package management
 
 import (
 	"bufio"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -19,6 +21,7 @@ import (
 const (
 	defaultLogFileName      = "main.log"
 	defaultLogLimit         = 5000
+	maxLogLimit             = 20000
 	logScannerInitialBuffer = 64 * 1024
 	logScannerMaxBuffer     = 8 * 1024 * 1024
 )
@@ -74,7 +77,7 @@ func (h *Handler) GetLogs(c *gin.Context) {
 	acc := newLogAccumulator(cutoff, limit)
 	for i := range files {
 		if errProcess := acc.consumeFile(files[i]); errProcess != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file %s: %v", files[i], errProcess)})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file %s: %v", filepath.Base(files[i]), errProcess)})
 			return
 		}
 	}
@@ -436,7 +439,17 @@ func (acc *logAccumulator) consumeFile(path string) error {
 		_ = file.Close()
 	}()
 
-	scanner := bufio.NewScanner(file)
+	var reader io.Reader = file
+	if strings.HasSuffix(strings.ToLower(path), ".gz") {
+		gzReader, errGzip := gzip.NewReader(file)
+		if errGzip != nil {
+			return errGzip
+		}
+		defer func() { _ = gzReader.Close() }()
+		reader = gzReader
+	}
+
+	scanner := bufio.NewScanner(reader)
 	buf := make([]byte, 0, logScannerInitialBuffer)
 	scanner.Buffer(buf, logScannerMaxBuffer)
 	for scanner.Scan() {
@@ -504,6 +517,9 @@ func parseLimit(raw string) (int, error) {
 	}
 	if limit <= 0 {
 		return 0, fmt.Errorf("must be greater than zero")
+	}
+	if limit > maxLogLimit {
+		return 0, fmt.Errorf("must not exceed %d", maxLogLimit)
 	}
 	return limit, nil
 }

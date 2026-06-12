@@ -4,7 +4,10 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 const DefaultMainAPIReadTimeout = 2 * time.Minute
 
@@ -128,6 +131,11 @@ type Config struct {
 	// ProxyPool stores reusable outbound proxies that can be referenced by providers and auth files.
 	ProxyPool []ProxyPoolEntry `yaml:"proxy-pool,omitempty" json:"proxy-pool,omitempty"`
 
+	// ProxyWarmup configures proactive upstream connection warming for fixed proxy hosts.
+	// When enabled, the server establishes and maintains idle TLS/HTTP2 connections
+	// to common upstream AI API hosts through the fixed residential proxy.
+	ProxyWarmup ProxyWarmConfig `yaml:"proxy-warmup,omitempty" json:"proxy-warmup,omitempty"`
+
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
@@ -178,4 +186,118 @@ type KimiHeaderDefaults struct {
 	UserAgent string `yaml:"user-agent" json:"user-agent"`
 	Platform  string `yaml:"platform" json:"platform"`
 	Version   string `yaml:"version" json:"version"`
+}
+
+// ProxyWarmConfig controls proactive upstream connection warming for fixed proxy hosts.
+// Warming establishes idle TLS/HTTP2 connections through the proxy before real requests arrive.
+type ProxyWarmConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// ProxyID references a proxy-pool entry to warm. It takes precedence over ProxyURL.
+	ProxyID string `yaml:"proxy-id,omitempty" json:"proxy-id,omitempty"`
+	// ProxyURL warms this explicit proxy when ProxyID is empty.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+	// StartupDelaySeconds waits this long after server start before beginning warmup.
+	StartupDelaySeconds int `yaml:"startup-delay-seconds,omitempty" json:"startup-delay-seconds,omitempty"`
+	// IntervalSeconds is the base interval between warmup rounds for active hosts.
+	IntervalSeconds int `yaml:"interval-seconds,omitempty" json:"interval-seconds,omitempty"`
+	// IntervalJitterSeconds adds random jitter to warmup interval to avoid fixed patterns.
+	IntervalJitterSeconds int `yaml:"interval-jitter-seconds,omitempty" json:"interval-jitter-seconds,omitempty"`
+	// TimeoutSeconds per individual warmup request.
+	TimeoutSeconds int `yaml:"timeout-seconds,omitempty" json:"timeout-seconds,omitempty"`
+	// InactiveTTLMinutes removes a host from warmup if unused for this long.
+	InactiveTTLMinutes int `yaml:"inactive-ttl-minutes,omitempty" json:"inactive-ttl-minutes,omitempty"`
+	// MaxHostsPerProxy limits the number of concurrently warmed hosts.
+	MaxHostsPerProxy int `yaml:"max-hosts-per-proxy,omitempty" json:"max-hosts-per-proxy,omitempty"`
+	// AllowedHostSuffixes restricts warming to matching host suffixes (e.g. chatgpt.com).
+	AllowedHostSuffixes []string `yaml:"allowed-host-suffixes,omitempty" json:"allowed-host-suffixes,omitempty"`
+	// Targets lists the specific URLs to warm for each host.
+	Targets []ProxyWarmTarget `yaml:"targets,omitempty" json:"targets,omitempty"`
+}
+
+// ProxyWarmTarget defines a single warmup request target.
+type ProxyWarmTarget struct {
+	Host   string `yaml:"host" json:"host"`
+	URL    string `yaml:"url" json:"url"`
+	Method string `yaml:"method" json:"method"`
+}
+
+func defaultProxyWarmConfig() ProxyWarmConfig {
+	return ProxyWarmConfig{
+		Enabled:               false,
+		StartupDelaySeconds:   15,
+		IntervalSeconds:       60,
+		IntervalJitterSeconds: 15,
+		TimeoutSeconds:        5,
+		InactiveTTLMinutes:    10,
+		MaxHostsPerProxy:      8,
+		AllowedHostSuffixes: []string{
+			"chatgpt.com",
+			"openai.com",
+			"oaistatic.com",
+			"oaiusercontent.com",
+		},
+		Targets: []ProxyWarmTarget{
+			{Host: "chatgpt.com", URL: "https://chatgpt.com/robots.txt", Method: "GET"},
+			{Host: "api.openai.com", URL: "https://api.openai.com/", Method: "HEAD"},
+			{Host: "chat.openai.com", URL: "https://chat.openai.com/", Method: "HEAD"},
+		},
+	}
+}
+
+func (cfg *Config) SanitizeProxyWarmup() {
+	if cfg == nil {
+		return
+	}
+	defaults := defaultProxyWarmConfig()
+	warm := cfg.ProxyWarmup
+	warm.ProxyID = strings.TrimSpace(warm.ProxyID)
+	warm.ProxyURL = strings.TrimSpace(warm.ProxyURL)
+	if warm.StartupDelaySeconds <= 0 {
+		warm.StartupDelaySeconds = defaults.StartupDelaySeconds
+	}
+	if warm.IntervalSeconds <= 0 {
+		warm.IntervalSeconds = defaults.IntervalSeconds
+	}
+	if warm.IntervalJitterSeconds < 0 {
+		warm.IntervalJitterSeconds = 0
+	}
+	if warm.TimeoutSeconds <= 0 {
+		warm.TimeoutSeconds = defaults.TimeoutSeconds
+	}
+	if warm.InactiveTTLMinutes <= 0 {
+		warm.InactiveTTLMinutes = defaults.InactiveTTLMinutes
+	}
+	if warm.MaxHostsPerProxy <= 0 {
+		warm.MaxHostsPerProxy = defaults.MaxHostsPerProxy
+	}
+	if len(warm.AllowedHostSuffixes) == 0 {
+		warm.AllowedHostSuffixes = defaults.AllowedHostSuffixes
+	} else {
+		out := make([]string, 0, len(warm.AllowedHostSuffixes))
+		for _, suffix := range warm.AllowedHostSuffixes {
+			if trimmed := strings.ToLower(strings.TrimSpace(suffix)); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		warm.AllowedHostSuffixes = out
+	}
+	if len(warm.Targets) == 0 {
+		warm.Targets = defaults.Targets
+	} else {
+		out := make([]ProxyWarmTarget, 0, len(warm.Targets))
+		for _, target := range warm.Targets {
+			target.Host = strings.ToLower(strings.TrimSpace(target.Host))
+			target.URL = strings.TrimSpace(target.URL)
+			target.Method = strings.ToUpper(strings.TrimSpace(target.Method))
+			if target.Method == "" {
+				target.Method = "HEAD"
+			}
+			if target.Host == "" || target.URL == "" {
+				continue
+			}
+			out = append(out, target)
+		}
+		warm.Targets = out
+	}
+	cfg.ProxyWarmup = warm
 }

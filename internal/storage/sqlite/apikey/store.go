@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	log "github.com/sirupsen/logrus"
 )
@@ -14,6 +15,7 @@ import (
 const createAPIKeysTableSQL = `
 CREATE TABLE IF NOT EXISTS api_keys (
   key               TEXT PRIMARY KEY NOT NULL,
+  id                TEXT NOT NULL DEFAULT '',
   name              TEXT NOT NULL DEFAULT '',
   disabled          INTEGER NOT NULL DEFAULT 0,
   permission_profile_id TEXT NOT NULL DEFAULT '',
@@ -30,9 +32,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
   created_at        TEXT NOT NULL DEFAULT '',
   updated_at        TEXT NOT NULL DEFAULT ''
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_id ON api_keys(id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
 `
 
 type APIKeyRow struct {
+	ID                   string   `json:"id,omitempty"`
 	Key                  string   `json:"key"`
 	Name                 string   `json:"name,omitempty"`
 	Disabled             bool     `json:"disabled,omitempty"`
@@ -84,6 +90,7 @@ func InitTable(db *sql.DB) {
 		log.Errorf("sqlite/apikey: create api_keys table: %v", err)
 	}
 	migrateColumns(db)
+	backfillIDs(db)
 	backfillNames(db)
 }
 
@@ -96,6 +103,7 @@ func BackfillNames(db *sql.DB) {
 
 func (r APIKeyRow) ToConfigEntry() config.APIKeyEntry {
 	return config.APIKeyEntry{
+		ID:                   r.ID,
 		Key:                  r.Key,
 		Name:                 r.Name,
 		Disabled:             r.Disabled,
@@ -116,6 +124,7 @@ func (r APIKeyRow) ToConfigEntry() config.APIKeyEntry {
 
 func APIKeyRowFromConfig(entry config.APIKeyEntry) APIKeyRow {
 	return APIKeyRow{
+		ID:                   entry.ID,
 		Key:                  entry.Key,
 		Name:                 entry.Name,
 		Disabled:             entry.Disabled,
@@ -163,7 +172,7 @@ func (s Store) List() []APIKeyRow {
 		return nil
 	}
 
-	rows, err := s.db.Query(`SELECT key, name, disabled, daily_limit, total_quota,
+	rows, err := s.db.Query(`SELECT key, name, disabled, id, daily_limit, total_quota,
 		permission_profile_id, spending_limit, concurrency_limit, rpm_limit, tpm_limit,
 		allowed_models, allowed_channels, allowed_channel_groups, system_prompt, created_at, updated_at
 		FROM api_keys ORDER BY created_at ASC`)
@@ -186,10 +195,31 @@ func (s Store) Get(key string) *APIKeyRow {
 		return nil
 	}
 
-	row := s.db.QueryRow(`SELECT key, name, disabled, daily_limit, total_quota,
+	row := s.db.QueryRow(`SELECT key, name, disabled, id, daily_limit, total_quota,
 		permission_profile_id, spending_limit, concurrency_limit, rpm_limit, tpm_limit,
 		allowed_models, allowed_channels, allowed_channel_groups, system_prompt, created_at, updated_at
 		FROM api_keys WHERE key = ?`, trimmed)
+	entry, ok := scanAPIKeyRow(row)
+	if !ok {
+		return nil
+	}
+	return entry
+}
+
+func (s Store) GetByID(id string) *APIKeyRow {
+	if s.db == nil {
+		return nil
+	}
+
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return nil
+	}
+
+	row := s.db.QueryRow(`SELECT key, name, disabled, id, daily_limit, total_quota,
+		permission_profile_id, spending_limit, concurrency_limit, rpm_limit, tpm_limit,
+		allowed_models, allowed_channels, allowed_channel_groups, system_prompt, created_at, updated_at
+		FROM api_keys WHERE id = ?`, trimmed)
 	entry, ok := scanAPIKeyRow(row)
 	if !ok {
 		return nil
@@ -206,6 +236,13 @@ func (s Store) Upsert(entry APIKeyRow) error {
 	if entry.Key == "" {
 		return fmt.Errorf("key is required")
 	}
+	if entry.ID == "" {
+		if existing := s.Get(entry.Key); existing != nil && existing.ID != "" {
+			entry.ID = existing.ID
+		} else {
+			entry.ID = uuid.NewString()
+		}
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	if entry.CreatedAt == "" {
@@ -218,10 +255,11 @@ func (s Store) Upsert(entry APIKeyRow) error {
 	}
 
 	_, err := s.db.Exec(`INSERT INTO api_keys
-		(key, name, disabled, permission_profile_id, daily_limit, total_quota, spending_limit,
+		(key, id, name, disabled, permission_profile_id, daily_limit, total_quota, spending_limit,
 		 concurrency_limit, rpm_limit, tpm_limit, allowed_models, allowed_channels, allowed_channel_groups, system_prompt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
+			id=excluded.id,
 			name=excluded.name, disabled=excluded.disabled,
 			permission_profile_id=excluded.permission_profile_id,
 			daily_limit=excluded.daily_limit, total_quota=excluded.total_quota,
@@ -231,12 +269,54 @@ func (s Store) Upsert(entry APIKeyRow) error {
 			allowed_channel_groups=excluded.allowed_channel_groups,
 			system_prompt=excluded.system_prompt,
 			updated_at=excluded.updated_at`,
-		entry.Key, entry.Name, disabledInt, entry.PermissionProfileID,
+		entry.Key, entry.ID, entry.Name, disabledInt, entry.PermissionProfileID,
 		entry.DailyLimit, entry.TotalQuota, entry.SpendingLimit,
 		entry.ConcurrencyLimit, entry.RPMLimit, entry.TPMLimit,
 		mustJSONStringList(entry.AllowedModels), mustJSONStringList(entry.AllowedChannels),
 		mustJSONStringList(entry.AllowedChannelGroups), entry.SystemPrompt,
 		entry.CreatedAt, now,
+	)
+	return err
+}
+
+func (s Store) UpdateByID(entry APIKeyRow) error {
+	if s.db == nil {
+		return fmt.Errorf("database not initialised")
+	}
+
+	entry = normalizeRow(entry)
+	if entry.ID == "" {
+		return fmt.Errorf("id is required")
+	}
+	if entry.Key == "" {
+		return fmt.Errorf("key is required")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if entry.CreatedAt == "" {
+		if existing := s.GetByID(entry.ID); existing != nil && existing.CreatedAt != "" {
+			entry.CreatedAt = existing.CreatedAt
+		} else {
+			entry.CreatedAt = now
+		}
+	}
+
+	disabledInt := 0
+	if entry.Disabled {
+		disabledInt = 1
+	}
+
+	_, err := s.db.Exec(`UPDATE api_keys SET
+		key = ?, name = ?, disabled = ?, permission_profile_id = ?, daily_limit = ?, total_quota = ?,
+		spending_limit = ?, concurrency_limit = ?, rpm_limit = ?, tpm_limit = ?,
+		allowed_models = ?, allowed_channels = ?, allowed_channel_groups = ?, system_prompt = ?,
+		created_at = ?, updated_at = ?
+		WHERE id = ?`,
+		entry.Key, entry.Name, disabledInt, entry.PermissionProfileID, entry.DailyLimit, entry.TotalQuota,
+		entry.SpendingLimit, entry.ConcurrencyLimit, entry.RPMLimit, entry.TPMLimit,
+		mustJSONStringList(entry.AllowedModels), mustJSONStringList(entry.AllowedChannels),
+		mustJSONStringList(entry.AllowedChannelGroups), entry.SystemPrompt,
+		entry.CreatedAt, now, entry.ID,
 	)
 	return err
 }
@@ -253,9 +333,30 @@ func (s Store) Delete(key string) error {
 	return err
 }
 
+func (s Store) DeleteByID(id string) error {
+	if s.db == nil {
+		return fmt.Errorf("database not initialised")
+	}
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return fmt.Errorf("id is required")
+	}
+	_, err := s.db.Exec("DELETE FROM api_keys WHERE id = ?", trimmed)
+	return err
+}
+
 func (s Store) ReplaceAll(entries []APIKeyRow) error {
 	if s.db == nil {
 		return fmt.Errorf("database not initialised")
+	}
+	existingIDsByKey := make(map[string]string)
+	for _, row := range s.List() {
+		key := strings.TrimSpace(row.Key)
+		id := strings.TrimSpace(row.ID)
+		if key == "" || id == "" {
+			continue
+		}
+		existingIDsByKey[key] = id
 	}
 
 	tx, err := s.db.Begin()
@@ -269,9 +370,9 @@ func (s Store) ReplaceAll(entries []APIKeyRow) error {
 	}
 
 	stmt, err := tx.Prepare(`INSERT INTO api_keys
-		(key, name, disabled, permission_profile_id, daily_limit, total_quota, spending_limit,
+		(key, id, name, disabled, permission_profile_id, daily_limit, total_quota, spending_limit,
 		 concurrency_limit, rpm_limit, tpm_limit, allowed_models, allowed_channels, allowed_channel_groups, system_prompt, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		_ = tx.Rollback()
 		return err
@@ -284,6 +385,13 @@ func (s Store) ReplaceAll(entries []APIKeyRow) error {
 		if entry.Key == "" {
 			continue
 		}
+		if entry.ID == "" {
+			if existingID := existingIDsByKey[entry.Key]; existingID != "" {
+				entry.ID = existingID
+			} else {
+				entry.ID = uuid.NewString()
+			}
+		}
 		if entry.CreatedAt == "" {
 			entry.CreatedAt = now
 		}
@@ -292,7 +400,7 @@ func (s Store) ReplaceAll(entries []APIKeyRow) error {
 			disabledInt = 1
 		}
 		if _, err := stmt.Exec(
-			entry.Key, entry.Name, disabledInt, entry.PermissionProfileID,
+			entry.Key, entry.ID, entry.Name, disabledInt, entry.PermissionProfileID,
 			entry.DailyLimit, entry.TotalQuota, entry.SpendingLimit,
 			entry.ConcurrencyLimit, entry.RPMLimit, entry.TPMLimit,
 			mustJSONStringList(entry.AllowedModels), mustJSONStringList(entry.AllowedChannels),
@@ -355,6 +463,7 @@ func migrateColumns(db *sql.DB) {
 		name       string
 		definition string
 	}{
+		{name: "id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "permission_profile_id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "allowed_channels", definition: "TEXT NOT NULL DEFAULT '[]'"},
 		{name: "allowed_channel_groups", definition: "TEXT NOT NULL DEFAULT '[]'"},
@@ -365,6 +474,62 @@ func migrateColumns(db *sql.DB) {
 			}
 		}
 	}
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_id ON api_keys(id)"); err != nil {
+		log.Warnf("sqlite/apikey: ensure api_keys id index: %v", err)
+	}
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key)"); err != nil {
+		log.Warnf("sqlite/apikey: ensure api_keys key index: %v", err)
+	}
+}
+
+func backfillIDs(db *sql.DB) {
+	rows, err := db.Query(`SELECT key FROM api_keys WHERE trim(coalesce(id, '')) = '' ORDER BY created_at ASC, key ASC`)
+	if err != nil {
+		log.Warnf("sqlite/apikey: query api_keys without id: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	keys := make([]string, 0)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err == nil && strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Warnf("sqlite/apikey: begin api_keys id backfill: %v", err)
+		return
+	}
+
+	stmt, err := tx.Prepare(`UPDATE api_keys SET id = ?, updated_at = ? WHERE key = ? AND trim(coalesce(id, '')) = ''`)
+	if err != nil {
+		_ = tx.Rollback()
+		log.Warnf("sqlite/apikey: prepare api_keys id backfill: %v", err)
+		return
+	}
+	defer stmt.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, key := range keys {
+		if _, err := stmt.Exec(uuid.NewString(), now, key); err != nil {
+			_ = tx.Rollback()
+			log.Warnf("sqlite/apikey: update api_keys id backfill for %s: %v", key, err)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Warnf("sqlite/apikey: commit api_keys id backfill: %v", err)
+		return
+	}
+
+	log.Infof("sqlite/apikey: backfilled ids for %d api_keys", len(keys))
 }
 
 func backfillNames(db *sql.DB) {
@@ -418,6 +583,7 @@ func backfillNames(db *sql.DB) {
 }
 
 func normalizeRow(row APIKeyRow) APIKeyRow {
+	row.ID = strings.TrimSpace(row.ID)
 	row.Key = strings.TrimSpace(row.Key)
 	row.Name = strings.TrimSpace(row.Name)
 	row.PermissionProfileID = strings.TrimSpace(row.PermissionProfileID)
@@ -457,6 +623,7 @@ func scanAPIKeyRow(row scanner) (*APIKeyRow, bool) {
 	var channelGroupsJSON string
 	if err := row.Scan(
 		&entry.Key, &entry.Name, &disabledInt,
+		&entry.ID,
 		&entry.DailyLimit, &entry.TotalQuota, &entry.PermissionProfileID, &entry.SpendingLimit,
 		&entry.ConcurrencyLimit, &entry.RPMLimit, &entry.TPMLimit,
 		&modelsJSON, &channelsJSON, &channelGroupsJSON, &entry.SystemPrompt,

@@ -335,10 +335,11 @@ func QueryTotalCostByKey(apiKey string) (float64, error) {
 	if db == nil {
 		return 0, nil
 	}
+	clause, args := buildSingleAPIKeySelectorClause(apiKey)
 	var total float64
 	err := db.QueryRow(
-		"SELECT COALESCE(SUM(cost), 0) FROM request_logs WHERE api_key = ?",
-		apiKey,
+		"SELECT COALESCE(SUM(cost), 0) FROM request_logs"+clause,
+		args...,
 	).Scan(&total)
 	if err != nil {
 		return 0, fmt.Errorf("usage: query total cost: %w", err)
