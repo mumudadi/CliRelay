@@ -335,11 +335,15 @@ func TestDefaultConfiguredAvailabilityUsesMappedOwnerModels(t *testing.T) {
 
 	const (
 		authID             = "codex-default-mapped-owner-auth"
+		codexConfigAuthID  = "codex-default-mapped-owner-config-auth"
+		codexStaticAuthID  = "codex-default-mapped-owner-static-config-auth"
 		openCodeAuthID     = "opencode-default-mapped-owner-auth"
 		registryID         = "codex-default-mapped-owner-registry"
 		openCodeRegistryID = "opencode-default-mapped-owner-registry"
 		mappedModel        = "mapped-codex-owner-model"
 		oldModel           = "old-codex-registry-model"
+		codexConfigModel   = "gpt-5.2"
+		codexStaticModel   = "codex-config-static-model"
 		openCodeModel      = "opencode-provider-model"
 	)
 
@@ -347,11 +351,19 @@ func TestDefaultConfiguredAvailabilityUsesMappedOwnerModels(t *testing.T) {
 	reg.RegisterClient(registryID, "codex", []*registry.ModelInfo{
 		{ID: oldModel, Object: "model", OwnedBy: "openai", Type: "openai"},
 	})
+	reg.RegisterClient(codexConfigAuthID, "codex", []*registry.ModelInfo{
+		{ID: codexConfigModel, Object: "model", OwnedBy: "openai", Type: "openai", UserDefined: true},
+	})
+	reg.RegisterClient(codexStaticAuthID, "codex", []*registry.ModelInfo{
+		{ID: codexStaticModel, Object: "model", OwnedBy: "openai", Type: "openai"},
+	})
 	reg.RegisterClient(openCodeRegistryID, "opencode-go", []*registry.ModelInfo{
 		{ID: openCodeModel, Object: "model", OwnedBy: "opencode", Type: "opencode-go"},
 	})
 	t.Cleanup(func() {
 		reg.UnregisterClient(registryID)
+		reg.UnregisterClient(codexConfigAuthID)
+		reg.UnregisterClient(codexStaticAuthID)
 		reg.UnregisterClient(openCodeRegistryID)
 	})
 
@@ -363,6 +375,31 @@ func TestDefaultConfiguredAvailabilityUsesMappedOwnerModels(t *testing.T) {
 		Status:   coreauth.StatusActive,
 	}); err != nil {
 		t.Fatalf("Register codex auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       codexConfigAuthID,
+		Provider: "codex",
+		Label:    "Codex Config",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind":   "apikey",
+			"source":      "config:codex[test]",
+			"models_hash": "explicit",
+		},
+	}); err != nil {
+		t.Fatalf("Register codex config auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       codexStaticAuthID,
+		Provider: "codex",
+		Label:    "Codex Static Config",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind": "apikey",
+			"source":    "config:codex[static]",
+		},
+	}); err != nil {
+		t.Fatalf("Register codex static config auth: %v", err)
 	}
 	if _, err := manager.Register(context.Background(), &coreauth.Auth{
 		ID:       openCodeAuthID,
@@ -420,8 +457,14 @@ func TestDefaultConfiguredAvailabilityUsesMappedOwnerModels(t *testing.T) {
 	if _, ok := ids[openCodeModel]; !ok {
 		t.Fatalf("missing unmapped provider model %q; ids=%v", openCodeModel, ids)
 	}
+	if _, ok := ids[codexConfigModel]; !ok {
+		t.Fatalf("missing explicit codex provider model %q; ids=%v", codexConfigModel, ids)
+	}
 	if _, ok := ids[oldModel]; ok {
 		t.Fatalf("unexpected registry model outside mapped owner %q; ids=%v", oldModel, ids)
+	}
+	if _, ok := ids[codexStaticModel]; ok {
+		t.Fatalf("unexpected static codex config model %q; ids=%v", codexStaticModel, ids)
 	}
 }
 

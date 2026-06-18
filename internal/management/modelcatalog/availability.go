@@ -316,12 +316,29 @@ func registryModelCoveredByMappedOwners(
 		return false
 	}
 	for _, source := range sources {
+		if sourceHasExplicitConfigModels(source, authByID) {
+			return false
+		}
 		owner := mappedOwnerForSource(source, authByID, ownerMappings)
 		if owner == "" || !ownerKeys[owner] {
 			return false
 		}
 	}
 	return true
+}
+
+func sourceHasExplicitConfigModels(source registry.ModelClientSource, authByID map[string]*coreauth.Auth) bool {
+	auth := authByID[strings.TrimSpace(source.ClientID)]
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Attributes["auth_kind"]), "apikey") {
+		return false
+	}
+	if strings.TrimSpace(auth.Attributes["models_hash"]) == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(auth.Attributes["source"])), "config:")
 }
 
 func mappedOwnerForSource(source registry.ModelClientSource, authByID map[string]*coreauth.Auth, ownerMappings map[string]string) string {
