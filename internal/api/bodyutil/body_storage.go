@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -282,12 +281,7 @@ func RequestBodyCacheAvailable(requiredBytes int64) bool {
 	if requiredBytes < 0 {
 		requiredBytes = 0
 	}
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(dir, &stat); err != nil {
-		return false
-	}
-	available := int64(stat.Bavail) * int64(stat.Bsize)
-	return available-requiredBytes >= bodyStorageMinFreeBytes
+	return requestBodyCacheHasFreeSpace(dir, requiredBytes)
 }
 
 // CleanupOldRequestBodyCacheFiles removes abandoned request body temp files.
