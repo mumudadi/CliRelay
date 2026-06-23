@@ -45,20 +45,23 @@ func TestDefaultClaudeIdentityFingerprintMirrorsClaudeCode(t *testing.T) {
 	if got.Enabled {
 		t.Fatalf("Enabled = true, want false by default")
 	}
-	if got.CLIVersion != "2.1.88" {
-		t.Fatalf("CLIVersion = %q, want 2.1.88", got.CLIVersion)
+	if got.CLIVersion != "2.1.161" {
+		t.Fatalf("CLIVersion = %q, want 2.1.161", got.CLIVersion)
 	}
 	if got.Entrypoint != "cli" {
 		t.Fatalf("Entrypoint = %q, want cli", got.Entrypoint)
 	}
-	if got.UserAgent != "claude-cli/2.1.88 (external, cli)" {
+	if got.UserAgent != "claude-cli/2.1.161 (external, cli)" {
 		t.Fatalf("UserAgent = %q, want Claude Code user agent", got.UserAgent)
 	}
-	if got.StainlessPackageVersion != "0.74.0" {
-		t.Fatalf("StainlessPackageVersion = %q, want 0.74.0", got.StainlessPackageVersion)
+	if got.StainlessPackageVersion != "0.94.0" {
+		t.Fatalf("StainlessPackageVersion = %q, want 0.94.0", got.StainlessPackageVersion)
 	}
-	if got.StainlessRuntimeVersion != "v22.13.0" {
-		t.Fatalf("StainlessRuntimeVersion = %q, want v22.13.0", got.StainlessRuntimeVersion)
+	if got.StainlessRuntimeVersion != "v24.3.0" {
+		t.Fatalf("StainlessRuntimeVersion = %q, want v24.3.0", got.StainlessRuntimeVersion)
+	}
+	if got.AnthropicBeta != "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11" {
+		t.Fatalf("AnthropicBeta = %q, want Claude Code OAuth beta set", got.AnthropicBeta)
 	}
 	if got.SessionMode != "per-request" {
 		t.Fatalf("SessionMode = %q, want per-request", got.SessionMode)

@@ -11,11 +11,11 @@ const (
 	DefaultCodexFingerprintWebsocketBeta = "responses_websockets=2026-02-06"
 	DefaultCodexFingerprintSessionMode   = "per-request"
 
-	DefaultClaudeFingerprintCLIVersion              = "2.1.88"
+	DefaultClaudeFingerprintCLIVersion              = "2.1.161"
 	DefaultClaudeFingerprintEntrypoint              = "cli"
-	DefaultClaudeFingerprintAnthropicBeta           = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
-	DefaultClaudeFingerprintStainlessPackageVersion = "0.74.0"
-	DefaultClaudeFingerprintStainlessRuntimeVersion = "v22.13.0"
+	DefaultClaudeFingerprintAnthropicBeta           = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11"
+	DefaultClaudeFingerprintStainlessPackageVersion = "0.94.0"
+	DefaultClaudeFingerprintStainlessRuntimeVersion = "v24.3.0"
 	DefaultClaudeFingerprintStainlessTimeout        = "600"
 	DefaultClaudeFingerprintSessionMode             = "per-request"
 )

@@ -71,6 +71,54 @@ func TestBuildEntryAllowsRuntimeOnlyAuthWithoutPath(t *testing.T) {
 	}
 }
 
+func TestBuildEntryIncludesSanitizedClaudeOAuthHealth(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "claude-oauth",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+		Metadata: map[string]any{
+			"email":         "claude@example.com",
+			"access_token":  "metadata-access-token",
+			"refresh_token": "metadata-refresh-token",
+			coreauth.ClaudeOAuthHealthMetadataKey: map[string]any{
+				"status":        "refresh_pending",
+				"access_token":  "health-access-token",
+				"refresh_token": "health-refresh-token",
+				"windows": map[string]any{
+					"five_hour": map[string]any{
+						"status":      "rejected",
+						"exceeded":    true,
+						"secret":      "hidden",
+						"utilization": 1.02,
+					},
+				},
+			},
+		},
+	}
+
+	entry := BuildEntry(auth, EntryOptions{})
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	health, ok := entry["claude_oauth_health"].(map[string]any)
+	if !ok {
+		t.Fatalf("claude_oauth_health = %#v, want map", entry["claude_oauth_health"])
+	}
+	if health["status"] != "refresh_pending" {
+		t.Fatalf("health.status = %v, want refresh_pending", health["status"])
+	}
+	if _, ok := health["access_token"]; ok {
+		t.Fatalf("health leaked access_token: %#v", health)
+	}
+	windows, _ := health["windows"].(map[string]any)
+	fiveHour, _ := windows["five_hour"].(map[string]any)
+	if fiveHour["utilization"] != 1.02 || fiveHour["secret"] != nil {
+		t.Fatalf("five_hour = %#v, want utilization without secret", fiveHour)
+	}
+}
+
 func TestBuildEntryUsesInjectedStat(t *testing.T) {
 	modtime := time.Date(2026, 4, 1, 9, 30, 0, 0, time.UTC)
 	auth := &coreauth.Auth{

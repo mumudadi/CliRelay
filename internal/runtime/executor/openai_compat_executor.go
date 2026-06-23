@@ -159,7 +159,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		recorder.AppendResponseChunk(b)
 		logWithRequestID(execCtx.Context).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), string(b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), headers: httpResp.Header.Clone()}
 		return resp, err
 	}
 	body, err := readUpstreamResponseBody(e.Identifier(), httpResp.Body)
@@ -262,7 +262,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), headers: httpResp.Header.Clone()}
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -410,6 +410,7 @@ type statusErr struct {
 	upstreamBody       []byte
 	quotaWindow        string
 	quotaWindowMinutes int
+	headers            http.Header
 }
 
 func (e statusErr) Error() string {
@@ -421,6 +422,12 @@ func (e statusErr) Error() string {
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) QuotaWindow() (string, int) { return e.quotaWindow, e.quotaWindowMinutes }
+func (e statusErr) Headers() http.Header {
+	if e.headers == nil {
+		return nil
+	}
+	return e.headers.Clone()
+}
 func (e statusErr) UpstreamErrorBody() []byte {
 	if len(e.upstreamBody) == 0 {
 		return nil

@@ -94,6 +94,9 @@ func BuildEntry(auth *coreauth.Auth, opts EntryOptions) map[string]any {
 		entry["plan_type"] = planType
 	}
 	AddSubscriptionFields(entry, auth.Metadata, now)
+	if health := ClaudeOAuthHealth(auth); len(health) > 0 {
+		entry["claude_oauth_health"] = health
+	}
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
 	}
