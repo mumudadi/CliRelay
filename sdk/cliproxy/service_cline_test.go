@@ -106,3 +106,42 @@ func TestRegisterModelsForAuth_ClineUsesExplicitAndExcludedModels(t *testing.T) 
 		t.Fatalf("cline-pass/new-model not registered; got %+v", models)
 	}
 }
+
+func TestRegisterModelsForAuth_ClineRegistersAliasWithUpstreamModelID(t *testing.T) {
+	service := &Service{cfg: &config.Config{
+		ClineKey: []config.ClineKey{{
+			APIKey: "cline-key-alias",
+			Models: []config.ClineModel{
+				{Name: "cline-pass/mimo-v2.5-pro", Alias: "mimo-v2.5-pro"},
+			},
+		}},
+	}}
+	auth := &coreauth.Auth{
+		ID:       "cline-auth-alias-models",
+		Provider: "cline",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind": "apikey",
+			"api_key":   "cline-key-alias",
+		},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	models := registry.GetModelsForClient(auth.ID)
+	for _, model := range models {
+		if model.ID == "mimo-v2.5-pro" {
+			if model.UpstreamModelID != "cline-pass/mimo-v2.5-pro" {
+				t.Fatalf("UpstreamModelID = %q, want cline-pass/mimo-v2.5-pro", model.UpstreamModelID)
+			}
+			return
+		}
+	}
+	t.Fatalf("mimo-v2.5-pro alias not registered; got %+v", models)
+}
