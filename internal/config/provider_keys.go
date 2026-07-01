@@ -294,7 +294,7 @@ type ClineKey struct {
 	// ProxyID references a reusable proxy-pool entry. When valid, it takes precedence over ProxyURL.
 	ProxyID string `yaml:"proxy-id,omitempty" json:"proxy-id,omitempty"`
 
-	// Models defines the Cline model IDs explicitly enabled for this key.
+	// Models defines upstream Cline model IDs and optional client-facing aliases.
 	Models []ClineModel `yaml:"models,omitempty" json:"models,omitempty"`
 
 	// Headers optionally adds extra HTTP headers for requests sent with this key.
@@ -305,8 +305,9 @@ type ClineKey struct {
 }
 
 type ClineModel struct {
-	Name string `yaml:"name" json:"name"`
+	Name  string `yaml:"name" json:"name"`
+	Alias string `yaml:"alias,omitempty" json:"alias,omitempty"`
 }
 
 func (m ClineModel) GetName() string  { return m.Name }
-func (m ClineModel) GetAlias() string { return "" }
+func (m ClineModel) GetAlias() string { return m.Alias }

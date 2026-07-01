@@ -176,6 +176,9 @@ func buildConfigModels[T modelEntry](
 			DisplayName: display,
 			UserDefined: true,
 		}
+		if name != "" && !strings.EqualFold(name, alias) {
+			info.UpstreamModelID = name
+		}
 		if resolveThinking != nil && name != "" {
 			info.Thinking = resolveThinking(name)
 		}
@@ -335,7 +338,7 @@ func buildClineConfigModels(entry *config.ClineKey, staticModels []*ModelInfo) [
 	if entry == nil || len(entry.Models) == 0 {
 		return nil
 	}
-	return buildNamedConfigModels(entry.Models, staticModels, "cline", "cline")
+	return buildConfigModels(entry.Models, "cline", "cline", nil)
 }
 
 func buildNamedConfigModels[T interface{ GetName() string }](models []T, staticModels []*ModelInfo, ownedBy, modelType string) []*ModelInfo {

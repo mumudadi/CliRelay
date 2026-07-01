@@ -144,7 +144,11 @@ func (ec *ExecutionContext) Reporter() *usageReporter {
 	if ec == nil {
 		return nil
 	}
-	return newUsageReporter(ec.Context, ec.Provider, ec.BaseModel, ec.Auth)
+	model := thinking.ParseSuffix(ec.RequestedModel).ModelName
+	if strings.TrimSpace(model) == "" {
+		model = ec.BaseModel
+	}
+	return newUsageReporter(ec.Context, ec.Provider, model, ec.BaseModel, ec.Auth)
 }
 
 func (ec *ExecutionContext) HTTPClient(timeout time.Duration) *http.Client {

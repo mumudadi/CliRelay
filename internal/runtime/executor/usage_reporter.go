@@ -20,6 +20,7 @@ const usageReporterOutputMemoryLimit = 256 * 1024
 type usageReporter struct {
 	provider      string
 	model         string
+	upstreamModel string
 	authID        string
 	authIndex     string
 	authSubjectID string
@@ -40,14 +41,15 @@ type usageReporter struct {
 	outputPath    string
 }
 
-func newUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *usageReporter {
+func newUsageReporter(ctx context.Context, provider, model, upstreamModel string, auth *cliproxyauth.Auth) *usageReporter {
 	apiKey := apiKeyFromContext(ctx)
 	reporter := &usageReporter{
-		provider:    provider,
-		model:       model,
-		requestedAt: time.Now(),
-		apiKey:      apiKey,
-		source:      resolveUsageSource(auth, apiKey),
+		provider:      provider,
+		model:         model,
+		upstreamModel: upstreamModel,
+		requestedAt:   time.Now(),
+		apiKey:        apiKey,
+		source:        resolveUsageSource(auth, apiKey),
 	}
 	if identity := internalusage.ResolveAPIKeyIdentity(apiKey); identity != nil {
 		reporter.apiKeyID = identity.ID
@@ -238,6 +240,7 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail coreusage
 		coreusage.PublishRecord(ctx, coreusage.Record{
 			Provider:      r.provider,
 			Model:         r.model,
+			UpstreamModel: r.upstreamModel,
 			Source:        r.source,
 			ChannelName:   r.channelName,
 			APIKey:        r.apiKey,

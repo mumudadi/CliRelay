@@ -297,12 +297,13 @@ func NormalizeClineModels(models []ClineModel) []ClineModel {
 		if name == "" {
 			continue
 		}
+		alias := strings.TrimSpace(models[i].Alias)
 		key := strings.ToLower(name)
 		if _, exists := seen[key]; exists {
 			continue
 		}
 		seen[key] = struct{}{}
-		out = append(out, ClineModel{Name: name})
+		out = append(out, ClineModel{Name: name, Alias: alias})
 	}
 	return out
 }

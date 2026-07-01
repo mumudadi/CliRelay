@@ -12,6 +12,7 @@ import (
 type Record struct {
 	Provider      string
 	Model         string
+	UpstreamModel string
 	APIKey        string
 	APIKeyID      string
 	APIKeyName    string
