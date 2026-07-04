@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/sjson"
@@ -318,6 +319,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		var lastUsage coreusage.Detail
+		hasUsage := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			recorder.AppendResponseChunk(line)
@@ -327,7 +330,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// provider-internal path (e.g. accounts/fireworks/models/glm-5p2) that
 			// must not override the clean request-time model used for logging/cost.
 			if detail, ok := parseOpenAIStreamUsage(line); ok {
-				reporter.publish(execCtx.Context, detail)
+				lastUsage = detail
+				hasUsage = true
 			}
 			if len(line) == 0 {
 				continue
@@ -348,6 +352,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			recorder.RecordResponseError(errScan)
 			reporter.publishFailure(execCtx.Context)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		}
+		if hasUsage {
+			reporter.publish(execCtx.Context, lastUsage)
 		}
 		// Ensure we record the request if no usage chunk was ever seen
 		reporter.ensurePublished(execCtx.Context)

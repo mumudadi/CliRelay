@@ -232,7 +232,8 @@ func TestOpenAICompatExecutorStreamUsagePreservesRequestModelOverUpstreamEcho(t 
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(strings.Join([]string{
 			`data: {"id":"chatcmpl-echo","object":"chat.completion.chunk","created":1,"model":"accounts/fireworks/models/glm-5p2","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}`,
-			`data: {"id":"chatcmpl-echo","object":"chat.completion.chunk","created":1,"model":"accounts/fireworks/models/glm-5p2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}`,
+			`data: {"id":"chatcmpl-echo","object":"chat.completion.chunk","created":1,"model":"accounts/fireworks/models/glm-5p2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8,"prompt_tokens_details":null}}`,
+			`data: {"id":"chatcmpl-echo","object":"chat.completion.chunk","created":1,"model":"accounts/fireworks/models/glm-5p2","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":10}}}`,
 			`data: [DONE]`,
 			``,
 		}, "\n\n")))
@@ -270,6 +271,9 @@ func TestOpenAICompatExecutorStreamUsagePreservesRequestModelOverUpstreamEcho(t 
 				t.Fatalf("stream usage record model = upstream echo %q; must stay the clean request model", record.Model)
 			}
 			if record.Model == "glm-5.2" {
+				if record.Detail.CachedTokens != 10 {
+					t.Fatalf("stream cached tokens = %d, want 10", record.Detail.CachedTokens)
+				}
 				return
 			}
 		case <-timer:
