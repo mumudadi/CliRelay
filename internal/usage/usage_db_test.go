@@ -672,6 +672,38 @@ func TestInitDBMigratesFirstTokenAndStreamingColumns(t *testing.T) {
 	}
 }
 
+func TestInitDBEnsuresRequestLogLookupIndexes(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	rows, err := getDB().Query("PRAGMA index_list(request_logs)")
+	if err != nil {
+		t.Fatalf("PRAGMA index_list(request_logs): %v", err)
+	}
+	defer rows.Close()
+
+	found := map[string]bool{}
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan index_list: %v", err)
+		}
+		found[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate index_list: %v", err)
+	}
+
+	for _, name := range []string{"idx_logs_api_key_timestamp", "idx_logs_api_key_id_timestamp"} {
+		if !found[name] {
+			t.Fatalf("expected %s to exist after InitDB", name)
+		}
+	}
+}
+
 func TestInitDBMigratesAuthSubjectColumnsAndCycleTable(t *testing.T) {
 	CloseDB()
 	dbPath := filepath.Join(t.TempDir(), "usage.db")
@@ -1587,6 +1619,33 @@ func TestBackfillRequestLogAPIKeyIDsUsesHistoricalRawKeyIdentity(t *testing.T) {
 	}
 }
 
+func TestUniqueRequestLogAPIKeyIDByKeyOnlyChecksMissingRawKeys(t *testing.T) {
+	initTestUsageDB(t, config.RequestLogStorageConfig{})
+
+	db := getDB()
+	now := time.Now().UTC()
+	InsertLogWithDetailsIdentity("sk-missing", "missing-id", "", "gpt-test", "source", "channel", "auth-1", false, now, 1, 1, TokenStats{TotalTokens: 1}, "", "", "")
+	InsertLogWithDetailsIdentity("sk-unrelated", "unrelated-id", "", "gpt-test", "source", "channel", "auth-1", false, now, 1, 1, TokenStats{TotalTokens: 1}, "", "", "")
+	if _, err := db.Exec(
+		`INSERT INTO request_logs
+			(timestamp, api_key, api_key_id, api_key_name, model, source, channel_name, auth_index,
+			 failed, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		now.Add(time.Second).Format(time.RFC3339Nano), "sk-missing", "", "", "gpt-test", "source", "channel", "auth-1",
+		0, 123, 45, 10, 20, 0, 0, 30, 0,
+	); err != nil {
+		t.Fatalf("insert missing api_key_id request_log: %v", err)
+	}
+
+	got := uniqueRequestLogAPIKeyIDByKeyFromDB(db)
+	if got["sk-missing"] != "missing-id" {
+		t.Fatalf("sk-missing id = %q, want missing-id", got["sk-missing"])
+	}
+	if _, ok := got["sk-unrelated"]; ok {
+		t.Fatalf("sk-unrelated should not be queried when it has no missing api_key_id rows")
+	}
+}
+
 func TestQueryAPIKeySelectorsHandleLegacyRowsWithoutAPIKeyID(t *testing.T) {
 	initTestUsageDB(t, config.RequestLogStorageConfig{})
 
@@ -1935,7 +1994,7 @@ func TestQueryStatsAndHeatmapCountSessionsFromDetails(t *testing.T) {
 		CleanupIntervalMinutes: 1440,
 	})
 
-	today := time.Now().UTC()
+	today := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
 	yesterday := today.AddDate(0, 0, -1)
 	InsertLogWithDetails("sk-heatmap", "Heatmap", "gpt-5.4", "codex", "Codex", "auth-1", false, today, 10, 5, TokenStats{
 		InputTokens: 10, OutputTokens: 20, TotalTokens: 30,

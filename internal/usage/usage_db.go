@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS request_log_content (
 
 CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON request_logs(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_api_key ON request_logs(api_key);
+CREATE INDEX IF NOT EXISTS idx_logs_api_key_timestamp ON request_logs(api_key, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(model);
 CREATE INDEX IF NOT EXISTS idx_logs_failed ON request_logs(failed);
 CREATE INDEX IF NOT EXISTS idx_logs_auth_index ON request_logs(auth_index);
@@ -273,6 +274,17 @@ func migrateAPIKeyIDColumn(db *sql.DB) {
 	}
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id)"); err != nil {
 		log.Warnf("usage: create idx_logs_api_key_id: %v", err)
+	}
+}
+
+func ensureRequestLogLookupIndexes(db *sql.DB) {
+	for _, stmt := range []string{
+		"CREATE INDEX IF NOT EXISTS idx_logs_api_key_timestamp ON request_logs(api_key, timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_logs_api_key_id_timestamp ON request_logs(api_key_id, timestamp DESC)",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Warnf("usage: create request log lookup index: %v", err)
+		}
 	}
 }
 
@@ -456,6 +468,8 @@ func InitDB(dbPath string, storageCfg config.RequestLogStorageConfig, loc *time.
 	migrateVisionFallbackModelColumn(db)
 	log.Debugf("usage: running api_key_id column migration")
 	migrateAPIKeyIDColumn(db)
+	log.Debugf("usage: ensuring request log lookup indexes")
+	ensureRequestLogLookupIndexes(db)
 	log.Debugf("usage: running auth_subject_id column migration")
 	migrateAuthSubjectIDColumns(db)
 	log.Debugf("usage: running first_token_ms column migration")
