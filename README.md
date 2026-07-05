@@ -57,17 +57,17 @@ CliRelay turns AI CLI subscriptions, OAuth credentials, API keys, and compatible
 | 🧠 **Multimodal Support** | Full support for text + image inputs, image-generation routing, function calling (tools), and streaming SSE responses |
 | 🔗 **OpenAI-Compatible** | Works with any upstream that speaks the OpenAI Chat Completions protocol |
 
-### 📊 Request Logging & Monitoring (SQLite)
+### 📊 Request Logging & Monitoring (PostgreSQL)
 
 | Feature | Description |
 |:--------|:------------|
-| 📝 **Full Request Capture** | Every API request is logged to SQLite with timestamp, model, tokens (in/out/reasoning/cache), latency, status, and source channel |
-| 💬 **Message Body Storage** | Full request/response message content captured in compressed SQLite storage, with separate retention for content vs. metadata |
+| 📝 **Full Request Capture** | Every API request is logged to PostgreSQL with timestamp, model, tokens (in/out/reasoning/cache), latency, status, and source channel |
+| 💬 **Message Body Storage** | Full request/response message content captured in compressed PostgreSQL storage, with separate retention for content vs. metadata |
 | 🔍 **Advanced Querying** | Filter logs by API Key, model, status, time range with efficient pagination (LIMIT/OFFSET) |
 | 📈 **Analytics Aggregation** | Pre-computed dashboards: daily trends, model distribution, hourly heatmaps, per-key statistics |
 | 🏥 **Health Score Engine** | Real-time 0–100 health score considering success rate, latency, active channels, and error patterns |
 | 📡 **WebSocket Monitoring** | Live system stats streamed via WebSocket: CPU, memory, goroutines, network I/O, DB size |
-| 🗄️ **No-CGO SQLite** | Uses `modernc.org/sqlite` — pure Go, no CGO dependency, easy cross-compilation |
+| 🗄️ **Ent + PostgreSQL** | Uses PostgreSQL 15+ as the runtime primary database with Ent-generated schema metadata |
 
 ### 🔐 API Key & Access Management
 
@@ -118,8 +118,8 @@ CliRelay turns AI CLI subscriptions, OAuth credentials, API keys, and compatible
 
 | Feature | Description |
 |:--------|:------------|
-| 💾 **SQLite Storage** | All usage data, request logs, and message bodies stored in local SQLite database |
-| 🔄 **Redis Backup** | Optional Redis integration for periodic snapshotting and cross-restart metric preservation |
+| 💾 **PostgreSQL Storage** | Usage data, request logs, message bodies, API keys, routing, proxy pool, model config, and quota state are stored in PostgreSQL |
+| 🔄 **Redis Runtime State** | Redis 7+ handles cache, locks, limits, queues, and rebuildable snapshots; PostgreSQL remains the source of truth |
 | 🗃️ **Pluggable Auth/Config Backends** | Local files by default, with optional PostgreSQL, Git, or S3-compatible object storage backends for config/auth persistence |
 | 📦 **Config Snapshots** | Import/export entire system configuration as JSON for backup and migration |
 
@@ -218,7 +218,7 @@ Docker Compose is the recommended installation path for CliRelay. The included `
 git clone https://github.com/kittors/CliRelay.git
 cd CliRelay
 cp config.example.yaml config.yaml
-mkdir -p auths logs data
+mkdir -p auths logs data postgres-data redis-data
 # Linux bind mounts need write access for the non-root container user:
 # sudo chown -R 10001:10001 auths logs data
 docker compose up -d
@@ -262,10 +262,13 @@ auto-update:
 
 ### 🗄️ Enabling Data Persistence
 
-By default, API usage logs are stored in SQLite for persistence. For additional backup:
-1. Ensure you have a Redis server running.
-2. Edit `config.yaml` and set `redis.enable: true` with your Redis address.
-CliRelay will automatically snapshot and restore traffic metrics on every startup!
+CliRelay uses PostgreSQL 15+ as the runtime primary database and Redis 7+ for cache, locks, limits, queues, and rebuildable snapshots. The bundled Docker Compose file starts both services and injects container-local connection settings through environment variables.
+
+For non-Compose deployments:
+1. Provision PostgreSQL 15+ and Redis 7+.
+2. Set `postgres.dsn` and `redis.*` in `config.yaml`, or override them with `CLIRELAY_POSTGRES_DSN`, `CLIRELAY_REDIS_ENABLE`, `CLIRELAY_REDIS_ADDR`, `CLIRELAY_REDIS_PASSWORD`, and `CLIRELAY_REDIS_DB`.
+3. Run `./cli-proxy-api -sqlite-dry-run /path/to/usage.db` before migration to collect a read-only table inventory with row counts, ID/time ranges, and checksums. The command does not print row contents.
+4. Run `./cli-proxy-api -sqlite-import /path/to/usage.db` with `CLIRELAY_POSTGRES_DSN` set to verify source/target rows and checksums without writing. Apply with `-sqlite-import-dry-run=false` only after reviewing the report.
 
 For large installations, tune `request-log-storage` in `config.yaml` to control how full request/response bodies are retained. By default, full bodies are compressed, kept for 30 days, and capped at ~1GB (1024MB); lightweight request metadata remains queryable for longer-term statistics. Set `content-retention-days: 0` to keep full content indefinitely, set `store-content: false` to stop new body storage without deleting existing historical content, and adjust `max-total-size-mb` to cap body storage so the oldest full bodies are pruned before the retention window is reached.
 
@@ -312,7 +315,7 @@ CliRelay/
 ├── internal/config/          # Config parsing, defaults, migrations
 ├── internal/store/           # Local, Git, PostgreSQL, object-store auth/config persistence
 ├── internal/tui/             # Terminal management UI
-├── internal/usage/           # SQLite usage DB, retention, analytics
+├── internal/usage/           # PostgreSQL-backed usage data, retention, analytics
 ├── internal/managementasset/ # /manage panel hosting and asset sync
 ├── sdk/                      # Reusable Go SDK, handlers, executors
 ├── auths/                    # Local credential storage
@@ -332,6 +335,7 @@ CliRelay/
 | [SDK Advanced](docs/sdk-advanced.md) | Executors & translators deep-dive |
 | [SDK Access](docs/sdk-access.md) | Authentication in SDK context |
 | [SDK Watcher](docs/sdk-watcher.md) | Credential loading & hot-reload |
+| [PostgreSQL / Redis Migration](docs/postgres-redis-migration.md) | Runtime data-stack setup, SQLite dry-run inventory, and validation |
 
 ## 🤝 Contributing
 
@@ -366,6 +370,6 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 This project is a deeply enhanced fork built upon the excellent core logic of the open-source **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** project.
 We want to express our deepest gratitude to the original **CLIProxyAPI** project and all its contributors!
 
-It is thanks to the solid, innovative proxy distribution foundation built by the upstream that we were able to stand on the shoulders of giants. This allowed us to develop unique advanced management features (like API Key tracking & control, full request logging with SQLite, and real-time system monitoring) and rebuild an entirely new frontend dashboard from scratch.
+It is thanks to the solid, innovative proxy distribution foundation built by the upstream that we were able to stand on the shoulders of giants. This allowed us to develop unique advanced management features (like API Key tracking & control, full request logging, and real-time system monitoring) and rebuild an entirely new frontend dashboard from scratch.
 
 A huge salute to the spirit of open source! ❤️

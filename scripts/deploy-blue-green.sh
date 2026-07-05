@@ -39,6 +39,30 @@ config_path="${config_path:-${service_dir}/config.yaml}"
 [ -f "$TEMP_BIN" ] || fail "uploaded temp binary not found: $TEMP_BIN"
 [ -f "$config_path" ] || fail "config file not found: $config_path"
 
+read_config_scalar() {
+	awk -v section="$1" -v key="$2" '
+		$0 ~ "^[[:space:]]*" section ":[[:space:]]*$" {in_section=1; next}
+		in_section && $0 ~ "^[^[:space:]#][^:]*:" {in_section=0}
+		in_section && $0 ~ "^[[:space:]]*" key ":[[:space:]]*" {
+			sub("^[[:space:]]*" key ":[[:space:]]*", "")
+			gsub(/^[[:space:]"'\'']+|[[:space:]"'\'']+$/, "")
+			print
+			exit
+		}
+	' "$config_path" 2>/dev/null || true
+}
+
+postgres_dsn="${CLIRELAY_POSTGRES_DSN:-$(read_config_scalar postgres dsn)}"
+[ -n "$postgres_dsn" ] || fail "postgres.dsn or CLIRELAY_POSTGRES_DSN is required before deploying this runtime data stack"
+
+redis_enable="${CLIRELAY_REDIS_ENABLE:-$(read_config_scalar redis enable)}"
+case "${redis_enable,,}" in
+	true|yes|1)
+		redis_addr="${CLIRELAY_REDIS_ADDR:-$(read_config_scalar redis addr)}"
+		[ -n "$redis_addr" ] || fail "redis.addr or CLIRELAY_REDIS_ADDR is required when redis is enabled"
+		;;
+esac
+
 config_port="$(awk '/^port:[[:space:]]*[0-9]+/ {print $2; exit}' "$config_path" 2>/dev/null || true)"
 active_port="$(cat "$ACTIVE_PORT_FILE" 2>/dev/null || true)"
 active_port="${active_port:-${config_port:-$PORT_A}}"

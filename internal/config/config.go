@@ -33,6 +33,9 @@ type Config struct {
 	// When empty, the process local timezone (time.Local) is used.
 	Timezone string `yaml:"timezone,omitempty" json:"timezone,omitempty"`
 
+	// Postgres config controls the runtime primary database.
+	Postgres PostgresConfig `yaml:"postgres" json:"-"`
+
 	// Redis config controls the Redis connection for usage persistence.
 	Redis RedisConfig `yaml:"redis" json:"redis"`
 
