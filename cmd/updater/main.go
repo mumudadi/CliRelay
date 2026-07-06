@@ -80,7 +80,7 @@ type updateStatusResponse struct {
 	Status          string           `json:"status"`
 	Stage           string           `json:"stage"`
 	Message         string           `json:"message,omitempty"`
-	ProgressPercent int              `json:"progress_percent,omitempty"`
+	ProgressPercent float64          `json:"progress_percent,omitempty"`
 	Migration       *migrationStatus `json:"migration,omitempty"`
 	Service         string           `json:"service,omitempty"`
 	TargetImage     string           `json:"target_image,omitempty"`
@@ -577,15 +577,15 @@ func runComposeUpdate(ctx context.Context, composeFile string, envFile string, p
 		return err
 	}
 	if composeFileHasService(composeFile, "clirelay-migrate") {
-		reporter.Stage("migrating", "starting PostgreSQL/Redis before SQLite migration")
+		reporter.Stage("migrating", "starting PostgreSQL/Redis before data migration check")
 		if err := runDockerCompose(ctx, composeFile, envFile, projectName, reporter, "up", "-d", "postgres", "redis"); err != nil {
 			return err
 		}
-		reporter.Stage("migrating", "migrating legacy SQLite data before restarting service")
+		reporter.Stage("migrating", "checking legacy SQLite migration before service restart")
 		if err := runDockerCompose(ctx, composeFile, envFile, projectName, reporter, "run", "--rm", "clirelay-migrate"); err != nil {
 			return err
 		}
-		reporter.Stage("migrating", "finishing SQLite migration before service restart")
+		reporter.Stage("migrating", "legacy SQLite migration check finished before service restart")
 	}
 	reporter.Stage("restarting", "recreating service container without restarting dependencies")
 	if err := runDockerCompose(ctx, composeFile, envFile, projectName, reporter, "up", "-d", "--no-deps", "--remove-orphans", service); err != nil {
