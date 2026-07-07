@@ -415,6 +415,38 @@ func TestOpenCodeGoKeysKeepPerKeyModels(t *testing.T) {
 	}
 }
 
+func TestPatchClineKeyRepairsConfiguredModelExclusions(t *testing.T) {
+	cfg := &config.Config{
+		ClineKey: []config.ClineKey{{
+			APIKey: "cline-key",
+			Name:   "old",
+			Models: []config.ClineModel{
+				{Name: "cline-pass/qwen3.7-max"},
+				{Name: "cline-pass/kimi-k2.6"},
+			},
+			ExcludedModels: []string{
+				"cline-pass/qwen3.7-max",
+				"cline-pass/kimi-k2.6",
+			},
+		}},
+	}
+	name := "new"
+
+	err := NewService(cfg, nil).PatchClineKey(nil, nil, &name, ClinePatch{Name: &name})
+	if !errors.Is(err, ErrItemNotFound) {
+		t.Fatalf("PatchClineKey unmatched error = %v, want ErrItemNotFound", err)
+	}
+
+	index := 0
+	err = NewService(cfg, nil).PatchClineKey(&index, nil, nil, ClinePatch{Name: &name})
+	if err != nil {
+		t.Fatalf("PatchClineKey() error = %v, want nil", err)
+	}
+	if len(cfg.ClineKey[0].ExcludedModels) != 0 {
+		t.Fatalf("excluded models = %#v, want repaired empty list", cfg.ClineKey[0].ExcludedModels)
+	}
+}
+
 func TestExtendedProviderReplaceRejectsNonEmptyPayloadWithoutAPIKeys(t *testing.T) {
 	t.Run("opencode go", func(t *testing.T) {
 		cfg := &config.Config{OpenCodeGoKey: []config.OpenCodeGoKey{{APIKey: "existing"}}}

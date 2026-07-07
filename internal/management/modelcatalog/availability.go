@@ -369,9 +369,10 @@ func withDefaultMappedOwnerRows(
 		if key == "" {
 			continue
 		}
-		if !mappedOwnerRowHasRuntimeSource(modelRegistry, row) {
-			continue
-		}
+		// DB-backed model catalog rows are management-authoritative. A newly
+		// added owner-mapped model may not have a runtime registry source until a
+		// provider advertises it, but the management UI still needs it in default
+		// availability so system/default model lists and route editors can select it.
 		if _, exists := seen[key]; exists {
 			continue
 		}
@@ -379,13 +380,6 @@ func withDefaultMappedOwnerRows(
 		out = append(out, modelConfigRowAsOpenAIModel(row))
 	}
 	return out
-}
-
-func mappedOwnerRowHasRuntimeSource(modelRegistry *registry.ModelRegistry, row usage.ModelConfigRow) bool {
-	if modelRegistry == nil {
-		return false
-	}
-	return len(modelRegistry.GetModelClientSources(row.ModelID)) > 0
 }
 
 func mappedOwnerRowModelKeys(rows []usage.ModelConfigRow, ownerKeys map[string]bool) map[string]bool {

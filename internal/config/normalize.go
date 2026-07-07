@@ -227,6 +227,7 @@ func (cfg *Config) SanitizeOpenCodeGoKeys() {
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.Models = NormalizeOpenCodeGoModels(entry.Models)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.ExcludedModels = removeConfiguredOpenCodeGoModelExclusions(entry.ExcludedModels, entry.Models)
 		entry.VisionFallbackModel = strings.TrimSpace(entry.VisionFallbackModel)
 		entry.WorkspaceID = strings.TrimSpace(entry.WorkspaceID)
 		entry.AuthCookie = strings.TrimSpace(entry.AuthCookie)
@@ -282,6 +283,7 @@ func (cfg *Config) SanitizeClineKeys() {
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.Models = NormalizeClineModels(entry.Models)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.ExcludedModels = removeConfiguredClineModelExclusions(entry.ExcludedModels, entry.Models)
 		entry.VisionFallbackModel = strings.TrimSpace(entry.VisionFallbackModel)
 		out = append(out, entry)
 	}
@@ -344,6 +346,7 @@ func (cfg *Config) SanitizeOllamaCloudKeys() {
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.Models = NormalizeOllamaCloudModels(entry.Models)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.ExcludedModels = removeConfiguredOllamaCloudModelExclusions(entry.ExcludedModels, entry.Models)
 		entry.VisionFallbackModel = strings.TrimSpace(entry.VisionFallbackModel)
 		out = append(out, entry)
 	}
@@ -368,6 +371,74 @@ func NormalizeOllamaCloudModels(models []OllamaCloudModel) []OllamaCloudModel {
 		}
 		seen[key] = struct{}{}
 		out = append(out, OllamaCloudModel{Name: name, Alias: alias})
+	}
+	return out
+}
+
+func removeConfiguredOpenCodeGoModelExclusions(excluded []string, models []OpenCodeGoModel) []string {
+	names := make([]string, 0, len(models))
+	for _, model := range models {
+		names = append(names, model.Name)
+	}
+	return NormalizeExcludedModelsForConfiguredModels(excluded, names)
+}
+
+func removeConfiguredClineModelExclusions(excluded []string, models []ClineModel) []string {
+	names := make([]string, 0, len(models))
+	for _, model := range models {
+		names = append(names, model.Name)
+	}
+	return NormalizeExcludedModelsForConfiguredModels(excluded, names)
+}
+
+func removeConfiguredOllamaCloudModelExclusions(excluded []string, models []OllamaCloudModel) []string {
+	names := make([]string, 0, len(models))
+	for _, model := range models {
+		names = append(names, model.Name)
+	}
+	return NormalizeExcludedModelsForConfiguredModels(excluded, names)
+}
+
+// NormalizeExcludedModelsForConfiguredModels repairs legacy data where every
+// explicitly configured model is also excluded, leaving the key unusable.
+func NormalizeExcludedModelsForConfiguredModels(excluded []string, modelNames []string) []string {
+	if len(excluded) == 0 || len(modelNames) == 0 {
+		return excluded
+	}
+	configured := make(map[string]struct{}, len(modelNames))
+	for _, name := range modelNames {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key != "" {
+			configured[key] = struct{}{}
+		}
+	}
+	if len(configured) < 2 {
+		return excluded
+	}
+	excludedSet := make(map[string]struct{}, len(excluded))
+	for _, model := range excluded {
+		key := strings.ToLower(strings.TrimSpace(model))
+		if key == "*" {
+			return excluded
+		}
+		if key != "" {
+			excludedSet[key] = struct{}{}
+		}
+	}
+	for model := range configured {
+		if _, exists := excludedSet[model]; !exists {
+			return excluded
+		}
+	}
+	out := excluded[:0]
+	for _, model := range excluded {
+		if _, exists := configured[strings.ToLower(strings.TrimSpace(model))]; exists {
+			continue
+		}
+		out = append(out, model)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

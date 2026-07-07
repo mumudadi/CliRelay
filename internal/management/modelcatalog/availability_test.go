@@ -171,7 +171,7 @@ func TestDefaultMappedOwnerRowsReplaceProviderModelWhenConfigRowExists(t *testin
 	}
 }
 
-func TestDefaultMappedOwnerRowsSkipConfigRowWithoutRuntimeSource(t *testing.T) {
+func TestDefaultMappedOwnerRowsIncludeConfigRowWithoutRuntimeSource(t *testing.T) {
 	const modelID = "gpt-5.6-sol"
 
 	ownerMappings := map[string]string{"codex": "codex"}
@@ -192,8 +192,8 @@ func TestDefaultMappedOwnerRowsSkipConfigRowWithoutRuntimeSource(t *testing.T) {
 		map[string]*coreauth.Auth{},
 		ownerMappings,
 	)
-	if len(got) != 0 {
-		t.Fatalf("models = %#v, want unserviceable mapped-owner config row hidden", got)
+	if len(got) != 1 || got[0]["id"] != modelID {
+		t.Fatalf("models = %#v, want owner-mapped config row kept without runtime source", got)
 	}
 }
 
