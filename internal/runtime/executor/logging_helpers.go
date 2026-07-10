@@ -324,14 +324,14 @@ func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 	defer capture.mu.Unlock()
 	ensureResponseIntro(attempt)
 	if status > 0 && !attempt.statusWritten {
-		attempt.response.WriteString(fmt.Sprintf("Status: %d\n", status))
+		writeAPIExchangeString(attempt.response, fmt.Sprintf("Status: %d\n", status))
 		attempt.statusWritten = true
 	}
 	if !attempt.headersWritten {
-		attempt.response.WriteString("Headers:\n")
+		writeAPIExchangeString(attempt.response, "Headers:\n")
 		writeHeaders(attempt.response, headers)
 		attempt.headersWritten = true
-		attempt.response.WriteString("\n")
+		writeAPIExchangeString(attempt.response, "\n")
 	}
 	capture.cachedResponseSnapshot = nil
 }
@@ -351,9 +351,9 @@ func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 		attempt.bodyStarted = false
 	}
 	if attempt.errorWritten {
-		attempt.response.WriteString("\n")
+		writeAPIExchangeString(attempt.response, "\n")
 	}
-	attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+	writeAPIExchangeString(attempt.response, fmt.Sprintf("Error: %s\n", err.Error()))
 	attempt.errorWritten = true
 	capture.cachedResponseSnapshot = nil
 }
@@ -373,19 +373,19 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	defer capture.mu.Unlock()
 	ensureResponseIntro(attempt)
 	if !attempt.headersWritten {
-		attempt.response.WriteString("Headers:\n")
+		writeAPIExchangeString(attempt.response, "Headers:\n")
 		writeHeaders(attempt.response, nil)
 		attempt.headersWritten = true
-		attempt.response.WriteString("\n")
+		writeAPIExchangeString(attempt.response, "\n")
 	}
 	if !attempt.bodyStarted {
-		attempt.response.WriteString("Body:\n")
+		writeAPIExchangeString(attempt.response, "Body:\n")
 		attempt.bodyStarted = true
 	}
 	if attempt.bodyHasContent {
-		attempt.response.WriteString("\n\n")
+		writeAPIExchangeString(attempt.response, "\n\n")
 	}
-	attempt.response.Write(data)
+	writeAPIExchangeBytes(attempt.response, data)
 	attempt.bodyHasContent = true
 	capture.cachedResponseSnapshot = nil
 }
@@ -458,9 +458,9 @@ func ensureResponseIntro(attempt *upstreamAttempt) {
 	if attempt == nil || attempt.response == nil || attempt.responseIntroWritten {
 		return
 	}
-	attempt.response.WriteString(fmt.Sprintf("=== API RESPONSE %d ===\n", attempt.index))
-	attempt.response.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
-	attempt.response.WriteString("\n")
+	writeAPIExchangeString(attempt.response, fmt.Sprintf("=== API RESPONSE %d ===\n", attempt.index))
+	writeAPIExchangeString(attempt.response, fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
+	writeAPIExchangeString(attempt.response, "\n")
 	attempt.responseIntroWritten = true
 }
 
@@ -498,12 +498,30 @@ func aggregateAPIResponses(attempts []*upstreamAttempt) []byte {
 	return []byte(builder.String())
 }
 
+func writeAPIExchangeString(writer interface{ WriteString(string) (int, error) }, value string) {
+	if writer == nil || value == "" {
+		return
+	}
+	if _, err := writer.WriteString(value); err != nil {
+		log.WithError(err).Warn("failed to capture API exchange text")
+	}
+}
+
+func writeAPIExchangeBytes(writer io.Writer, value []byte) {
+	if writer == nil || len(value) == 0 {
+		return
+	}
+	if _, err := writer.Write(value); err != nil {
+		log.WithError(err).Warn("failed to capture API exchange bytes")
+	}
+}
+
 func writeHeaders(builder interface{ WriteString(string) (int, error) }, headers http.Header) {
 	if builder == nil {
 		return
 	}
 	if len(headers) == 0 {
-		builder.WriteString("<none>\n")
+		writeAPIExchangeString(builder, "<none>\n")
 		return
 	}
 	keys := make([]string, 0, len(headers))
@@ -514,12 +532,12 @@ func writeHeaders(builder interface{ WriteString(string) (int, error) }, headers
 	for _, key := range keys {
 		values := headers[key]
 		if len(values) == 0 {
-			builder.WriteString(fmt.Sprintf("%s:\n", key))
+			writeAPIExchangeString(builder, fmt.Sprintf("%s:\n", key))
 			continue
 		}
 		for _, value := range values {
 			masked := util.MaskSensitiveHeaderValue(key, value)
-			builder.WriteString(fmt.Sprintf("%s: %s\n", key, masked))
+			writeAPIExchangeString(builder, fmt.Sprintf("%s: %s\n", key, masked))
 		}
 	}
 }
