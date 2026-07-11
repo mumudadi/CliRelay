@@ -1833,3 +1833,137 @@ func TestDeleteUsageLogsSupportsSelectiveBodyCleanup(t *testing.T) {
 		t.Fatalf("HasContent = true, want false after selective cleanup")
 	}
 }
+
+func TestGetUsageLogsFiltersByOrphanAuthIndexWithoutLiveMeta(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "usage.db")
+	if err := usage.InitDB(dbPath, config.RequestLogStorageConfig{}, time.UTC); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() {
+		usage.CloseDB()
+		_ = os.Remove(dbPath)
+		_ = os.Remove(dbPath + "-wal")
+		_ = os.Remove(dbPath + "-shm")
+	})
+
+	// Live auth uses the file: seed index (current EnsureIndex behavior).
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	liveAuth, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "xai-asherandersenloqv@outlook.com.json",
+		FileName: "xai-asherandersenloqv@outlook.com.json",
+		Provider: "xai",
+		Label:    "asherandersenloqv@outlook.com",
+		Metadata: map[string]any{
+			"email":     "asherandersenloqv@outlook.com",
+			"auth_kind": "oauth",
+		},
+	})
+	if err != nil {
+		t.Fatalf("register live auth: %v", err)
+	}
+
+	// Historical rows were written under the id: seed index before FileName was
+	// consistently set. That orphan index no longer exists in live auth meta.
+	orphanIndex := "69e8946f1ffc2d23"
+	now := time.Now().UTC()
+	usage.InsertLog(
+		"", "", "grok-4.5", "asherandersenloqv@outlook.com", "asherandersenloqv@outlook.com", orphanIndex,
+		false, now.Add(-time.Minute), 100, 10,
+		usage.TokenStats{InputTokens: 1, OutputTokens: 2, TotalTokens: 3},
+		"", "",
+	)
+	usage.InsertLog(
+		"", "", "grok-4.5", "asherandersenloqv@outlook.com", "asherandersenloqv@outlook.com", liveAuth.Index,
+		false, now, 100, 10,
+		usage.TokenStats{InputTokens: 1, OutputTokens: 2, TotalTokens: 3},
+		"", "",
+	)
+
+	h := &Handler{
+		cfg:         &config.Config{},
+		authManager: manager,
+	}
+
+	// Facet list should expose both live and orphan options for the same email.
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/usage/logs?days=7&page=1&size=50", nil)
+	h.UsageLogs().GetUsageLogs(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list expected status %d, got %d, body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var listPayload struct {
+		Filters struct {
+			ChannelOptions []struct {
+				Value     string `json:"value"`
+				Label     string `json:"label"`
+				Provider  string `json:"provider"`
+				AuthType  string `json:"auth_type"`
+				AuthIndex string `json:"auth_index"`
+			} `json:"channel_options"`
+		} `json:"filters"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listPayload); err != nil {
+		t.Fatalf("unmarshal list response: %v", err)
+	}
+	if len(listPayload.Filters.ChannelOptions) != 2 {
+		t.Fatalf("channel_options = %#v, want 2 options (live + orphan)", listPayload.Filters.ChannelOptions)
+	}
+	var foundOrphan, foundLive bool
+	for _, opt := range listPayload.Filters.ChannelOptions {
+		switch opt.Value {
+		case orphanIndex:
+			foundOrphan = true
+			if opt.Label != "asherandersenloqv@outlook.com" {
+				t.Fatalf("orphan label = %q, want email", opt.Label)
+			}
+			// Orphan has no live meta → no provider / oauth badge.
+			if opt.Provider != "" || opt.AuthType != "" {
+				t.Fatalf("orphan option should have empty provider/auth_type, got %#v", opt)
+			}
+		case liveAuth.Index:
+			foundLive = true
+			if opt.AuthType != "oauth" {
+				t.Fatalf("live option auth_type = %q, want oauth", opt.AuthType)
+			}
+		}
+	}
+	if !foundOrphan || !foundLive {
+		t.Fatalf("channel_options missing live/orphan values: %#v", listPayload.Filters.ChannelOptions)
+	}
+
+	// Selecting the orphan auth_index must return the historical rows, not 0.
+	rec = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/usage/logs?days=7&page=1&size=50&channel="+orphanIndex, nil)
+	h.UsageLogs().GetUsageLogs(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("orphan filter expected status %d, got %d, body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var filtered struct {
+		Items []struct {
+			AuthIndex   string `json:"auth_index"`
+			ChannelName string `json:"channel_name"`
+			Model       string `json:"model"`
+		} `json:"items"`
+		Total int64 `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &filtered); err != nil {
+		t.Fatalf("unmarshal orphan filtered response: %v", err)
+	}
+	if filtered.Total != 1 || len(filtered.Items) != 1 {
+		t.Fatalf("orphan filtered total/items = %d/%d, want 1/1; body=%s", filtered.Total, len(filtered.Items), rec.Body.String())
+	}
+	if filtered.Items[0].AuthIndex != orphanIndex {
+		t.Fatalf("orphan filtered auth_index = %q, want %q", filtered.Items[0].AuthIndex, orphanIndex)
+	}
+	if filtered.Items[0].ChannelName != "asherandersenloqv@outlook.com" {
+		t.Fatalf("orphan filtered channel_name = %q", filtered.Items[0].ChannelName)
+	}
+}

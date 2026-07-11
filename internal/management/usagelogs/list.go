@@ -298,6 +298,14 @@ func channelFilterSelectors(
 		if matchedAuthIndex {
 			continue
 		}
+		// Historical channel_options values are auth_index hashes even when the
+		// auth file was later reindexed (file: vs id: seed) or deleted. Treat
+		// stable auth_index tokens as AuthIndexes; never fall back to
+		// channel_name matching for them (that path yields 0 rows).
+		if looksLikeAuthIndex(raw) {
+			appendAuthIndex(raw)
+			continue
+		}
 		// Legacy clients still send display labels / emails.
 		appendChannelName(raw)
 	}
@@ -327,6 +335,28 @@ func channelFilterSelectors(
 		authIndexes = []string{""}
 	}
 	return authIndexes, channelNames, authIndexChannelNames
+}
+
+// looksLikeAuthIndex reports whether value matches the stable auth index format
+// produced by coreauth.stableAuthIndex (first 8 bytes of SHA-256 as 16 hex chars).
+// Channel facet values use this token so historical rows remain filterable after
+// live auth reindex or deletion.
+func looksLikeAuthIndex(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 16 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func enrichChannelFilterOptions(
