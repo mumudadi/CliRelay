@@ -73,10 +73,10 @@ func ListModelEntriesForTenant(manager *coreauth.Manager, source ModelSource, te
 }
 
 // ListModelEntriesLiveForTenant optionally re-fetches models from the upstream
-// provider for claude/xai/antigravity (live-capable providers), updates the
+// provider for xai/antigravity (live-capable providers), updates the
 // registry when successful, then returns the public model payload.
-// Codex is never live-refreshed: incomplete ChatGPT manifests must not replace
-// the static catalog.
+// Claude and Codex are never live-refreshed: incomplete upstream catalogs must
+// not replace the static channel definitions.
 //
 // When live fetch fails, falls back to the existing registry list so the UI
 // still shows known models.
@@ -128,11 +128,8 @@ func fetchLiveModelsForAuth(ctx context.Context, auth *coreauth.Auth, cfg *confi
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	var sdkModels []*sdkmodelcatalog.ModelInfo
 	switch provider {
-	case "claude":
-		sdkModels = executor.FetchClaudeModels(fetchCtx, auth, cfg)
-	// codex deliberately omitted: live ChatGPT manifest is incomplete and
-	// overwrote the static catalog (only a few models visible). Keep registry
-	// static for codex; refresh falls through to registry below.
+	// claude/codex deliberately omitted: live upstream catalogs can be incomplete
+	// and overwrite the static registry (codex regression #674). Keep static.
 	case "xai":
 		sdkModels = executor.FetchXAIModels(fetchCtx, auth, cfg)
 	case "antigravity":
