@@ -2,16 +2,21 @@ package management
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/identity"
 	postgresstore "github.com/router-for-me/CLIProxyAPI/v6/internal/storage/postgres"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/storage/postgres/compatdriver"
 )
 
 func TestPermissionForManagementRequest(t *testing.T) {
@@ -99,20 +104,45 @@ func TestServiceCredentialCannotAccessTenantGovernance(t *testing.T) {
 // TestLogsDeleteMiddlewareRequiresExplicitPermission drives real sessions
 // through Handler.Middleware(): read-only DELETE is 403 and never reaches the
 // handler; delete-capable DELETE and read-only GET both enter the handler.
+//
+// Uses a disposable database so parallel package tests that TRUNCATE the shared
+// CLIRELAY_POSTGRES_TEST_DSN catalog cannot race this middleware fixture.
 func TestLogsDeleteMiddlewareRequiresExplicitPermission(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("CLIRELAY_POSTGRES_TEST_DSN"))
 	if dsn == "" {
 		t.Skip("CLIRELAY_POSTGRES_TEST_DSN is not set")
 	}
 	ctx := context.Background()
-	db, err := postgresstore.OpenRuntimeDB(ctx, config.PostgresConfig{DSN: dsn, MaxOpenConns: 4, MaxIdleConns: 1})
+
+	adminDB, err := sql.Open("pgxq", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adminDB.Close()
+	if err = adminDB.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dbName := fmt.Sprintf("logs_delete_mw_%d", time.Now().UnixNano())
+	if _, err = adminDB.ExecContext(ctx, "CREATE DATABASE "+dbName); err != nil {
+		t.Fatalf("create disposable db: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = adminDB.ExecContext(context.Background(), `
+			SELECT pg_terminate_backend(pid)
+			  FROM pg_stat_activity
+			 WHERE datname = $1 AND pid <> pg_backend_pid()
+		`, dbName)
+		_, _ = adminDB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+dbName)
+	})
+	testDSN, err := replacePostgresDatabaseForTest(dsn, dbName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := postgresstore.OpenRuntimeDB(ctx, config.PostgresConfig{DSN: testDSN, MaxOpenConns: 4, MaxIdleConns: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	if _, err = db.ExecContext(ctx, `TRUNCATE audit_logs,user_sessions,user_roles,role_permissions,menus,users,roles,permissions,tenants CASCADE`); err != nil {
-		t.Fatal(err)
-	}
 
 	service := identity.NewService(db)
 	if err = service.Bootstrap(ctx, "bootstrap-password-123"); err != nil {
@@ -212,4 +242,30 @@ func TestLogsDeleteMiddlewareRequiresExplicitPermission(t *testing.T) {
 	if code, reached := serve(http.MethodDelete, deleteToken); code != http.StatusOK || !reached {
 		t.Fatalf("delete-capable DELETE: status=%d reached=%v, want 200 and handler executed", code, reached)
 	}
+}
+
+func replacePostgresDatabaseForTest(dsn, dbName string) (string, error) {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", err
+		}
+		u.Path = "/" + dbName
+		return u.String(), nil
+	}
+	parts := strings.Fields(dsn)
+	out := make([]string, 0, len(parts))
+	replaced := false
+	for _, p := range parts {
+		if strings.HasPrefix(p, "dbname=") {
+			out = append(out, "dbname="+dbName)
+			replaced = true
+			continue
+		}
+		out = append(out, p)
+	}
+	if !replaced {
+		out = append(out, "dbname="+dbName)
+	}
+	return strings.Join(out, " "), nil
 }
