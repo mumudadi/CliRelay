@@ -87,7 +87,9 @@ COPY --from=backend-builder --chown=clirelay:clirelay /app/CLIProxyAPI /CLIProxy
 COPY --from=backend-builder --chown=clirelay:clirelay /app/clirelay-updater /CLIProxyAPI/clirelay-updater
 COPY --from=frontend-builder --chown=clirelay:clirelay /frontend/dist/ /CLIProxyAPI/panel/
 
+COPY --chown=clirelay:clirelay config.example.yaml /CLIProxyAPI/config.yaml
 COPY --chown=clirelay:clirelay config.example.yaml /CLIProxyAPI/config.example.yaml
+
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/migrate-sqlite-to-postgres.sh /usr/local/bin/migrate-sqlite-to-postgres.sh
 COPY scripts/init-compose-env.sh /usr/local/bin/clirelay-init-env
