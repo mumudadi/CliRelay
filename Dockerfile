@@ -1,5 +1,6 @@
 # ── Frontend source ──────────────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM alpine:3.22.0 AS frontend-source
+ARG BUILDPLATFORM=linux/amd64
+FROM --platform=${BUILDPLATFORM:-linux/amd64} alpine:3.22.0 AS frontend-source
 
 ARG FRONTEND_REPOSITORY=https://github.com/kittors/codeProxy.git
 ARG FRONTEND_REF=main
@@ -22,7 +23,7 @@ RUN git clone --depth=1 --branch "${FRONTEND_REF}" "${FRONTEND_REPOSITORY}" fron
   fi
 
 # ── Frontend build ───────────────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM oven/bun:1 AS frontend-builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} oven/bun:1 AS frontend-builder
 
 WORKDIR /frontend
 COPY --from=frontend-source /src/frontend/ .
@@ -40,7 +41,7 @@ RUN bun install --frozen-lockfile
 RUN bun run build
 
 # ── Backend build ────────────────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM golang:1.26.1-alpine AS backend-builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.26.1-alpine AS backend-builder
 
 WORKDIR /app
 
