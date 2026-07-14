@@ -93,7 +93,6 @@ build_dsn() {
 wait_for_postgres() {
   i=0
   while [ "$i" -lt 90 ]; do
-    # Prefer socket readiness; fall back to TCP.
     if su-exec postgres pg_isready -p "$PG_PORT" -q 2>/dev/null \
       || su-exec postgres pg_isready -h "$PG_HOST" -p "$PG_PORT" -q 2>/dev/null; then
       return 0
@@ -111,15 +110,20 @@ wait_for_postgres() {
 
 # Bootstrap admin connections MUST use the Unix socket.
 # pg_hba has "local all all trust"; TCP to 127.0.0.1 requires a password
-# and the superuser has none after initdb — that caused:
-#   fe_sendauth: no password supplied
-# and left role cliproxy uncreated.
+# and the superuser has none after initdb.
 psql_superuser() {
   # -h <socket dir> forces local/unix peer path (trust), never TCP.
   su-exec postgres \
     env PGHOST= PGHOSTADDR= PGPASSWORD= \
     psql --no-password -v ON_ERROR_STOP=1 \
       -h "$PG_RUNDIR" -p "$PG_PORT" -U postgres "$@"
+}
+
+# Quote a string as a PostgreSQL string literal ('...' with ' doubled).
+# Do NOT use psql :'var' interpolation here — under su-exec/env it was sent
+# literally to the server as PASSWORD :'pass' (syntax error).
+sql_string_literal() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
 }
 
 init_postgres() {
@@ -172,27 +176,30 @@ EOF
 
 ensure_role_and_db() {
   log "bootstrapping role/db via Unix socket (local trust)"
+  pass_sql="$(sql_string_literal "$PG_PASSWORD")"
 
   role_exists="$(psql_superuser -tAc \
     "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" | tr -d '[:space:]' || true)"
   if [ "$role_exists" = "1" ]; then
     log "updating password for role ${PG_USER}"
-    psql_superuser -v pass="$PG_PASSWORD" \
-      -c "ALTER ROLE \"${PG_USER}\" WITH LOGIN PASSWORD :'pass';"
+    psql_superuser -c "ALTER ROLE \"${PG_USER}\" WITH LOGIN PASSWORD ${pass_sql};" \
+      || die "ALTER ROLE ${PG_USER} failed"
   else
     log "creating role ${PG_USER}"
-    psql_superuser -v pass="$PG_PASSWORD" \
-      -c "CREATE ROLE \"${PG_USER}\" LOGIN PASSWORD :'pass';"
+    psql_superuser -c "CREATE ROLE \"${PG_USER}\" LOGIN PASSWORD ${pass_sql};" \
+      || die "CREATE ROLE ${PG_USER} failed"
   fi
 
   db_exists="$(psql_superuser -tAc \
     "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | tr -d '[:space:]' || true)"
   if [ "$db_exists" != "1" ]; then
     log "creating database ${PG_DB}"
-    psql_superuser -c "CREATE DATABASE \"${PG_DB}\" OWNER \"${PG_USER}\";"
+    psql_superuser -c "CREATE DATABASE \"${PG_DB}\" OWNER \"${PG_USER}\";" \
+      || die "CREATE DATABASE ${PG_DB} failed"
   fi
 
-  psql_superuser -c "GRANT ALL PRIVILEGES ON DATABASE \"${PG_DB}\" TO \"${PG_USER}\";"
+  psql_superuser -c "GRANT ALL PRIVILEGES ON DATABASE \"${PG_DB}\" TO \"${PG_USER}\";" \
+    || die "GRANT on database ${PG_DB} failed"
 
   # On PG 15+ also grant schema privileges on the app database.
   su-exec postgres \
@@ -216,10 +223,8 @@ ensure_role_and_db() {
 start_postgres() {
   init_postgres
   log "starting PostgreSQL on ${PG_HOST}:${PG_PORT}"
-  # Log to a file AND tee to stdout so Cloud Run captures DB boot failures.
   : > "${LOG_DIR}/postgres.log"
   chown postgres:postgres "${LOG_DIR}/postgres.log" 2>/dev/null || true
-  # Stream postgres log to container stdout in background.
   tail -F "${LOG_DIR}/postgres.log" 2>/dev/null &
   TAIL_PID=$!
 
@@ -284,24 +289,20 @@ if [ -e "${APP_DIR}/config.yaml" ]; then
   chown clirelay:clirelay "${APP_DIR}/config.yaml" 2>/dev/null || true
 fi
 
-# Ensure the app process can write runtime dirs.
 chown -R clirelay:clirelay "$AUTH_PATH" "$LOG_DIR" "${DATA_DIR}/pgstore" 2>/dev/null || true
 
 log "starting CLIProxyAPI on 0.0.0.0:${CLIRELAY_PORT} (redis=${CLIRELAY_REDIS_ENABLE})"
 cd "$APP_DIR"
 
-# Run in foreground via wait so signals are handled; app binds using PORT/CLIRELAY_PORT.
 su-exec clirelay:clirelay ./CLIProxyAPI &
 APP_PID=$!
 
-# Fail fast if the binary exits before Cloud Run's probe window.
 i=0
 while [ "$i" -lt 120 ]; do
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     wait "$APP_PID" || true
     die "CLIProxyAPI exited during startup (check postgres DSN / config logs above)"
   fi
-  # Once something accepts TCP on PORT, Cloud Run startup probe can pass.
   if (command -v wget >/dev/null 2>&1 && wget -q -T 1 -O /dev/null "http://127.0.0.1:${PORT}/healthz" 2>/dev/null) \
     || (command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null); then
     log "CLIProxyAPI is accepting connections on port ${PORT}"
