@@ -1,0 +1,64 @@
+# Single-container Cloud Run defaults.
+# Embedded PostgreSQL is started by scripts/cloudrun-entrypoint.sh on 127.0.0.1:5432.
+# Redis is disabled (optional feature; not required for basic operation).
+
+host: ""
+port: 8317
+
+main-api-read-timeout-seconds: 120
+
+request-body:
+  model-max-mb: 128
+  disk-threshold-mb: 8
+  cache-dir: ""
+
+timezone: "Asia/Shanghai"
+
+# Overridden at runtime by CLIRELAY_POSTGRES_DSN from the entrypoint.
+postgres:
+  dsn: "postgres://cliproxy:cliproxy@127.0.0.1:5432/cliproxy?sslmode=disable"
+  max-open-conns: 8
+  max-idle-conns: 2
+
+# Keep Redis off for single-container deploys unless you attach Memorystore.
+redis:
+  enable: false
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+tls:
+  enable: false
+  cert: ""
+  key: ""
+
+cors-allow-origins: []
+trusted-proxies: []
+
+remote-management:
+  # Cloud Run is always remote from the container's point of view.
+  allow-remote: true
+  # Prefer setting CLIRELAY_ADMIN_PASSWORD (or secret-key) via Cloud Run secrets.
+  secret-key: ""
+  disable-control-panel: false
+  panel-github-repository: "https://github.com/kittors/codeProxy"
+
+# No Docker socket / updater sidecar on Cloud Run.
+auto-update:
+  enabled: false
+  channel: main
+  repository: https://github.com/kittors/CliRelay
+  docker-image: ghcr.io/kittors/clirelay
+  updater-url: ""
+
+auth-dir: "/CLIProxyAPI/auths"
+
+api-keys: []
+
+allow-unauthenticated: false
+debug: false
+
+pprof:
+  enable: false
+  addr: "127.0.0.1:8316"
+  allow-remote: false

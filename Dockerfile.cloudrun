@@ -1,0 +1,134 @@
+# All-in-one image for Google Cloud Run: CliRelay + embedded PostgreSQL.
+# Build:  docker build -f Dockerfile.cloudrun -t clirelay-cloudrun .
+# Run:    docker run --rm -p 8080:8080 -e PORT=8080 -e CLIRELAY_ADMIN_PASSWORD=change-me clirelay-cloudrun
+#
+# Notes:
+# - Redis is disabled by default (not required for core runtime).
+# - Container filesystem is ephemeral on Cloud Run unless you attach a volume.
+# - Prefer min-instances=1 and always-on CPU so the embedded DB stays healthy.
+
+# ── Frontend source ──────────────────────────────────────────────────────────
+ARG BUILDPLATFORM=linux/amd64
+FROM --platform=${BUILDPLATFORM:-linux/amd64} alpine:3.22.0 AS frontend-source
+
+ARG FRONTEND_REPOSITORY=https://github.com/kittors/codeProxy.git
+ARG FRONTEND_REF=main
+ARG FRONTEND_COMMIT=
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /src
+
+RUN git clone --depth=1 --branch "${FRONTEND_REF}" "${FRONTEND_REPOSITORY}" frontend \
+  && if [ -n "${FRONTEND_COMMIT}" ]; then \
+    cd frontend \
+    && git fetch --depth=1 origin "${FRONTEND_COMMIT}" \
+    && git checkout --detach "${FRONTEND_COMMIT}"; \
+  fi
+
+# ── Frontend build ───────────────────────────────────────────────────────────
+FROM --platform=${BUILDPLATFORM:-linux/amd64} oven/bun:1 AS frontend-builder
+
+WORKDIR /frontend
+COPY --from=frontend-source /src/frontend/ .
+ARG UI_VERSION=dev
+ARG FRONTEND_REPOSITORY=https://github.com/kittors/codeProxy.git
+ARG FRONTEND_REF=main
+ARG FRONTEND_COMMIT=none
+ARG BUILD_DATE=unknown
+ENV VITE_APP_VERSION=${UI_VERSION}
+ENV VITE_PANEL_REPOSITORY=${FRONTEND_REPOSITORY}
+ENV VITE_PANEL_REF=${FRONTEND_REF}
+ENV VITE_PANEL_COMMIT=${FRONTEND_COMMIT}
+ENV VITE_PANEL_BUILD_DATE=${BUILD_DATE}
+RUN bun install --frozen-lockfile
+RUN bun run build
+
+# ── Backend build ────────────────────────────────────────────────────────────
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.26.1-alpine AS backend-builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+ARG UI_VERSION=dev
+ARG FRONTEND_REF=main
+ARG FRONTEND_COMMIT=none
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+  -ldflags="-s -w \
+    -X 'github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo.Version=${VERSION}' \
+    -X 'github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo.Commit=${COMMIT}' \
+    -X 'github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo.BuildDate=${BUILD_DATE}' \
+    -X 'github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo.FrontendVersion=${UI_VERSION}' \
+    -X 'github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo.FrontendCommit=${FRONTEND_COMMIT}' \
+    -X 'github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo.FrontendRef=${FRONTEND_REF}'" \
+  -o ./CLIProxyAPI ./cmd/server/
+
+# ── Runtime (app + embedded PostgreSQL) ──────────────────────────────────────
+FROM alpine:3.22.0
+
+RUN apk add --no-cache \
+    tzdata \
+    ca-certificates \
+    su-exec \
+    postgresql \
+    postgresql-contrib \
+    libpq
+
+RUN addgroup -S -g 10001 clirelay \
+  && adduser -S -D -H -u 10001 -h /CLIProxyAPI -s /sbin/nologin -G clirelay clirelay \
+  && mkdir -p \
+    /CLIProxyAPI/panel \
+    /CLIProxyAPI/auths \
+    /CLIProxyAPI/logs \
+    /CLIProxyAPI/data/postgres \
+    /CLIProxyAPI/data/pgstore \
+    /run/postgresql \
+  && chown -R clirelay:clirelay /CLIProxyAPI \
+  && chown -R postgres:postgres /CLIProxyAPI/data/postgres /run/postgresql \
+  && chmod 775 /run/postgresql
+
+COPY --from=backend-builder --chown=clirelay:clirelay /app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
+COPY --from=frontend-builder --chown=clirelay:clirelay /frontend/dist/ /CLIProxyAPI/panel/
+
+COPY --chown=clirelay:clirelay config.cloudrun.yaml /CLIProxyAPI/config.yaml
+COPY --chown=clirelay:clirelay config.example.yaml /CLIProxyAPI/config.example.yaml
+COPY scripts/cloudrun-entrypoint.sh /usr/local/bin/cloudrun-entrypoint.sh
+
+WORKDIR /CLIProxyAPI
+
+# Cloud Run sets PORT (commonly 8080). Local default remains 8317 via entrypoint.
+EXPOSE 8080 8317
+
+ENV TZ=Asia/Shanghai \
+    MANAGEMENT_PANEL_DIR=/CLIProxyAPI/panel \
+    AUTH_PATH=/CLIProxyAPI/auths \
+    CLIRELAY_LOCALE=zh \
+    CLIRELAY_REDIS_ENABLE=false \
+    CLIRELAY_ENABLE_PGSTORE=false \
+    CLIRELAY_POSTGRES_USER=cliproxy \
+    CLIRELAY_POSTGRES_PASSWORD=cliproxy \
+    CLIRELAY_POSTGRES_DB=cliproxy \
+    PGDATA=/CLIProxyAPI/data/postgres
+
+RUN chmod +x /usr/local/bin/cloudrun-entrypoint.sh \
+  && cp /usr/share/zoneinfo/${TZ} /etc/localtime \
+  && echo "${TZ}" > /etc/timezone
+
+# Must run as root so the entrypoint can start PostgreSQL then drop to clirelay.
+USER root
+
+ENTRYPOINT ["/usr/local/bin/cloudrun-entrypoint.sh"]
+
+# Longer start-period: first boot runs initdb.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
+  CMD wget -q -T 3 -O /dev/null "http://127.0.0.1:${PORT:-8317}/healthz" || exit 1

@@ -246,6 +246,20 @@ docker compose restart cli-proxy-api
 
 如果你使用 Docker Compose 部署，也可以在环境变量中设置 `CLIRELAY_LOCALE=en` 或 `CLIRELAY_LOCALE=zh`，控制 TUI 的默认语言。
 
+### ☁️ Google Cloud Run 单容器部署
+
+若需要**一个容器就能部署**（例如 Cloud Run），请使用 `Dockerfile.cloudrun`：镜像内嵌 PostgreSQL，默认关闭 Redis。当前运行时**不能**改回 SQLite（SQLite 仅用于历史导入）。
+
+```bash
+docker build -f Dockerfile.cloudrun -t clirelay-cloudrun .
+docker run --rm -p 8080:8080 \
+  -e PORT=8080 \
+  -e CLIRELAY_ADMIN_PASSWORD='change-me-now' \
+  clirelay-cloudrun
+```
+
+完整说明、Cloud Run 参数与限制见 [`docs/cloudrun.md`](docs/cloudrun.md)。
+
 如果云平台只允许一个挂载目录，可以把 `AUTH_PATH` 设置为容器内的认证目录，例如 `/CLIProxyAPI/auths`。`CLI_PROXY_AUTH_PATH` 仍表示宿主机侧绑定路径，`AUTH_PATH` 会同时作为容器内挂载目标，并在运行时覆盖 `auth-dir`。
 
 如果不希望自动提示更新，可以在 `config.yaml` 中关闭，或在配置页关闭 **自动检查更新**：
@@ -381,6 +395,7 @@ CliRelay/
 | [SDK 认证](docs/sdk-access.md) | SDK 认证上下文 |
 | [SDK Watcher](docs/sdk-watcher.md) | 凭据加载与热重载 |
 | [PostgreSQL / Redis 迁移](docs/postgres-redis-migration.md) | 运行时数据栈配置、SQLite dry-run 清单与验证命令 |
+| [Cloud Run 单容器部署](docs/cloudrun.md) | 内嵌 PostgreSQL 的 all-in-one 镜像与部署参数 |
 
 ## 🤝 贡献
 
