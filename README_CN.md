@@ -248,17 +248,18 @@ docker compose restart cli-proxy-api
 
 ### ☁️ Google Cloud Run 单容器部署
 
-若需要**一个容器就能部署**（例如 Cloud Run），请使用 `Dockerfile.cloudrun`：镜像内嵌 PostgreSQL，默认关闭 Redis。当前运行时**不能**改回 SQLite（SQLite 仅用于历史导入）。
+若需要**一个容器就能部署**（例如 Cloud Run），使用仓库根目录 `Dockerfile` 即可：在 Cloud Run 上会因 `K_SERVICE` **自动启用内嵌 PostgreSQL**（也可设 `CLIRELAY_EMBEDDED_POSTGRES=true`）。Compose 多服务部署不受影响。当前运行时**不能**改回 SQLite。
 
 ```bash
-docker build -f Dockerfile.cloudrun -t clirelay-cloudrun .
+docker build -t clirelay-cloudrun .
 docker run --rm -p 8080:8080 \
   -e PORT=8080 \
+  -e K_SERVICE=local-test \
   -e CLIRELAY_ADMIN_PASSWORD='change-me-now' \
   clirelay-cloudrun
 ```
 
-完整说明、Cloud Run 参数与限制见 [`docs/cloudrun.md`](docs/cloudrun.md)。
+若出现 `failed to start and listen on the port ... PORT=8317`，多半是旧镜像未内嵌数据库或启动超时，见 [`docs/cloudrun.md`](docs/cloudrun.md) 故障排查。
 
 如果云平台只允许一个挂载目录，可以把 `AUTH_PATH` 设置为容器内的认证目录，例如 `/CLIProxyAPI/auths`。`CLI_PROXY_AUTH_PATH` 仍表示宿主机侧绑定路径，`AUTH_PATH` 会同时作为容器内挂载目标，并在运行时覆盖 `auth-dir`。
 

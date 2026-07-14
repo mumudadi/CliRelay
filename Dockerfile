@@ -74,14 +74,34 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
   -o ./clirelay-updater ./cmd/updater/
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
+# Includes PostgreSQL so Google Cloud Run / single-container deploys work without
+# a sibling database service. Docker Compose still uses external postgres/redis;
+# embedded mode activates only when K_SERVICE (Cloud Run) is set or
+# CLIRELAY_EMBEDDED_POSTGRES=true.
 FROM alpine:3.22.0
 
-RUN apk add --no-cache tzdata ca-certificates docker-cli docker-cli-compose su-exec
+RUN apk add --no-cache \
+    tzdata \
+    ca-certificates \
+    docker-cli \
+    docker-cli-compose \
+    su-exec \
+    postgresql \
+    postgresql-contrib \
+    libpq
 
 RUN addgroup -S -g 10001 clirelay \
   && adduser -S -D -H -u 10001 -h /CLIProxyAPI -s /sbin/nologin -G clirelay clirelay \
-  && mkdir -p /CLIProxyAPI/panel /CLIProxyAPI/auths /CLIProxyAPI/logs /CLIProxyAPI/data \
-  && chown -R clirelay:clirelay /CLIProxyAPI
+  && mkdir -p \
+    /CLIProxyAPI/panel \
+    /CLIProxyAPI/auths \
+    /CLIProxyAPI/logs \
+    /CLIProxyAPI/data/postgres \
+    /CLIProxyAPI/data/pgstore \
+    /run/postgresql \
+  && chown -R clirelay:clirelay /CLIProxyAPI \
+  && chown -R postgres:postgres /CLIProxyAPI/data/postgres /run/postgresql \
+  && chmod 775 /run/postgresql
 
 COPY --from=backend-builder --chown=clirelay:clirelay /app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 COPY --from=backend-builder --chown=clirelay:clirelay /app/clirelay-updater /CLIProxyAPI/clirelay-updater
@@ -89,23 +109,33 @@ COPY --from=frontend-builder --chown=clirelay:clirelay /frontend/dist/ /CLIProxy
 
 COPY --chown=clirelay:clirelay config.example.yaml /CLIProxyAPI/config.yaml
 COPY --chown=clirelay:clirelay config.example.yaml /CLIProxyAPI/config.example.yaml
-COPY ./config.example.yaml /CLIProxyAPI/config.yaml
-COPY ./config.example.yaml /CLIProxyAPI/config.example.yaml
+COPY --chown=clirelay:clirelay config.cloudrun.yaml /CLIProxyAPI/config.cloudrun.yaml
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY scripts/cloudrun-entrypoint.sh /usr/local/bin/cloudrun-entrypoint.sh
 COPY scripts/migrate-sqlite-to-postgres.sh /usr/local/bin/migrate-sqlite-to-postgres.sh
 COPY scripts/init-compose-env.sh /usr/local/bin/clirelay-init-env
 
 WORKDIR /CLIProxyAPI
 
-EXPOSE 8317
+EXPOSE 8080 8317
 
 ENV TZ=Asia/Shanghai \
     MANAGEMENT_PANEL_DIR=/CLIProxyAPI/panel \
     AUTH_PATH=/CLIProxyAPI/auths \
-    CLIRELAY_LOCALE=zh
+    CLIRELAY_LOCALE=zh \
+    CLIRELAY_REDIS_ENABLE=false \
+    CLIRELAY_ENABLE_PGSTORE=false \
+    CLIRELAY_POSTGRES_USER=cliproxy \
+    CLIRELAY_POSTGRES_PASSWORD=cliproxy \
+    CLIRELAY_POSTGRES_DB=cliproxy \
+    PGDATA=/CLIProxyAPI/data/postgres
 
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/migrate-sqlite-to-postgres.sh /usr/local/bin/clirelay-init-env \
+RUN chmod +x \
+      /usr/local/bin/docker-entrypoint.sh \
+      /usr/local/bin/cloudrun-entrypoint.sh \
+      /usr/local/bin/migrate-sqlite-to-postgres.sh \
+      /usr/local/bin/clirelay-init-env \
   && cp /usr/share/zoneinfo/${TZ} /etc/localtime \
   && echo "${TZ}" > /etc/timezone
 
@@ -113,7 +143,8 @@ USER root
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget -q -T 2 -O /dev/null http://127.0.0.1:8317/healthz
+# Cloud Run ignores Docker HEALTHCHECK; kept for local/compose convenience.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
+  CMD wget -q -T 3 -O /dev/null "http://127.0.0.1:${PORT:-8317}/healthz" || exit 1
 
 CMD ["./CLIProxyAPI"]
