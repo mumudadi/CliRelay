@@ -93,7 +93,9 @@ build_dsn() {
 wait_for_postgres() {
   i=0
   while [ "$i" -lt 90 ]; do
-    if su-exec postgres pg_isready -h "$PG_HOST" -p "$PG_PORT" -q 2>/dev/null; then
+    # Prefer socket readiness; fall back to TCP.
+    if su-exec postgres pg_isready -p "$PG_PORT" -q 2>/dev/null \
+      || su-exec postgres pg_isready -h "$PG_HOST" -p "$PG_PORT" -q 2>/dev/null; then
       return 0
     fi
     i=$((i + 1))
@@ -105,6 +107,19 @@ wait_for_postgres() {
     tail -n 100 "${LOG_DIR}/postgres.log" || true
   fi
   return 1
+}
+
+# Bootstrap admin connections MUST use the Unix socket.
+# pg_hba has "local all all trust"; TCP to 127.0.0.1 requires a password
+# and the superuser has none after initdb — that caused:
+#   fe_sendauth: no password supplied
+# and left role cliproxy uncreated.
+psql_superuser() {
+  # -h <socket dir> forces local/unix peer path (trust), never TCP.
+  su-exec postgres \
+    env PGHOST= PGHOSTADDR= PGPASSWORD= \
+    psql --no-password -v ON_ERROR_STOP=1 \
+      -h "$PG_RUNDIR" -p "$PG_PORT" -U postgres "$@"
 }
 
 init_postgres() {
@@ -156,27 +171,46 @@ EOF
 }
 
 ensure_role_and_db() {
-  role_exists="$(su-exec postgres psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -tAc \
-    "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" 2>/dev/null | tr -d '[:space:]' || true)"
+  log "bootstrapping role/db via Unix socket (local trust)"
+
+  role_exists="$(psql_superuser -tAc \
+    "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" | tr -d '[:space:]' || true)"
   if [ "$role_exists" = "1" ]; then
-    su-exec postgres psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -v ON_ERROR_STOP=1 \
-      -v pass="$PG_PASSWORD" \
+    log "updating password for role ${PG_USER}"
+    psql_superuser -v pass="$PG_PASSWORD" \
       -c "ALTER ROLE \"${PG_USER}\" WITH LOGIN PASSWORD :'pass';"
   else
-    su-exec postgres psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -v ON_ERROR_STOP=1 \
-      -v pass="$PG_PASSWORD" \
+    log "creating role ${PG_USER}"
+    psql_superuser -v pass="$PG_PASSWORD" \
       -c "CREATE ROLE \"${PG_USER}\" LOGIN PASSWORD :'pass';"
   fi
 
-  db_exists="$(su-exec postgres psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -tAc \
-    "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" 2>/dev/null | tr -d '[:space:]' || true)"
+  db_exists="$(psql_superuser -tAc \
+    "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | tr -d '[:space:]' || true)"
   if [ "$db_exists" != "1" ]; then
-    su-exec postgres psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -v ON_ERROR_STOP=1 \
-      -c "CREATE DATABASE \"${PG_DB}\" OWNER \"${PG_USER}\";"
+    log "creating database ${PG_DB}"
+    psql_superuser -c "CREATE DATABASE \"${PG_DB}\" OWNER \"${PG_USER}\";"
   fi
 
-  su-exec postgres psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -v ON_ERROR_STOP=1 \
-    -c "GRANT ALL PRIVILEGES ON DATABASE \"${PG_DB}\" TO \"${PG_USER}\";"
+  psql_superuser -c "GRANT ALL PRIVILEGES ON DATABASE \"${PG_DB}\" TO \"${PG_USER}\";"
+
+  # On PG 15+ also grant schema privileges on the app database.
+  su-exec postgres \
+    env PGHOST= PGHOSTADDR= PGPASSWORD= \
+    psql --no-password -v ON_ERROR_STOP=1 \
+      -h "$PG_RUNDIR" -p "$PG_PORT" -U postgres -d "$PG_DB" \
+      -c "GRANT ALL ON SCHEMA public TO \"${PG_USER}\";" \
+      -c "ALTER SCHEMA public OWNER TO \"${PG_USER}\";" \
+    >/dev/null 2>&1 || true
+
+  # Verify the app DSN path (TCP + password) before starting CLIProxyAPI.
+  log "verifying TCP auth for ${PG_USER}@${PG_HOST}:${PG_PORT}/${PG_DB}"
+  if ! env PGPASSWORD="$PG_PASSWORD" \
+    psql --no-password -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
+    -v ON_ERROR_STOP=1 -tAc "SELECT 1" >/dev/null; then
+    die "TCP login failed for role ${PG_USER}; embedded bootstrap incomplete"
+  fi
+  log "role/db bootstrap ok"
 }
 
 start_postgres() {
@@ -203,7 +237,7 @@ start_postgres() {
     kill "$TAIL_PID" 2>/dev/null || true
     return 1
   }
-  ensure_role_and_db
+  ensure_role_and_db || die "failed to bootstrap embedded PostgreSQL role/database"
   log "PostgreSQL is ready"
 }
 
