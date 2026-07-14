@@ -37,13 +37,82 @@ fi
 # ApplyEnvOverrides reads CLIRELAY_PORT first, then PORT.
 export CLIRELAY_PORT="${PORT}"
 
-# One secret can unlock both identity bootstrap and management API.
-if [ -n "${CLIRELAY_ADMIN_PASSWORD:-}" ] && [ -z "${MANAGEMENT_PASSWORD:-}" ]; then
-  export MANAGEMENT_PASSWORD="${CLIRELAY_ADMIN_PASSWORD}"
-fi
-if [ -n "${MANAGEMENT_PASSWORD:-}" ] && [ -z "${CLIRELAY_ADMIN_PASSWORD:-}" ]; then
-  export CLIRELAY_ADMIN_PASSWORD="${MANAGEMENT_PASSWORD}"
-fi
+# Identity bootstrap requires password length >= 12 (see internal/identity/service.go).
+# MANAGEMENT_PASSWORD and CLIRELAY_ADMIN_PASSWORD share the same value when only one is set.
+ADMIN_PASSWORD_FILE="${CLIRELAY_ADMIN_PASSWORD_FILE:-${DATA_DIR}/.admin-password}"
+ADMIN_PASSWORD_SOURCE="unset"
+
+generate_admin_password() {
+  # 24 chars from /dev/urandom (hex) — always satisfies the 12-char rule.
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 12
+    return 0
+  fi
+  tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 24
+}
+
+# Print credentials to BOTH stdout and stderr so Cloud Run / Cloud Logging always
+# captures them (filter: CLIRELAY_BOOT_CREDENTIALS or CLIRELAY_ADMIN_PASSWORD=).
+print_admin_credentials() {
+  reason="${1:-ready}"
+  # One-line machine-friendly markers (easy to search in Logs Explorer).
+  msg_line="CLIRELAY_BOOT_CREDENTIALS username=admin password=${CLIRELAY_ADMIN_PASSWORD} source=${ADMIN_PASSWORD_SOURCE} reason=${reason}"
+  echo "$msg_line"
+  echo "$msg_line" >&2
+  # Human-readable block (also duplicated to stderr).
+  {
+    echo "############################################################"
+    echo "# CliRelay admin login (print to Cloud Run logs on purpose)"
+    echo "# Open: Cloud Run -> your service -> LOGS (not Cloud Build)"
+    echo "# Search: CLIRELAY_BOOT_CREDENTIALS"
+    echo "# username: admin"
+    echo "# password: ${CLIRELAY_ADMIN_PASSWORD}"
+    echo "# source:   ${ADMIN_PASSWORD_SOURCE}"
+    echo "# (override with env CLIRELAY_ADMIN_PASSWORD, min 12 chars)"
+    echo "############################################################"
+  } | tee /dev/stderr
+}
+
+ensure_admin_password() {
+  mkdir -p "$DATA_DIR"
+
+  if [ -n "${CLIRELAY_ADMIN_PASSWORD:-}" ] || [ -n "${MANAGEMENT_PASSWORD:-}" ]; then
+    ADMIN_PASSWORD_SOURCE="environment"
+  elif [ -f "$ADMIN_PASSWORD_FILE" ] && [ -s "$ADMIN_PASSWORD_FILE" ]; then
+    CLIRELAY_ADMIN_PASSWORD="$(tr -d '\r\n' <"$ADMIN_PASSWORD_FILE")"
+    ADMIN_PASSWORD_SOURCE="file:${ADMIN_PASSWORD_FILE}"
+    log "loaded admin password from ${ADMIN_PASSWORD_FILE}"
+  else
+    CLIRELAY_ADMIN_PASSWORD="$(generate_admin_password)"
+    if [ "${#CLIRELAY_ADMIN_PASSWORD}" -lt 12 ]; then
+      die "failed to generate admin password (got ${#CLIRELAY_ADMIN_PASSWORD} chars)"
+    fi
+    umask 077
+    printf '%s\n' "$CLIRELAY_ADMIN_PASSWORD" >"$ADMIN_PASSWORD_FILE"
+    chmod 600 "$ADMIN_PASSWORD_FILE" 2>/dev/null || true
+    ADMIN_PASSWORD_SOURCE="auto-generated"
+  fi
+
+  if [ -n "${CLIRELAY_ADMIN_PASSWORD:-}" ] && [ -z "${MANAGEMENT_PASSWORD:-}" ]; then
+    MANAGEMENT_PASSWORD="${CLIRELAY_ADMIN_PASSWORD}"
+  fi
+  if [ -n "${MANAGEMENT_PASSWORD:-}" ] && [ -z "${CLIRELAY_ADMIN_PASSWORD:-}" ]; then
+    CLIRELAY_ADMIN_PASSWORD="${MANAGEMENT_PASSWORD}"
+  fi
+
+  export CLIRELAY_ADMIN_PASSWORD
+  export MANAGEMENT_PASSWORD
+
+  pw_len="${#CLIRELAY_ADMIN_PASSWORD}"
+  if [ "$pw_len" -lt 12 ]; then
+    die "admin password must be at least 12 characters (got ${pw_len}). Set CLIRELAY_ADMIN_PASSWORD or MANAGEMENT_PASSWORD."
+  fi
+
+  # Always print password to console/logs so operators can find it without env UI.
+  print_admin_credentials "boot"
+}
+
+ensure_admin_password
 
 # On Cloud Run, prefer the cloud-friendly config template once (first boot only).
 if [ -n "${K_SERVICE:-}" ] && [ -f "${APP_DIR}/config.cloudrun.yaml" ]; then
@@ -292,6 +361,8 @@ fi
 chown -R clirelay:clirelay "$AUTH_PATH" "$LOG_DIR" "${DATA_DIR}/pgstore" 2>/dev/null || true
 
 log "starting CLIProxyAPI on 0.0.0.0:${CLIRELAY_PORT} (redis=${CLIRELAY_REDIS_ENABLE})"
+# Print again immediately before the app starts (easy to spot above app logs).
+print_admin_credentials "before-app-start"
 cd "$APP_DIR"
 
 su-exec clirelay:clirelay ./CLIProxyAPI &
@@ -306,6 +377,7 @@ while [ "$i" -lt 120 ]; do
   if (command -v wget >/dev/null 2>&1 && wget -q -T 1 -O /dev/null "http://127.0.0.1:${PORT}/healthz" 2>/dev/null) \
     || (command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null); then
     log "CLIProxyAPI is accepting connections on port ${PORT}"
+    print_admin_credentials "ready"
     break
   fi
   i=$((i + 1))
