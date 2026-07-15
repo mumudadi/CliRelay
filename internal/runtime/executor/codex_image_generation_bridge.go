@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -25,7 +26,32 @@ const (
 var (
 	imageGenToolJSON      = []byte(`{"type":"image_generation","output_format":"png"}`)
 	imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
+
+	// Codex Desktop / ChatGPT-style sandbox image refs written into assistant markdown.
+	// Only rewrite these when the same response already produced a hosted image_generation_call.
+	codexMntDataMarkdownRef = regexp.MustCompile(`!\[([^\]]*)\]\((?:sandbox:)?(/mnt/data/(\d+)\.([A-Za-z0-9]+))\)`)
+	codexMntDataBareRef     = regexp.MustCompile(`(?:sandbox:)?/mnt/data/(\d+)\.([A-Za-z0-9]+)`)
 )
+
+// codexHostedImage is one completed hosted image_generation_call payload for Desktop rewrite.
+type codexHostedImage struct {
+	Result string
+	MIME   string
+}
+
+// codexImageStreamNormalizer rewrites Desktop-visible assistant markdown after hosted image gen.
+//
+// Codex Desktop keeps the model text message (often `![x](/mnt/data/0.png)`) and drops the
+// synthetic data-url message we inject beside image_generation_call. When this response
+// already has image result(s), replace sandbox /mnt/data refs with data URLs in the
+// assistant text events Desktop actually persists.
+type codexImageStreamNormalizer struct {
+	images []codexHostedImage
+}
+
+func newCodexImageStreamNormalizer() *codexImageStreamNormalizer {
+	return &codexImageStreamNormalizer{}
+}
 
 // maybeEnsureCodexImageGenerationTool prepares outbound /responses tools for image gen.
 //
@@ -329,17 +355,250 @@ func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
 
 // normalizeCodexImageGenerationOutboundEvent normalizes hosted image events for clients:
 //  1. force status=completed when result is present
-//  2. synthesize an assistant markdown image message so Desktop can render without saved_path
+//  2. cache image results and rewrite Desktop assistant markdown /mnt/data refs to data URLs
+//  3. synthesize a fallback data-url message (Desktop may drop it; rewrite is the primary path)
+//
+// n may be nil; then only status + synthetic display message run (stateless).
 func normalizeCodexImageGenerationOutboundEvent(payload []byte) [][]byte {
+	return normalizeCodexImageGenerationOutboundEventWithState(nil, payload)
+}
+
+func normalizeCodexImageGenerationOutboundEventWithState(n *codexImageStreamNormalizer, payload []byte) [][]byte {
 	if len(payload) == 0 {
 		return nil
 	}
 	normalized := normalizeCodexImageGenerationCallStatus(payload)
+	if n != nil {
+		n.observe(normalized)
+		normalized = n.rewriteAssistantMarkdown(normalized)
+	}
 	out := [][]byte{normalized}
 	if msg := synthesizeCodexImageDisplayMessageEvent(normalized); len(msg) > 0 {
 		out = append(out, msg)
 	}
 	return out
+}
+
+func (n *codexImageStreamNormalizer) observe(payload []byte) {
+	if n == nil || len(payload) == 0 {
+		return
+	}
+	body := sseJSONBody(payload)
+	if !gjson.ValidBytes(body) {
+		return
+	}
+	switch gjson.GetBytes(body, "type").String() {
+	case "response.output_item.done", "response.output_item.added":
+		n.rememberImageItem(gjson.GetBytes(body, "item"))
+	case "response.completed", "response.done":
+		output := gjson.GetBytes(body, "response.output")
+		if !output.IsArray() {
+			return
+		}
+		for _, item := range output.Array() {
+			n.rememberImageItem(item)
+		}
+	}
+}
+
+func (n *codexImageStreamNormalizer) rememberImageItem(item gjson.Result) {
+	if !item.Exists() || !item.IsObject() {
+		return
+	}
+	if strings.TrimSpace(item.Get("type").String()) != "image_generation_call" {
+		return
+	}
+	result := strings.TrimSpace(item.Get("result").String())
+	if result == "" {
+		return
+	}
+	// Avoid duplicate cache if both added/done carry the same result.
+	for _, existing := range n.images {
+		if existing.Result == result {
+			return
+		}
+	}
+	n.images = append(n.images, codexHostedImage{
+		Result: result,
+		MIME:   codexImageMIMEFromFormat(item.Get("output_format").String()),
+	})
+}
+
+func (n *codexImageStreamNormalizer) rewriteAssistantMarkdown(payload []byte) []byte {
+	if n == nil || len(n.images) == 0 || len(payload) == 0 {
+		return payload
+	}
+	hadSSEPrefix := bytes.HasPrefix(payload, dataTag)
+	body := sseJSONBody(payload)
+	if !gjson.ValidBytes(body) {
+		return payload
+	}
+
+	eventType := gjson.GetBytes(body, "type").String()
+	updated := body
+	changed := false
+
+	switch eventType {
+	case "response.output_text.done":
+		text := gjson.GetBytes(body, "text").String()
+		if next, ok := rewriteCodexMntDataImageMarkdown(text, n.images); ok {
+			var err error
+			updated, err = sjson.SetBytes(updated, "text", next)
+			if err != nil {
+				return payload
+			}
+			changed = true
+		}
+	case "response.content_part.done":
+		partType := strings.TrimSpace(gjson.GetBytes(body, "part.type").String())
+		if partType == "output_text" || partType == "text" {
+			text := gjson.GetBytes(body, "part.text").String()
+			if next, ok := rewriteCodexMntDataImageMarkdown(text, n.images); ok {
+				var err error
+				updated, err = sjson.SetBytes(updated, "part.text", next)
+				if err != nil {
+					return payload
+				}
+				changed = true
+			}
+		}
+	case "response.output_item.done", "response.output_item.added":
+		item := gjson.GetBytes(body, "item")
+		if strings.TrimSpace(item.Get("type").String()) != "message" {
+			return payload
+		}
+		content := item.Get("content")
+		if !content.IsArray() {
+			return payload
+		}
+		for i, part := range content.Array() {
+			partType := strings.TrimSpace(part.Get("type").String())
+			if partType != "output_text" && partType != "text" {
+				continue
+			}
+			text := part.Get("text").String()
+			next, ok := rewriteCodexMntDataImageMarkdown(text, n.images)
+			if !ok {
+				continue
+			}
+			path := "item.content." + strconv.Itoa(i) + ".text"
+			var err error
+			updated, err = sjson.SetBytes(updated, path, next)
+			if err != nil {
+				return payload
+			}
+			changed = true
+		}
+	case "response.completed", "response.done":
+		output := gjson.GetBytes(body, "response.output")
+		if !output.IsArray() {
+			return payload
+		}
+		for i, item := range output.Array() {
+			if strings.TrimSpace(item.Get("type").String()) != "message" {
+				continue
+			}
+			content := item.Get("content")
+			if !content.IsArray() {
+				continue
+			}
+			for j, part := range content.Array() {
+				partType := strings.TrimSpace(part.Get("type").String())
+				if partType != "output_text" && partType != "text" {
+					continue
+				}
+				text := part.Get("text").String()
+				next, ok := rewriteCodexMntDataImageMarkdown(text, n.images)
+				if !ok {
+					continue
+				}
+				path := "response.output." + strconv.Itoa(i) + ".content." + strconv.Itoa(j) + ".text"
+				var err error
+				updated, err = sjson.SetBytes(updated, path, next)
+				if err != nil {
+					return payload
+				}
+				changed = true
+			}
+		}
+	default:
+		return payload
+	}
+	if !changed {
+		return payload
+	}
+	return maybeWrapSSEData(hadSSEPrefix, updated)
+}
+
+func rewriteCodexMntDataImageMarkdown(text string, images []codexHostedImage) (string, bool) {
+	if text == "" || len(images) == 0 || !strings.Contains(text, "/mnt/data/") {
+		return text, false
+	}
+	// Prefer markdown image refs so alt text is preserved.
+	out := codexMntDataMarkdownRef.ReplaceAllStringFunc(text, func(match string) string {
+		sub := codexMntDataMarkdownRef.FindStringSubmatch(match)
+		if len(sub) != 5 {
+			return match
+		}
+		img, ok := codexHostedImageByIndex(images, sub[3])
+		if !ok {
+			return match
+		}
+		return fmt.Sprintf("![%s](data:%s;base64,%s)", sub[1], img.MIME, img.Result)
+	})
+	// Bare /mnt/data/N.ext left outside markdown (rare).
+	if strings.Contains(out, "/mnt/data/") {
+		out = codexMntDataBareRef.ReplaceAllStringFunc(out, func(match string) string {
+			sub := codexMntDataBareRef.FindStringSubmatch(match)
+			if len(sub) != 3 {
+				return match
+			}
+			img, ok := codexHostedImageByIndex(images, sub[1])
+			if !ok {
+				return match
+			}
+			return fmt.Sprintf("data:%s;base64,%s", img.MIME, img.Result)
+		})
+	}
+	if out == text {
+		return text, false
+	}
+	return out, true
+}
+
+func codexHostedImageByIndex(images []codexHostedImage, idxStr string) (codexHostedImage, bool) {
+	if len(images) == 0 {
+		return codexHostedImage{}, false
+	}
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil || idx < 0 {
+		return codexHostedImage{}, false
+	}
+	if idx >= len(images) {
+		// Single-image turns often only emit 0.png; clamp overshoot to last result.
+		idx = len(images) - 1
+	}
+	return images[idx], true
+}
+
+func codexImageMIMEFromFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "jpeg", "jpg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	case "gif":
+		return "image/gif"
+	default:
+		return "image/png"
+	}
+}
+
+func sseJSONBody(payload []byte) []byte {
+	if bytes.HasPrefix(payload, dataTag) {
+		return bytes.TrimSpace(payload[len(dataTag):])
+	}
+	return payload
 }
 
 // normalizeCodexImageGenerationCallStatus upgrades image_generation_call items that already
@@ -423,17 +682,9 @@ func synthesizeCodexImageDisplayMessageEvent(payload []byte) []byte {
 	if status != "" && status != "completed" && status != "generating" && status != "in_progress" && status != "incomplete" {
 		return nil
 	}
-	format := strings.ToLower(strings.TrimSpace(item.Get("output_format").String()))
-	mime := "image/png"
-	switch format {
-	case "jpeg", "jpg":
-		mime = "image/jpeg"
-	case "webp":
-		mime = "image/webp"
-	case "gif":
-		mime = "image/gif"
-	}
+	mime := codexImageMIMEFromFormat(item.Get("output_format").String())
 	// Markdown image so Desktop/agent markdown renderers can show the asset inline.
+	// Fallback only: Desktop often drops this synthetic item; stream rewrite is primary.
 	text := fmt.Sprintf("![generated image](data:%s;base64,%s)", mime, result)
 	msgID := strings.TrimSpace(item.Get("id").String())
 	if msgID == "" {

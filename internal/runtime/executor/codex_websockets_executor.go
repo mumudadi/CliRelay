@@ -453,6 +453,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 
 		var param any
+		imageStream := newCodexImageStreamNormalizer()
 		for {
 			if execCtx.Context != nil && execCtx.Context.Err() != nil {
 				terminateReason = "context_done"
@@ -510,7 +511,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			payload = normalizeCodexWebsocketCompletion(payload)
-			normalizedEvents := normalizeCodexImageGenerationOutboundEvent(payload)
+			normalizedEvents := normalizeCodexImageGenerationOutboundEventWithState(imageStream, payload)
 			if len(normalizedEvents) == 0 {
 				normalizedEvents = [][]byte{payload}
 			}

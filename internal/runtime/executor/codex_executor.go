@@ -221,7 +221,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			continue
 		}
 		line = mergeCodexResponsesCompletedOutput(line, pendingOutputItems, pendingOutputKeys)
+		// Non-stream: still rewrite /mnt/data markdown when hosted image results exist.
+		imageStream := newCodexImageStreamNormalizer()
+		for _, item := range pendingOutputItems {
+			imageStream.observe(item)
+		}
+		imageStream.observe(line)
 		line = normalizeCodexImageGenerationCallStatus(line)
+		line = imageStream.rewriteAssistantMarkdown(line)
 
 		if detail, ok := parseCodexUsage(line); ok {
 			reporter.publishWithContent(execCtx.Context, detail, string(req.Payload), string(data))
@@ -398,9 +405,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		completed := false
+		imageStream := newCodexImageStreamNormalizer()
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			normalizedEvents := normalizeCodexImageGenerationOutboundEvent(bytes.Clone(line))
+			normalizedEvents := normalizeCodexImageGenerationOutboundEventWithState(imageStream, bytes.Clone(line))
 			if len(normalizedEvents) == 0 {
 				normalizedEvents = [][]byte{bytes.Clone(line)}
 			}
