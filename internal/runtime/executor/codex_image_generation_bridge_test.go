@@ -162,6 +162,62 @@ func TestSynthesizeCodexImageDisplayMessageEvent(t *testing.T) {
 	}
 }
 
+func TestCodexImageStreamRewritesMntDataMarkdownAfterHostedImage(t *testing.T) {
+	n := newCodexImageStreamNormalizer()
+	ig := []byte(`data: {"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","status":"completed","result":"iVBORw0KGgo=","output_format":"png"}}`)
+	events := normalizeCodexImageGenerationOutboundEventWithState(n, ig)
+	if len(events) < 1 {
+		t.Fatalf("expected image events, got %d", len(events))
+	}
+	if len(n.images) != 1 {
+		t.Fatalf("cached images = %d, want 1", len(n.images))
+	}
+
+	// Desktop-visible path: model writes ChatGPT sandbox markdown.
+	textDone := []byte(`data: {"type":"response.output_text.done","item_id":"msg_1","text":"给你画好了：\n\n![小猫](/mnt/data/0.png)\n"}`)
+	rewritten := normalizeCodexImageGenerationOutboundEventWithState(n, textDone)
+	if len(rewritten) != 1 {
+		t.Fatalf("text events = %d, want 1", len(rewritten))
+	}
+	body := bytes.TrimSpace(rewritten[0][len(dataTag):])
+	got := gjson.GetBytes(body, "text").String()
+	if !strings.Contains(got, "data:image/png;base64,iVBORw0KGgo=") {
+		t.Fatalf("text not rewritten to data url: %s", got)
+	}
+	if strings.Contains(got, "/mnt/data/") {
+		t.Fatalf("text still has /mnt/data: %s", got)
+	}
+	if !strings.Contains(got, "![小猫](") {
+		t.Fatalf("alt text lost: %s", got)
+	}
+
+	msgDone := []byte(`data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"给你画好了：\n\n![小猫](/mnt/data/0.png)\n"}]}}`)
+	rewritten = normalizeCodexImageGenerationOutboundEventWithState(n, msgDone)
+	body = bytes.TrimSpace(rewritten[0][len(dataTag):])
+	got = gjson.GetBytes(body, "item.content.0.text").String()
+	if !strings.Contains(got, "data:image/png;base64,iVBORw0KGgo=") || strings.Contains(got, "/mnt/data/") {
+		t.Fatalf("message item not rewritten: %s", got)
+	}
+}
+
+func TestCodexImageStreamDoesNotRewriteWithoutHostedImage(t *testing.T) {
+	n := newCodexImageStreamNormalizer()
+	in := []byte(`data: {"type":"response.output_text.done","text":"see ![x](/mnt/data/0.png)"}`)
+	out := normalizeCodexImageGenerationOutboundEventWithState(n, in)
+	body := bytes.TrimSpace(out[0][len(dataTag):])
+	if got := gjson.GetBytes(body, "text").String(); got != "see ![x](/mnt/data/0.png)" {
+		t.Fatalf("rewrote without image result: %s", got)
+	}
+}
+
+func TestRewriteCodexMntDataImageMarkdownClampsIndex(t *testing.T) {
+	images := []codexHostedImage{{Result: "AAA", MIME: "image/png"}}
+	got, ok := rewriteCodexMntDataImageMarkdown("![a](/mnt/data/3.png)", images)
+	if !ok || !strings.Contains(got, "data:image/png;base64,AAA") {
+		t.Fatalf("clamp rewrite failed: ok=%v got=%s", ok, got)
+	}
+}
+
 func TestMaybeEnsureForcesToolChoiceOnImageIntent(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
