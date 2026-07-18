@@ -422,9 +422,14 @@ func (s Store) deleteOwnedGuarded(where string, arg string) error {
 		}
 		return err
 	}
-	if endUserID.Valid && strings.TrimSpace(endUserID.String) != "" {
+	ownerID := ""
+	if endUserID.Valid {
+		ownerID = strings.TrimSpace(endUserID.String)
+	}
+	wasDefault := false
+	if ownerID != "" {
 		// Best-effort row lock on owner (Postgres); SQLite ignores unsupported syntax via fallback.
-		if _, err = tx.Exec(`SELECT id FROM end_users WHERE id = ? FOR UPDATE`, endUserID.String); err != nil {
+		if _, err = tx.Exec(`SELECT id FROM end_users WHERE id = ? FOR UPDATE`, ownerID); err != nil {
 			msg := strings.ToLower(err.Error())
 			if !strings.Contains(msg, "syntax") && !strings.Contains(msg, "for update") {
 				return err
@@ -433,16 +438,44 @@ func (s Store) deleteOwnedGuarded(where string, arg string) error {
 		var n int
 		if err = tx.QueryRow(
 			`SELECT COUNT(*) FROM api_keys WHERE tenant_id = ? AND end_user_id = ?`,
-			s.tenantID, endUserID.String,
+			s.tenantID, ownerID,
 		).Scan(&n); err != nil {
 			return err
 		}
 		if n <= 1 {
 			return fmt.Errorf("cannot delete last api key owned by an end user")
 		}
+		_ = tx.QueryRow(
+			`SELECT COALESCE(is_default, false) FROM api_keys WHERE tenant_id = ? AND id = ?`,
+			s.tenantID, keyID,
+		).Scan(&wasDefault)
 	}
 	if _, err = tx.Exec(`DELETE FROM api_keys WHERE tenant_id = ? AND id = ?`, s.tenantID, keyID); err != nil {
 		return err
+	}
+	if ownerID != "" && wasDefault {
+		now := time.Now().UTC().Format(time.RFC3339)
+		if _, err = tx.Exec(`
+			UPDATE api_keys SET is_default = true, updated_at = ?
+			 WHERE id = (
+				SELECT id FROM api_keys
+				 WHERE tenant_id = ? AND end_user_id = ?
+				 ORDER BY created_at ASC, id ASC LIMIT 1
+			 )
+		`, now, s.tenantID, ownerID); err != nil {
+			// Some engines disallow updating the same table as the subquery target.
+			var promoteID string
+			if err2 := tx.QueryRow(`
+				SELECT id FROM api_keys
+				 WHERE tenant_id = ? AND end_user_id = ?
+				 ORDER BY created_at ASC, id ASC LIMIT 1
+			`, s.tenantID, ownerID).Scan(&promoteID); err2 != nil {
+				return err
+			}
+			if _, err = tx.Exec(`UPDATE api_keys SET is_default = true, updated_at = ? WHERE tenant_id = ? AND id = ?`, now, s.tenantID, promoteID); err != nil {
+				return err
+			}
+		}
 	}
 	return tx.Commit()
 }
@@ -601,70 +634,24 @@ func (s Store) ReplaceAll(entries []APIKeyRow) error {
 		}
 	}
 
-	// Ensure every remaining owned user has exactly one default key.
-	if _, err := tx.Exec(`
-		UPDATE api_keys
-		   SET is_default = 1, updated_at = ?
-		 WHERE tenant_id = ?
-		   AND end_user_id IS NOT NULL
-		   AND end_user_id <> ''
-		   AND id IN (
-		     SELECT id FROM (
-		       SELECT id,
-		              ROW_NUMBER() OVER (
-		                PARTITION BY end_user_id
-		                ORDER BY CASE WHEN is_default THEN 0 ELSE 1 END, created_at ASC, id ASC
-		              ) AS rn,
-		              SUM(CASE WHEN is_default THEN 1 ELSE 0 END) OVER (PARTITION BY end_user_id) AS defaults
-		         FROM api_keys
-		        WHERE tenant_id = ? AND end_user_id IS NOT NULL AND end_user_id <> ''
-		     ) ranked
-		    WHERE defaults = 0 AND rn = 1
-		   )
-	`, now, s.tenantID, s.tenantID); err != nil {
-		// SQLite without window functions: fall back to a simpler promote path.
-		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "window") || strings.Contains(msg, "syntax") || strings.Contains(msg, "over") {
-			if err2 := promoteMissingDefaultsSQLite(tx, s.tenantID, now); err2 != nil {
-				_ = tx.Rollback()
-				return err2
-			}
-		} else {
-			_ = tx.Rollback()
-			return err
-		}
-	} else {
-		// Clear extra defaults if any (keep earliest default).
-		if _, err := tx.Exec(`
-			UPDATE api_keys SET is_default = 0, updated_at = ?
-			 WHERE tenant_id = ? AND end_user_id IS NOT NULL AND end_user_id <> '' AND is_default = 1
-			   AND id NOT IN (
-			     SELECT id FROM (
-			       SELECT id, ROW_NUMBER() OVER (PARTITION BY end_user_id ORDER BY created_at ASC, id ASC) AS rn
-			         FROM api_keys
-			        WHERE tenant_id = ? AND end_user_id IS NOT NULL AND end_user_id <> '' AND is_default = 1
-			     ) d WHERE rn = 1
-			   )
-		`, now, s.tenantID, s.tenantID); err != nil {
-			msg := strings.ToLower(err.Error())
-			if !(strings.Contains(msg, "window") || strings.Contains(msg, "syntax") || strings.Contains(msg, "over")) {
-				_ = tx.Rollback()
-				return err
-			}
-			if err2 := demoteExtraDefaultsSQLite(tx, s.tenantID, now); err2 != nil {
-				_ = tx.Rollback()
-				return err2
-			}
-		}
+	// Portable rebalance (SQLite + Postgres): one default per owned user.
+	if err := promoteMissingDefaultsSQLite(tx, s.tenantID, now); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := demoteExtraDefaultsSQLite(tx, s.tenantID, now); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
 
 	return tx.Commit()
 }
 
 func promoteMissingDefaultsSQLite(tx *sql.Tx, tenantID, now string) error {
+	// Portable across SQLite INTEGER and Postgres BOOLEAN is_default.
 	rows, err := tx.Query(`
 		SELECT end_user_id FROM api_keys
-		 WHERE tenant_id = ? AND end_user_id IS NOT NULL AND end_user_id <> ''
+		 WHERE tenant_id = ? AND end_user_id IS NOT NULL AND CAST(end_user_id AS TEXT) <> ''
 		 GROUP BY end_user_id
 		HAVING SUM(CASE WHEN is_default THEN 1 ELSE 0 END) = 0
 	`, tenantID)
@@ -692,7 +679,7 @@ func promoteMissingDefaultsSQLite(tx *sql.Tx, tenantID, now string) error {
 		`, tenantID, endUserID).Scan(&keyID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE api_keys SET is_default = 1, updated_at = ? WHERE tenant_id = ? AND id = ?`, now, tenantID, keyID); err != nil {
+		if _, err := tx.Exec(`UPDATE api_keys SET is_default = true, updated_at = ? WHERE tenant_id = ? AND id = ?`, now, tenantID, keyID); err != nil {
 			return err
 		}
 	}
@@ -702,7 +689,8 @@ func promoteMissingDefaultsSQLite(tx *sql.Tx, tenantID, now string) error {
 func demoteExtraDefaultsSQLite(tx *sql.Tx, tenantID, now string) error {
 	rows, err := tx.Query(`
 		SELECT end_user_id FROM api_keys
-		 WHERE tenant_id = ? AND end_user_id IS NOT NULL AND end_user_id <> '' AND is_default = 1
+		 WHERE tenant_id = ? AND end_user_id IS NOT NULL AND CAST(end_user_id AS TEXT) <> ''
+		   AND is_default
 		 GROUP BY end_user_id
 		HAVING COUNT(*) > 1
 	`, tenantID)
@@ -725,14 +713,14 @@ func demoteExtraDefaultsSQLite(tx *sql.Tx, tenantID, now string) error {
 		var keepID string
 		if err := tx.QueryRow(`
 			SELECT id FROM api_keys
-			 WHERE tenant_id = ? AND end_user_id = ? AND is_default = 1
+			 WHERE tenant_id = ? AND end_user_id = ? AND is_default
 			 ORDER BY created_at ASC, id ASC LIMIT 1
 		`, tenantID, endUserID).Scan(&keepID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`
-			UPDATE api_keys SET is_default = 0, updated_at = ?
-			 WHERE tenant_id = ? AND end_user_id = ? AND is_default = 1 AND id <> ?
+			UPDATE api_keys SET is_default = false, updated_at = ?
+			 WHERE tenant_id = ? AND end_user_id = ? AND is_default AND id <> ?
 		`, now, tenantID, endUserID, keepID); err != nil {
 			return err
 		}
