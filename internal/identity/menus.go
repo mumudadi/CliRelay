@@ -138,11 +138,17 @@ func seedMenus(ctx context.Context, tx *sql.Tx) error {
 			  parent_code=EXCLUDED.parent_code, menu_type=EXCLUDED.menu_type, path=EXCLUDED.path,
 			  component=EXCLUDED.component, label_key=EXCLUDED.label_key, icon=EXCLUDED.icon,
 			  permission_code=EXCLUDED.permission_code, sort_order=EXCLUDED.sort_order,
-			  hide_menu=EXCLUDED.hide_menu,
 			  system_protected=true, updated_at=now()
 		`, menu.Code, parent, menu.Type, menu.Path, menu.Component, menu.LabelKey, menu.Icon, permission, menu.SortOrder, menu.HideMenu); err != nil {
 			return fmt.Errorf("identity: seed menu %s: %w", menu.Code, err)
 		}
+	}
+	// Targeted product migration: hide legacy API Keys sidebar entry without
+	// resetting custom hide_menu on other menus during catalog re-seed.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE menus SET hide_menu = true, updated_at = now() WHERE code = 'access.api-keys'
+	`); err != nil {
+		return fmt.Errorf("identity: hide access.api-keys menu: %w", err)
 	}
 	return nil
 }

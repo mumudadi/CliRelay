@@ -53,8 +53,8 @@ type EntryPatch struct {
 	AllowedChannelGroups *[]string `json:"allowed-channel-groups"`
 	SystemPrompt         *string   `json:"system-prompt"`
 	CreatedAt            *string   `json:"created-at"`
-	EndUserID            *string   `json:"end_user_id"`
-	IsDefault            *bool     `json:"is_default"`
+	// end_user_id / is_default are intentionally not patchable here; ownership
+	// changes go through end-user owner-scoped APIs only.
 }
 
 type DeleteEntryResult struct {
@@ -463,12 +463,6 @@ func (s *Service) PatchEntry(id *string, index *int, match *string, patch EntryP
 	if patch.CreatedAt != nil {
 		entry.CreatedAt = strings.TrimSpace(*patch.CreatedAt)
 	}
-	if patch.EndUserID != nil {
-		entry.EndUserID = strings.TrimSpace(*patch.EndUserID)
-	}
-	if patch.IsDefault != nil {
-		entry.IsDefault = *patch.IsDefault
-	}
 
 	normalized, err := s.prepareEntryForSave(entry.ToConfigEntry())
 	if err != nil {
@@ -482,9 +476,9 @@ func (s *Service) PatchEntry(id *string, index *int, match *string, patch EntryP
 	}
 	updated := usage.APIKeyRowFromConfig(normalized)
 	updated.ID = originalID
-	// prepareEntryForSave works on config entry; ownership fields must survive the round-trip.
-	updated.EndUserID = entry.EndUserID
-	updated.IsDefault = entry.IsDefault
+	// Preserve ownership regardless of client payload (read-only on generic API).
+	updated.EndUserID = existing.EndUserID
+	updated.IsDefault = existing.IsDefault
 	return usage.UpdateAPIKeyByIDForTenant(s.tenantID, updated)
 }
 
