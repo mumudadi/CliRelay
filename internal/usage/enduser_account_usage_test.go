@@ -30,7 +30,8 @@ func setupEndUserAccountUsageTestDB(t *testing.T) {
 		CREATE TABLE IF NOT EXISTS end_users (
 			id TEXT PRIMARY KEY,
 			tenant_id TEXT NOT NULL,
-			display_name TEXT NOT NULL
+			display_name TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active'
 		)
 	`); err != nil {
 		t.Fatalf("create end_users: %v", err)

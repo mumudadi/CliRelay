@@ -75,13 +75,25 @@ func (h *Handler) GetEndUsers(c *gin.Context) {
 		endUserError(c, err)
 		return
 	}
+	// Group by tenant then batch-load today costs (avoids per-row N+1).
+	byTenant := map[string][]string{}
 	for i := range items {
-		used, usageErr := usage.QueryTodayEffectiveCostByEndUserForTenant(items[i].TenantID, items[i].ID)
+		tid := items[i].TenantID
+		byTenant[tid] = append(byTenant[tid], items[i].ID)
+	}
+	costs := map[string]float64{}
+	for tid, ids := range byTenant {
+		part, usageErr := usage.QueryTodayEffectiveCostsByEndUsersForTenant(tid, ids)
 		if usageErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": usageErr.Error()})
 			return
 		}
-		items[i].DailySpendingUsed = used
+		for id, used := range part {
+			costs[id] = used
+		}
+	}
+	for i := range items {
+		items[i].DailySpendingUsed = costs[items[i].ID]
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }

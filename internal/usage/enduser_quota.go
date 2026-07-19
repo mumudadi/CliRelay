@@ -13,6 +13,8 @@ type EndUserQuota struct {
 	ID                   string
 	TenantID             string
 	DisplayName          string
+	// Status is end_users.status (active/disabled/locked). Auth must refuse non-active accounts.
+	Status               string
 	PermissionProfileID  string
 	DailyLimit           int
 	TotalQuota           int
@@ -52,7 +54,7 @@ func GetEndUserQuota(endUserID string) *EndUserQuota {
 	var q EndUserQuota
 	var modelsJSON, channelsJSON, groupsJSON string
 	err := db.QueryRow(`
-		SELECT id, tenant_id, display_name,
+		SELECT id, tenant_id, display_name, COALESCE(status, 'active'),
 			COALESCE(permission_profile_id, ''), COALESCE(daily_limit, 0), COALESCE(total_quota, 0),
 			COALESCE(spending_limit, 0), COALESCE(daily_spending_limit, 0),
 			COALESCE(concurrency_limit, 0), COALESCE(rpm_limit, 0), COALESCE(tpm_limit, 0),
@@ -60,7 +62,7 @@ func GetEndUserQuota(endUserID string) *EndUserQuota {
 			COALESCE(system_prompt, '')
 		FROM end_users WHERE id = ?
 	`, endUserID).Scan(
-		&q.ID, &q.TenantID, &q.DisplayName,
+		&q.ID, &q.TenantID, &q.DisplayName, &q.Status,
 		&q.PermissionProfileID, &q.DailyLimit, &q.TotalQuota,
 		&q.SpendingLimit, &q.DailySpendingLimit,
 		&q.ConcurrencyLimit, &q.RPMLimit, &q.TPMLimit,
