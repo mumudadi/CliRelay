@@ -19,8 +19,247 @@ func RuntimeMigrations() []Migration {
 		{Version: "202607160002_ai_account_status_read_model", SQL: aiAccountStatusReadModelSQL},
 		// Manual same-day daily spending reset baseline per API key (does not delete request_logs).
 		{Version: "202607160003_api_key_daily_spending_resets", SQL: apiKeyDailySpendingResetsSQL},
+		// Daily USD spending limit belongs on reusable permission profiles.
+		{Version: "202607170001_profile_daily_spending_limit", SQL: profileDailySpendingLimitSQL},
+		// Append-only history of manual daily spending resets (who/when/amount).
+		{Version: "202607170002_api_key_daily_spending_reset_events", SQL: apiKeyDailySpendingResetEventsSQL},
+		// End-user portal accounts (isolated from admin users) + multi-key ownership + refresh tokens.
+		{Version: "202607170003_end_users_and_tokens", SQL: endUsersAndTokensSQL},
+		// Account-level quota/permissions: shared across all API keys of an end user.
+		{Version: "202607190001_end_user_account_quota", SQL: endUserAccountQuotaSQL},
+		// Account-level same-day spending reset baseline for end-user quota pools.
+		{Version: "202607190002_end_user_daily_spending_resets", SQL: endUserDailySpendingResetsSQL},
+		// Small usage rollup so stats/limits stop scanning request_logs.
+		{Version: "202607200001_usage_rollup_buckets", SQL: usageRollupBucketsSQL},
+		// Shared physical AI-account subjects; credentials remain tenant-private bindings.
+		{Version: "202607200002_ai_account_shared_subjects", SQL: aiAccountSharedSubjectsSQL},
 	}
 }
+
+const usageRollupBucketsSQL = `
+CREATE TABLE IF NOT EXISTS usage_rollup_buckets (
+  tenant_id               UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+  bucket_kind             TEXT NOT NULL,
+  bucket_start            TEXT NOT NULL,
+  api_key_id              TEXT NOT NULL DEFAULT '',
+  end_user_id             TEXT NOT NULL DEFAULT '',
+  auth_subject_id         TEXT NOT NULL DEFAULT '',
+  model                   TEXT NOT NULL DEFAULT '',
+  source                  TEXT NOT NULL DEFAULT '',
+  channel_name            TEXT NOT NULL DEFAULT '',
+  request_count           BIGINT NOT NULL DEFAULT 0,
+  success_count           BIGINT NOT NULL DEFAULT 0,
+  failure_count           BIGINT NOT NULL DEFAULT 0,
+  streaming_count         BIGINT NOT NULL DEFAULT 0,
+  input_tokens            BIGINT NOT NULL DEFAULT 0,
+  output_tokens           BIGINT NOT NULL DEFAULT 0,
+  reasoning_tokens        BIGINT NOT NULL DEFAULT 0,
+  cached_tokens           BIGINT NOT NULL DEFAULT 0,
+  effective_input_tokens  BIGINT NOT NULL DEFAULT 0,
+  total_tokens            BIGINT NOT NULL DEFAULT 0,
+  cost_total              DOUBLE PRECISION NOT NULL DEFAULT 0,
+  latency_sum_ms          BIGINT NOT NULL DEFAULT 0,
+  latency_count           BIGINT NOT NULL DEFAULT 0,
+  first_token_sum_ms      BIGINT NOT NULL DEFAULT 0,
+  first_token_count       BIGINT NOT NULL DEFAULT 0,
+  updated_at              TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (
+    tenant_id, bucket_kind, bucket_start,
+    api_key_id, end_user_id, auth_subject_id,
+    model, source, channel_name
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_kind_start
+  ON usage_rollup_buckets(tenant_id, bucket_kind, bucket_start);
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_key_day
+  ON usage_rollup_buckets(tenant_id, bucket_kind, api_key_id, bucket_start);
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_user_day
+  ON usage_rollup_buckets(tenant_id, bucket_kind, end_user_id, bucket_start);
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_subject_day
+  ON usage_rollup_buckets(tenant_id, bucket_kind, auth_subject_id, bucket_start);
+
+CREATE TABLE IF NOT EXISTS request_log_storage_state (
+  id                        INTEGER PRIMARY KEY CHECK (id = 1),
+  metadata_row_count        BIGINT NOT NULL DEFAULT 0,
+  content_row_count         BIGINT NOT NULL DEFAULT 0,
+  last_cleanup_started_at   TIMESTAMPTZ,
+  last_cleanup_finished_at  TIMESTAMPTZ,
+  last_cleanup_status       TEXT NOT NULL DEFAULT '',
+  last_cleanup_deleted_rows BIGINT NOT NULL DEFAULT 0,
+  last_cleanup_duration_ms  BIGINT NOT NULL DEFAULT 0,
+  last_cleanup_error        TEXT NOT NULL DEFAULT '',
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO request_log_storage_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+`
+
+const endUserDailySpendingResetsSQL = `
+CREATE TABLE IF NOT EXISTS end_user_daily_spending_resets (
+  tenant_id     UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+  end_user_id   UUID NOT NULL,
+  day_key       TEXT NOT NULL DEFAULT '',
+  cost_baseline DOUBLE PRECISION NOT NULL DEFAULT 0,
+  reset_at      TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (tenant_id, end_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_end_user_daily_spending_resets_day
+  ON end_user_daily_spending_resets(tenant_id, day_key);
+`
+
+// Quota + permission template live on end_users so multiple keys share one pool.
+// Backfill from each user's default key (or earliest key) then zero owned key limits
+// so creating extra keys cannot mint independent budgets.
+const endUserAccountQuotaSQL = `
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS permission_profile_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS daily_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS total_quota INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS spending_limit DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS daily_spending_limit DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS concurrency_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS rpm_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS tpm_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS allowed_models TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS allowed_channels TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS allowed_channel_groups TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE end_users ADD COLUMN IF NOT EXISTS system_prompt TEXT NOT NULL DEFAULT '';
+
+UPDATE end_users AS eu
+SET
+  permission_profile_id = COALESCE(NULLIF(src.permission_profile_id, ''), eu.permission_profile_id),
+  daily_limit = CASE WHEN src.daily_limit > 0 THEN src.daily_limit ELSE eu.daily_limit END,
+  total_quota = CASE WHEN src.total_quota > 0 THEN src.total_quota ELSE eu.total_quota END,
+  spending_limit = CASE WHEN src.spending_limit > 0 THEN src.spending_limit ELSE eu.spending_limit END,
+  daily_spending_limit = CASE WHEN src.daily_spending_limit > 0 THEN src.daily_spending_limit ELSE eu.daily_spending_limit END,
+  concurrency_limit = CASE WHEN src.concurrency_limit > 0 THEN src.concurrency_limit ELSE eu.concurrency_limit END,
+  rpm_limit = CASE WHEN src.rpm_limit > 0 THEN src.rpm_limit ELSE eu.rpm_limit END,
+  tpm_limit = CASE WHEN src.tpm_limit > 0 THEN src.tpm_limit ELSE eu.tpm_limit END,
+  allowed_models = CASE WHEN src.allowed_models IS NOT NULL AND src.allowed_models <> '' AND src.allowed_models <> '[]'
+    THEN src.allowed_models ELSE eu.allowed_models END,
+  allowed_channels = CASE WHEN src.allowed_channels IS NOT NULL AND src.allowed_channels <> '' AND src.allowed_channels <> '[]'
+    THEN src.allowed_channels ELSE eu.allowed_channels END,
+  allowed_channel_groups = CASE WHEN src.allowed_channel_groups IS NOT NULL AND src.allowed_channel_groups <> '' AND src.allowed_channel_groups <> '[]'
+    THEN src.allowed_channel_groups ELSE eu.allowed_channel_groups END,
+  system_prompt = CASE WHEN src.system_prompt IS NOT NULL AND src.system_prompt <> ''
+    THEN src.system_prompt ELSE eu.system_prompt END
+FROM (
+  SELECT DISTINCT ON (end_user_id)
+    end_user_id,
+    permission_profile_id,
+    daily_limit,
+    total_quota,
+    spending_limit,
+    daily_spending_limit,
+    concurrency_limit,
+    rpm_limit,
+    tpm_limit,
+    allowed_models,
+    allowed_channels,
+    allowed_channel_groups,
+    system_prompt
+  FROM api_keys
+  WHERE end_user_id IS NOT NULL
+  ORDER BY end_user_id, is_default DESC, created_at ASC NULLS LAST, id ASC
+) AS src
+WHERE eu.id = src.end_user_id;
+
+UPDATE api_keys
+SET
+  permission_profile_id = '',
+  daily_limit = 0,
+  total_quota = 0,
+  spending_limit = 0,
+  daily_spending_limit = 0,
+  concurrency_limit = 0,
+  rpm_limit = 0,
+  tpm_limit = 0,
+  allowed_models = '[]',
+  allowed_channels = '[]',
+  allowed_channel_groups = '[]',
+  system_prompt = ''
+WHERE end_user_id IS NOT NULL;
+`
+
+const endUsersAndTokensSQL = `
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS access_token_ttl_seconds INTEGER NOT NULL DEFAULT 43200;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS refresh_token_ttl_seconds INTEGER NOT NULL DEFAULT 2592000;
+
+CREATE TABLE IF NOT EXISTS end_users (
+  id                    UUID PRIMARY KEY,
+  tenant_id             UUID NOT NULL REFERENCES tenants(id),
+  username              TEXT NOT NULL,
+  username_normalized   TEXT NOT NULL,
+  display_name          TEXT NOT NULL,
+  password_hash         TEXT NOT NULL,
+  status                TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled', 'locked')),
+  must_change_password  BOOLEAN NOT NULL DEFAULT false,
+  password_changed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_login_at         TIMESTAMPTZ,
+  failed_login_count    INTEGER NOT NULL DEFAULT 0,
+  lock_stage            INTEGER NOT NULL DEFAULT 0,
+  locked_until          TIMESTAMPTZ,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  version               BIGINT NOT NULL DEFAULT 1,
+  UNIQUE (username_normalized)
+);
+CREATE INDEX IF NOT EXISTS idx_end_users_tenant_status ON end_users(tenant_id, status);
+
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS end_user_id UUID REFERENCES end_users(id) ON DELETE SET NULL;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_api_keys_end_user ON api_keys(tenant_id, end_user_id);
+-- at most one default key per end user
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_one_default_per_user
+  ON api_keys(tenant_id, end_user_id) WHERE is_default = true AND end_user_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS end_user_backfill_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  done_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS end_user_sessions (
+  id                  UUID PRIMARY KEY,
+  end_user_id         UUID NOT NULL REFERENCES end_users(id) ON DELETE CASCADE,
+  tenant_id           UUID NOT NULL REFERENCES tenants(id),
+  access_token_hash   TEXT NOT NULL UNIQUE,
+  refresh_token_hash  TEXT NOT NULL UNIQUE,
+  access_expires_at   TIMESTAMPTZ NOT NULL,
+  refresh_expires_at  TIMESTAMPTZ NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at          TIMESTAMPTZ,
+  revoke_reason       TEXT NOT NULL DEFAULT '',
+  user_agent_hash     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_end_user_sessions_user_active
+  ON end_user_sessions(end_user_id, revoked_at, refresh_expires_at);
+
+ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS refresh_token_hash TEXT;
+ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS refresh_expires_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash
+  ON user_sessions(refresh_token_hash) WHERE refresh_token_hash IS NOT NULL AND refresh_token_hash <> '';
+
+INSERT INTO permissions (code, name, description, scope, resource, action, sensitive, sort_order, updated_at)
+VALUES
+  ('end_users.read', 'Read end users', 'List and view portal end users', 'tenant', 'end_users', 'read', true, 410, now()),
+  ('end_users.write', 'Write end users', 'Create, update, delete portal end users and their keys', 'tenant', 'end_users', 'write', true, 420, now())
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO role_permissions (role_id, permission_code)
+SELECT r.id, p.code
+  FROM roles r
+  CROSS JOIN (VALUES ('end_users.read'), ('end_users.write')) AS p(code)
+ WHERE r.code IN ('tenant_admin', 'platform_super_admin')
+ON CONFLICT DO NOTHING;
+
+-- Menu row is seeded from MenuCatalog (identity bootstrap), not here:
+-- parent group.access may be absent on partial upgrade baselines, which would
+-- fail menus_parent_code_fkey and leave the migration dirty.
+`
+
+const profileDailySpendingLimitSQL = `
+ALTER TABLE api_key_permission_profiles
+  ADD COLUMN IF NOT EXISTS daily_spending_limit DOUBLE PRECISION NOT NULL DEFAULT 0;
+`
 
 // TIMESTAMPTZ matches other PG runtime tables; SQLite bootstrap uses TIMESTAMP (see usage package).
 const apiKeyDailySpendingResetsSQL = `
@@ -34,6 +273,25 @@ CREATE TABLE IF NOT EXISTS api_key_daily_spending_resets (
 );
 CREATE INDEX IF NOT EXISTS idx_api_key_daily_spending_resets_day
   ON api_key_daily_spending_resets(tenant_id, day_key);
+`
+
+// BIGSERIAL for PG; SQLite bootstrap uses INTEGER PRIMARY KEY AUTOINCREMENT.
+const apiKeyDailySpendingResetEventsSQL = `
+CREATE TABLE IF NOT EXISTS api_key_daily_spending_reset_events (
+  id                     BIGSERIAL PRIMARY KEY,
+  tenant_id              UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+  api_key_id             TEXT NOT NULL,
+  day_key                TEXT NOT NULL DEFAULT '',
+  reset_at               TIMESTAMPTZ NOT NULL,
+  actor_user_id          TEXT NOT NULL DEFAULT '',
+  actor_username         TEXT NOT NULL DEFAULT '',
+  actor_kind             TEXT NOT NULL DEFAULT '',
+  cost_baseline          DOUBLE PRECISION NOT NULL DEFAULT 0,
+  effective_used_before  DOUBLE PRECISION NOT NULL DEFAULT 0,
+  raw_today_cost         DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_api_key_daily_spending_reset_events_key
+  ON api_key_daily_spending_reset_events(tenant_id, api_key_id, reset_at DESC);
 `
 
 const requestLogsAuthLookupIndexesSQL = `
@@ -704,4 +962,115 @@ ALTER TABLE model_configs ADD COLUMN IF NOT EXISTS max_completion_tokens INTEGER
 ALTER TABLE model_configs ADD COLUMN IF NOT EXISTS supported_parameters TEXT NOT NULL DEFAULT '';
 ALTER TABLE model_configs ADD COLUMN IF NOT EXISTS reasoning TEXT NOT NULL DEFAULT '';
 ALTER TABLE model_configs ADD COLUMN IF NOT EXISTS knowledge_cutoff TEXT NOT NULL DEFAULT '';
+`
+
+const aiAccountSharedSubjectsSQL = `
+CREATE TABLE IF NOT EXISTS ai_account_subjects (
+  auth_subject_id          TEXT PRIMARY KEY,
+  provider                 TEXT NOT NULL,
+  subject_scope            TEXT NOT NULL CHECK (subject_scope IN ('shared', 'tenant')),
+  seed_kind                TEXT NOT NULL,
+  seed_hash                TEXT NOT NULL,
+  share_eligible           BOOLEAN NOT NULL DEFAULT false,
+  usage_projected_since    TIMESTAMPTZ,
+  usage_history_complete   BOOLEAN NOT NULL DEFAULT false,
+  created_at               TIMESTAMPTZ NOT NULL,
+  updated_at               TIMESTAMPTZ NOT NULL,
+  UNIQUE (provider, subject_scope, seed_kind, seed_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_account_subjects_provider_scope
+  ON ai_account_subjects(provider, subject_scope, updated_at);
+
+CREATE TABLE IF NOT EXISTS ai_account_tenant_bindings (
+  tenant_id                UUID NOT NULL,
+  auth_id                  TEXT NOT NULL,
+  auth_index               TEXT NOT NULL,
+  provider                 TEXT NOT NULL,
+  auth_subject_id          TEXT NOT NULL,
+  binding_seed_kind        TEXT NOT NULL,
+  binding_seed_hash        TEXT NOT NULL,
+  share_eligible           BOOLEAN NOT NULL DEFAULT false,
+  binding_state            TEXT NOT NULL DEFAULT 'active'
+                           CHECK (binding_state IN ('active', 'deleted')),
+  binding_revision         BIGINT NOT NULL DEFAULT 1,
+  bound_at                 TIMESTAMPTZ NOT NULL,
+  last_seen_at             TIMESTAMPTZ NOT NULL,
+  deleted_at               TIMESTAMPTZ,
+  PRIMARY KEY (tenant_id, auth_id),
+  FOREIGN KEY (auth_subject_id) REFERENCES ai_account_subjects(auth_subject_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_account_binding_active_index
+  ON ai_account_tenant_bindings(tenant_id, auth_index)
+  WHERE binding_state = 'active';
+CREATE INDEX IF NOT EXISTS idx_ai_account_binding_subject
+  ON ai_account_tenant_bindings(auth_subject_id, binding_state);
+CREATE INDEX IF NOT EXISTS idx_ai_account_binding_tenant_subject
+  ON ai_account_tenant_bindings(tenant_id, auth_subject_id, binding_state);
+
+CREATE TABLE IF NOT EXISTS ai_account_subject_status (
+  auth_subject_id           TEXT PRIMARY KEY,
+  provider                  TEXT NOT NULL,
+  last_probe_state          TEXT NOT NULL DEFAULT 'idle'
+                            CHECK (last_probe_state IN ('idle', 'success', 'error')),
+  health_status             TEXT NOT NULL DEFAULT '',
+  plan_type                 TEXT NOT NULL DEFAULT '',
+  subscription_started_at   TIMESTAMPTZ,
+  subscription_expires_at   TIMESTAMPTZ,
+  subscription_source       TEXT NOT NULL DEFAULT ''
+                            CHECK (subscription_source IN ('', 'probe', 'signed_claims', 'migration')),
+  restriction_summary       TEXT NOT NULL DEFAULT '',
+  error_code                TEXT NOT NULL DEFAULT '',
+  error_summary             TEXT NOT NULL DEFAULT '',
+  quota_json                TEXT NOT NULL DEFAULT '[]',
+  reset_credit_count        BIGINT,
+  reset_credit_expirations  TEXT NOT NULL DEFAULT '[]',
+  upstream_checked_at       TIMESTAMPTZ,
+  version                   BIGINT NOT NULL DEFAULT 1,
+  updated_at                TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (auth_subject_id) REFERENCES ai_account_subjects(auth_subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_account_subject_status_checked
+  ON ai_account_subject_status(upstream_checked_at, updated_at);
+
+CREATE TABLE IF NOT EXISTS ai_account_subject_usage_buckets (
+  auth_subject_id   TEXT NOT NULL,
+  bucket_kind       TEXT NOT NULL CHECK (bucket_kind IN ('day', 'lifetime', 'cycle')),
+  bucket_start      TEXT NOT NULL,
+  request_count     BIGINT NOT NULL DEFAULT 0,
+  success_count     BIGINT NOT NULL DEFAULT 0,
+  failure_count     BIGINT NOT NULL DEFAULT 0,
+  cost_total        DOUBLE PRECISION NOT NULL DEFAULT 0,
+  first_event_at    TIMESTAMPTZ NOT NULL,
+  updated_at        TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (auth_subject_id, bucket_kind, bucket_start)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_account_subject_usage_day
+  ON ai_account_subject_usage_buckets(bucket_kind, bucket_start, auth_subject_id);
+
+CREATE TABLE IF NOT EXISTS ai_account_subject_quota_cycles (
+  auth_subject_id    TEXT NOT NULL,
+  provider           TEXT NOT NULL,
+  quota_key          TEXT NOT NULL,
+  cycle_start_at     TIMESTAMPTZ NOT NULL,
+  reset_at           TIMESTAMPTZ NOT NULL,
+  window_seconds     BIGINT NOT NULL DEFAULT 0,
+  last_verified_at   TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (auth_subject_id, quota_key),
+  FOREIGN KEY (auth_subject_id) REFERENCES ai_account_subjects(auth_subject_id)
+);
+
+CREATE TABLE IF NOT EXISTS ai_account_subject_quota_points (
+  id                 BIGSERIAL PRIMARY KEY,
+  auth_subject_id    TEXT NOT NULL,
+  provider           TEXT NOT NULL,
+  quota_key          TEXT NOT NULL,
+  quota_label        TEXT NOT NULL DEFAULT '',
+  percent            DOUBLE PRECISION,
+  reset_at           TIMESTAMPTZ,
+  window_seconds     BIGINT NOT NULL DEFAULT 0,
+  recorded_at        TIMESTAMPTZ NOT NULL,
+  FOREIGN KEY (auth_subject_id) REFERENCES ai_account_subjects(auth_subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_account_subject_quota_points_key_time
+  ON ai_account_subject_quota_points(auth_subject_id, quota_key, recorded_at DESC);
 `

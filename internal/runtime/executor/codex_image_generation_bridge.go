@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -884,6 +885,9 @@ func maybeWrapSSEData(hadSSEPrefix bool, body []byte) []byte {
 //  2. Re-attach at most the last extracted image as a structured input_image on the latest
 //     user turn so the model can re-identify / edit without keeping base64-as-text history
 //  3. All image bytes come from the current request body and die with the request
+//
+// Implementation rebuilds the input array once. Never call sjson.Set/Delete on the full
+// multi-MB body for each history item — that was the production RSS spike path.
 func stripCodexHistoryDataURLImages(body []byte) []byte {
 	if len(body) == 0 {
 		return body
@@ -914,63 +918,149 @@ func stripCodexHistoryDataURLImages(body []byte) []byte {
 		return fmt.Sprintf("![%s](cliproxy-image:%d)", alt, seq)
 	}
 
-	// Top-level string input (rare for Desktop).
-	if in := gjson.GetBytes(body, "input"); in.Type == gjson.String {
-		if next, ok := replaceCodexDataURLImagesInText(in.String(), nextPlaceholder, remember); ok {
-			body, _ = sjson.SetBytes(body, "input", next)
+	// Single GetBytes("input") — gjson copies the matched raw, so never call it twice on multi-MB bodies.
+	input := gjson.GetBytes(body, "input")
+	if input.Type == gjson.String {
+		if next, ok := replaceCodexDataURLImagesInText(input.String(), nextPlaceholder, remember); ok {
+			return util.MutateTopLevelObject(body, map[string][]byte{
+				"input": util.JSONString(next),
+			}, nil)
 		}
 		// Cannot attach input_image to string input safely; placeholders only.
 		return body
 	}
-
-	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
 		return body
 	}
-	for itemIndex, item := range input.Array() {
+	items := input.Array()
+	// Keep original raw strings for unchanged fragments; only allocate rewritten ones.
+	itemRaws := make([]string, len(items))
+	changed := false
+	outLen := 2 // []
+	for itemIndex, item := range items {
+		itemRaws[itemIndex] = item.Raw
 		// Drop base64 from any re-sent image_generation_call history items; remember last.
 		if strings.TrimSpace(item.Get("type").String()) == "image_generation_call" {
-			if result := strings.TrimSpace(item.Get("result").String()); len(result) >= 256 {
-				mime := codexImageMIMEFromFormat(item.Get("output_format").String())
-				remember(fmt.Sprintf("data:%s;base64,%s", mime, result))
-				path := fmt.Sprintf("input.%d.result", itemIndex)
-				body, _ = sjson.DeleteBytes(body, path)
+			if result := item.Get("result"); result.Exists() {
+				resultStr := strings.TrimSpace(result.String())
+				if len(resultStr) >= 256 {
+					// Only reattach if within soft cap; avoid building a huge data URL otherwise.
+					if len(resultStr) <= 8<<20 {
+						mime := codexImageMIMEFromFormat(item.Get("output_format").String())
+						remember(fmt.Sprintf("data:%s;base64,%s", mime, resultStr))
+					}
+					if next, err := sjson.Delete(item.Raw, "result"); err == nil {
+						itemRaws[itemIndex] = next
+						changed = true
+					}
+				}
 			}
+			if itemIndex > 0 {
+				outLen++
+			}
+			outLen += len(itemRaws[itemIndex])
 			continue
 		}
 		if !hasDataURL {
+			if itemIndex > 0 {
+				outLen++
+			}
+			outLen += len(itemRaws[itemIndex])
 			continue
 		}
 		// message / content text fields
 		if content := item.Get("content"); content.Type == gjson.String {
 			if next, ok := replaceCodexDataURLImagesInText(content.String(), nextPlaceholder, remember); ok {
-				path := fmt.Sprintf("input.%d.content", itemIndex)
-				body, _ = sjson.SetBytes(body, path, next)
+				if rewritten, err := sjson.Set(item.Raw, "content", next); err == nil {
+					itemRaws[itemIndex] = rewritten
+					changed = true
+				}
 			}
+			if itemIndex > 0 {
+				outLen++
+			}
+			outLen += len(itemRaws[itemIndex])
 			continue
 		}
 		if content := item.Get("content"); content.IsArray() {
-			for partIndex, part := range content.Array() {
+			parts := content.Array()
+			partRaws := make([]string, len(parts))
+			partChanged := false
+			partOutLen := 2
+			for partIndex, part := range parts {
+				partRaws[partIndex] = part.Raw
 				partType := strings.TrimSpace(part.Get("type").String())
 				// Only rewrite text parts. Do not touch structured input_image (user uploads /
 				// vision) — those are intentional pixels, not Desktop session replay of our
 				// outbound markdown data URLs.
-				if partType != "input_text" && partType != "output_text" && partType != "text" {
-					continue
+				if partType == "input_text" || partType == "output_text" || partType == "text" {
+					text := part.Get("text").String()
+					if next, ok := replaceCodexDataURLImagesInText(text, nextPlaceholder, remember); ok {
+						if rewritten, err := sjson.Set(part.Raw, "text", next); err == nil {
+							partRaws[partIndex] = rewritten
+							partChanged = true
+						}
+					}
 				}
-				text := part.Get("text").String()
-				if next, ok := replaceCodexDataURLImagesInText(text, nextPlaceholder, remember); ok {
-					path := fmt.Sprintf("input.%d.content.%d.text", itemIndex, partIndex)
-					body, _ = sjson.SetBytes(body, path, next)
+				if partIndex > 0 {
+					partOutLen++
+				}
+				partOutLen += len(partRaws[partIndex])
+			}
+			if partChanged {
+				var contentBuf bytes.Buffer
+				contentBuf.Grow(partOutLen)
+				contentBuf.WriteByte('[')
+				for i, p := range partRaws {
+					if i > 0 {
+						contentBuf.WriteByte(',')
+					}
+					contentBuf.WriteString(p)
+				}
+				contentBuf.WriteByte(']')
+				if rewritten, err := sjson.SetRaw(item.Raw, "content", contentBuf.String()); err == nil {
+					itemRaws[itemIndex] = rewritten
+					changed = true
 				}
 			}
 		}
+		if itemIndex > 0 {
+			outLen++
+		}
+		outLen += len(itemRaws[itemIndex])
 	}
+
 	// Re-identify / edit: move last history image into structured input_image (not text tokens).
 	if lastImage != nil {
-		body = attachCodexHistoryImageToLastUser(body, *lastImage)
+		if nextItems, ok := attachCodexHistoryImageToItemRaws(itemRaws, *lastImage); ok {
+			itemRaws = nextItems
+			changed = true
+			outLen = 2
+			for i, raw := range itemRaws {
+				if i > 0 {
+					outLen++
+				}
+				outLen += len(raw)
+			}
+		}
 	}
-	return body
+	if !changed {
+		return body
+	}
+
+	var inputBuf bytes.Buffer
+	inputBuf.Grow(outLen)
+	inputBuf.WriteByte('[')
+	for i, raw := range itemRaws {
+		if i > 0 {
+			inputBuf.WriteByte(',')
+		}
+		inputBuf.WriteString(raw)
+	}
+	inputBuf.WriteByte(']')
+	return util.MutateTopLevelObject(body, map[string][]byte{
+		"input": inputBuf.Bytes(),
+	}, nil)
 }
 
 func replaceCodexDataURLImagesInText(text string, nextPlaceholder func(alt string) string, remember func(dataURL string)) (string, bool) {
@@ -1031,57 +1121,71 @@ func parseCodexDataURLImage(dataURL string) (codexHistoryImage, bool) {
 	return codexHistoryImage{MIME: mime, Result: payload}, true
 }
 
-// attachCodexHistoryImageToLastUser adds at most one input_image to the latest user message.
-// Image bytes are already in this request; we only restructure them for vision-capable models.
-func attachCodexHistoryImageToLastUser(body []byte, img codexHistoryImage) []byte {
-	input := gjson.GetBytes(body, "input")
-	if !input.IsArray() {
-		return body
-	}
-	items := input.Array()
+// attachCodexHistoryImageToItemRaws adds at most one input_image to the latest user message
+// inside a pre-rewritten input item list. Mutates only that item fragment.
+func attachCodexHistoryImageToItemRaws(items []string, img codexHistoryImage) ([]string, bool) {
 	lastUser := -1
 	for i := len(items) - 1; i >= 0; i-- {
-		if strings.TrimSpace(items[i].Get("role").String()) == "user" {
+		if strings.TrimSpace(gjson.Get(items[i], "role").String()) == "user" {
 			lastUser = i
 			break
 		}
 	}
 	if lastUser < 0 {
-		return body
+		return items, false
 	}
-	item := items[lastUser]
+	itemRaw := items[lastUser]
+	item := gjson.Parse(itemRaw)
 	// Skip if this user turn already has an input_image (user-uploaded).
 	if content := item.Get("content"); content.IsArray() {
 		for _, part := range content.Array() {
 			if strings.TrimSpace(part.Get("type").String()) == "input_image" {
-				return body
+				return items, false
 			}
 		}
 	}
 	dataURL := fmt.Sprintf("data:%s;base64,%s", img.MIME, img.Result)
-	imagePart := map[string]any{
-		"type":      "input_image",
-		"image_url": dataURL,
+	imagePartJSON, err := sjson.Set(`{"type":"input_image"}`, "image_url", dataURL)
+	if err != nil {
+		return items, false
 	}
 
 	content := item.Get("content")
-	if content.Type == gjson.String {
+	var rewritten string
+	switch {
+	case content.Type == gjson.String:
 		// Promote string content to multipart so we can attach the image.
-		parts := []any{
-			map[string]any{"type": "input_text", "text": content.String()},
-			imagePart,
+		textPart, err := sjson.Set(`{"type":"input_text"}`, "text", content.String())
+		if err != nil {
+			return items, false
 		}
-		path := fmt.Sprintf("input.%d.content", lastUser)
-		body, _ = sjson.SetBytes(body, path, parts)
-		return body
+		var contentBuf bytes.Buffer
+		contentBuf.WriteByte('[')
+		contentBuf.WriteString(textPart)
+		contentBuf.WriteByte(',')
+		contentBuf.WriteString(imagePartJSON)
+		contentBuf.WriteByte(']')
+		rewritten, err = sjson.SetRaw(itemRaw, "content", contentBuf.String())
+		if err != nil {
+			return items, false
+		}
+	case content.IsArray():
+		rewritten, err = sjson.SetRaw(itemRaw, "content.-1", imagePartJSON)
+		if err != nil {
+			return items, false
+		}
+	default:
+		var contentBuf bytes.Buffer
+		contentBuf.WriteByte('[')
+		contentBuf.WriteString(imagePartJSON)
+		contentBuf.WriteByte(']')
+		rewritten, err = sjson.SetRaw(itemRaw, "content", contentBuf.String())
+		if err != nil {
+			return items, false
+		}
 	}
-	if content.IsArray() {
-		path := fmt.Sprintf("input.%d.content.-1", lastUser)
-		body, _ = sjson.SetBytes(body, path, imagePart)
-		return body
-	}
-	// No content yet — create multipart.
-	path := fmt.Sprintf("input.%d.content", lastUser)
-	body, _ = sjson.SetBytes(body, path, []any{imagePart})
-	return body
+	out := make([]string, len(items))
+	copy(out, items)
+	out[lastUser] = rewritten
+	return out, true
 }

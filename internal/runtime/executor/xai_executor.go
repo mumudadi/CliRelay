@@ -19,7 +19,6 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -86,7 +85,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	httpResp, err := httpClient.Do(httpReq) //nolint:bodyclose // body is closed by the defer below.
 	if err != nil {
 		recorder.RecordResponseError(err)
-		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), err.Error())
+		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, err.Error())
 		return resp, err
 	}
 	defer func() {
@@ -99,7 +98,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		b := readUpstreamErrorBody(e.Identifier(), httpResp.Body)
 		recorder.AppendResponseChunk(b)
 		logWithRequestID(execCtx.Context).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), string(b))
+		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, string(b))
 		// Parse 402 balance-exhausted into weekly quota cooldown metadata.
 		err = newXAIStatusErr(httpResp.StatusCode, b, httpResp.Header)
 		return resp, err
@@ -138,14 +137,14 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		payload = mergeCodexResponsesCompletedOutput(payload, pendingOutputItems, pendingOutputKeys)
 		if detail, ok := parseCodexUsage(payload); ok {
-			reporter.publishWithContent(execCtx.Context, detail, string(req.Payload), string(data))
+			reporter.publishWithContentBytes(execCtx.Context, detail, req.Payload, string(data))
 		}
 		var param any
 		out := sdktranslator.TranslateNonStream(execCtx.Context, execCtx.Execution.TargetFormat, execCtx.SourceFormat, req.Model, execCtx.OriginalPayload, body, payload, &param)
 		return cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}, nil
 	}
 	if streamErr != nil {
-		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), streamErr.Error())
+		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, streamErr.Error())
 		return resp, streamErr
 	}
 	err = statusErr{code: http.StatusRequestTimeout, msg: "xai stream error: stream disconnected before response.completed"}
@@ -177,7 +176,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	httpResp, err := httpClient.Do(httpReq) //nolint:bodyclose // success body is consumed and closed by the stream goroutine below.
 	if err != nil {
 		recorder.RecordResponseError(err)
-		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), err.Error())
+		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, err.Error())
 		return nil, err
 	}
 	recorder.RecordResponseMetadata(httpResp.StatusCode, httpResp.Header.Clone())
@@ -188,14 +187,14 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		recorder.AppendResponseChunk(data)
 		logWithRequestID(execCtx.Context).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), string(data))
+		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, string(data))
 		// Parse 402 balance-exhausted into weekly quota cooldown metadata.
 		err = newXAIStatusErr(httpResp.StatusCode, data, httpResp.Header)
 		return nil, err
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
-	reporter.setInputContent(string(req.Payload))
+	reporter.setInputContentBytes(req.Payload)
 	go func() {
 		defer close(out)
 		defer func() {
@@ -347,15 +346,18 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, auth *cliprox
 	body = execCtx.ApplyPayloadConfig(body, originalTranslated)
 	body = ensureTranslatedCodexModel(body, execCtx.BaseModel)
 	body = sanitizeCodexResponsesRequest(body)
-	body, _ = sjson.SetBytes(body, "stream", stream)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		sysContent := extractSystemMessagesAsInstructions(execCtx.Request.Payload)
-		body, _ = sjson.SetBytes(body, "instructions", sysContent)
+	sets := map[string][]byte{
+		"stream": util.JSONBool(stream),
 	}
+	if !gjson.GetBytes(body, "instructions").Exists() {
+		sets["instructions"] = util.JSONString(extractSystemMessagesAsInstructions(execCtx.Request.Payload))
+	}
+	body = util.MutateTopLevelObject(body, sets, []string{
+		"previous_response_id",
+		"prompt_cache_retention",
+		"safety_identifier",
+		"stream_options",
+	})
 	return execCtx, body, originalTranslated, nil
 }
 

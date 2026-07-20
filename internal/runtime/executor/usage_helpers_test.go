@@ -14,8 +14,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
+
+func setUsageBodyCaptureForTest(t *testing.T, enabled bool) {
+	t.Helper()
+	previous := internalusage.RequestLogBodyStorageEnabled()
+	internalusage.SetRequestLogBodyStorageEnabled(enabled)
+	t.Cleanup(func() { internalusage.SetRequestLogBodyStorageEnabled(previous) })
+}
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	data := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
@@ -84,6 +92,7 @@ func TestParseOpenAIResponseModel(t *testing.T) {
 }
 
 func TestUsageReporterSpillsLargeStreamingOutputToTempFile(t *testing.T) {
+	setUsageBodyCaptureForTest(t, true)
 	reporter := newUsageReporter(context.Background(), "provider", "model", "", nil)
 	chunk := bytes.Repeat([]byte("x"), usageReporterOutputMemoryLimit/2)
 
@@ -186,6 +195,72 @@ func TestRequestDetailsCaptureUpstreamLogsWhenOnlyContentStorageEnabled(t *testi
 	}
 }
 
+func TestRequestDetailsRedactSensitiveHeadersAndOmitEmptyExchangeSections(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses?api_key=query-secret&safe=value", strings.NewReader(`{"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer downstream-secret")
+	req.Header.Set("Proxy-Authorization", "Basic proxy-secret")
+	req.Header.Set("Cookie", "session=browser-secret")
+	req.Header.Set("X-Api-Key", "api-key-secret")
+	req.Header.Set("X-Auth-Token", "token-secret")
+	req.Header.Set("X-Codex-Session-Id", "session-diagnostic")
+	req.Header.Set("User-Agent", "codex-cli-test")
+	ginCtx.Request = req
+	ctx := context.WithValue(req.Context(), util.ContextKeyGin, ginCtx)
+
+	var detail struct {
+		Client struct {
+			URL                string              `json:"url"`
+			Query              map[string][]string `json:"query"`
+			Headers            map[string][]string `json:"headers"`
+			FingerprintHeaders map[string][]string `json:"fingerprint_headers"`
+		} `json:"client"`
+		Upstream *struct {
+			RequestLog string `json:"request_log"`
+		} `json:"upstream"`
+		Response *struct {
+			UpstreamLog string `json:"upstream_log"`
+		} `json:"response"`
+	}
+	raw := buildRequestDetailContent(ctx, false)
+	if err := json.Unmarshal([]byte(raw), &detail); err != nil {
+		t.Fatalf("unmarshal request details: %v", err)
+	}
+	for _, key := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Auth-Token"} {
+		values := detail.Client.Headers[key]
+		if len(values) != 1 || values[0] != redactedRequestDetailHeaderValue {
+			t.Fatalf("client.headers[%q] = %#v, want redacted", key, values)
+		}
+	}
+	for _, key := range []string{"X-Api-Key", "X-Auth-Token"} {
+		values := detail.Client.FingerprintHeaders[key]
+		if len(values) != 1 || values[0] != redactedRequestDetailHeaderValue {
+			t.Fatalf("client.fingerprint_headers[%q] = %#v, want redacted", key, values)
+		}
+	}
+	if got := detail.Client.Headers["X-Codex-Session-Id"]; len(got) != 1 || got[0] != "session-diagnostic" {
+		t.Fatalf("non-sensitive diagnostic header = %#v, want preserved", got)
+	}
+	if got := detail.Client.Headers["User-Agent"]; len(got) != 1 || got[0] != "codex-cli-test" {
+		t.Fatalf("user-agent = %#v, want preserved", got)
+	}
+	if strings.Contains(detail.Client.URL, "query-secret") || strings.Contains(strings.Join(detail.Client.Query["api_key"], ""), "query-secret") {
+		t.Fatalf("request detail retained sensitive query value: url=%q query=%#v", detail.Client.URL, detail.Client.Query)
+	}
+	if got := detail.Client.Query["safe"]; len(got) != 1 || got[0] != "value" {
+		t.Fatalf("safe query value = %#v, want preserved", got)
+	}
+	for _, secret := range []string{"downstream-secret", "proxy-secret", "browser-secret", "api-key-secret", "token-secret", "query-secret"} {
+		if strings.Contains(raw, secret) {
+			t.Fatalf("request detail retained sensitive value %q", secret)
+		}
+	}
+	if detail.Upstream != nil || detail.Response != nil {
+		t.Fatalf("empty exchange sections should be omitted: upstream=%#v response=%#v", detail.Upstream, detail.Response)
+	}
+}
+
 func TestRequestDetailsPreferForwardedClientIPForCDNRequests(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ginCtx, engine := gin.CreateTestContext(httptest.NewRecorder())
@@ -230,6 +305,7 @@ func TestFirstTokenLatencyMsFromContext(t *testing.T) {
 }
 
 func TestUsageReporterPreservesDirectContentBeforeSpilledChunks(t *testing.T) {
+	setUsageBodyCaptureForTest(t, true)
 	reporter := newUsageReporter(context.Background(), "provider", "model", "", nil)
 	chunk := bytes.Repeat([]byte("x"), usageReporterOutputMemoryLimit+1)
 	reporter.appendOutputChunk(chunk)
@@ -253,6 +329,7 @@ func TestUsageReporterPreservesDirectContentBeforeSpilledChunks(t *testing.T) {
 }
 
 func TestUsageReporterDefersLargeInputContent(t *testing.T) {
+	setUsageBodyCaptureForTest(t, true)
 	reporter := newUsageReporter(context.Background(), "provider", "model", "", nil)
 	input := strings.Repeat("i", usageReporterOutputMemoryLimit+1)
 	reporter.setInputContent(input)
@@ -268,6 +345,19 @@ func TestUsageReporterDefersLargeInputContent(t *testing.T) {
 	}
 	if string(data) != input {
 		t.Fatalf("deferred input content mismatch")
+	}
+}
+
+func TestUsageReporterPreservesStreamingClassificationWithoutBodyCapture(t *testing.T) {
+	setUsageBodyCaptureForTest(t, false)
+	reporter := newUsageReporter(context.Background(), "provider", "model", "", nil)
+	reporter.setInputContent(`{"model":"gpt-5.4","stream":true}`)
+
+	if !reporter.streamingRequest {
+		t.Fatal("streaming request classification should survive disabled body storage")
+	}
+	if reporter.inputContent != "" || reporter.inputPath != "" {
+		t.Fatal("request body must not be retained when body storage is disabled")
 	}
 }
 

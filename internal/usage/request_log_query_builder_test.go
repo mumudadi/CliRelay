@@ -15,12 +15,13 @@ func TestBuildWhereClauseUsesParameterizedFilters(t *testing.T) {
 		APIKeys:               []string{" sk-a ", "sk-b", "SK-B"},
 		Models:                []string{" gpt-5 ", "gpt-4"},
 		Statuses:              []string{"failed"},
+		AuthSubjectIDs:        []string{" authsub_29b975703f03bde1 ", ""},
 		AuthIndexes:           []string{" auth-1 ", ""},
 		AuthIndexChannelNames: map[string][]string{" auth-2 ": {" Legacy ", ""}},
 		ChannelNames:          []string{" Codex ", ""},
 	})
 
-	wantWhere := " WHERE tenant_id = ? AND timestamp >= ? AND (api_key = ? OR api_key = ?) AND model IN (?,?) AND failed = 1 AND (auth_index IN (?) OR (auth_index = ? AND lower(trim(channel_name)) IN (?)) OR lower(trim(channel_name)) IN (?))"
+	wantWhere := " WHERE tenant_id = ? AND timestamp >= ? AND (api_key = ? OR api_key = ?) AND model IN (?,?) AND failed = 1 AND (auth_subject_id IN (?) OR auth_index IN (?) OR (auth_index = ? AND lower(trim(channel_name)) IN (?)) OR lower(trim(channel_name)) IN (?))"
 	if where != wantWhere {
 		t.Fatalf("where = %q, want %q", where, wantWhere)
 	}
@@ -38,7 +39,7 @@ func TestBuildWhereClauseUsesParameterizedFilters(t *testing.T) {
 		t.Fatalf("cutoff arg %q is not RFC3339: %v", cutoff, err)
 	}
 
-	wantArgs := []interface{}{"sk-a", "sk-b", "gpt-5", "gpt-4", "auth-1", "auth-2", "legacy", "codex"}
+	wantArgs := []interface{}{"sk-a", "sk-b", "gpt-5", "gpt-4", "authsub_29b975703f03bde1", "auth-1", "auth-2", "legacy", "codex"}
 	if !reflect.DeepEqual(args[2:], wantArgs) {
 		t.Fatalf("args[2:] = %#v, want %#v", args[2:], wantArgs)
 	}
@@ -104,5 +105,62 @@ func TestBuildSingleAPIKeySelectorClauseUsesStableIdentityWhenAvailable(t *testi
 	wantArgs = []interface{}{"missing-key"}
 	if !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("missing key args = %#v, want %#v", args, wantArgs)
+	}
+}
+
+func TestInferChannelDisplayMeta(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		label        string
+		source       string
+		model        string
+		providerHint string
+		wantProvider string
+		wantAuthType string
+	}{
+		{
+			name:         "opencode go api key",
+			label:        "opencode go",
+			source:       "sk-abc123xyz",
+			model:        "deepseek-v4-flash",
+			wantProvider: "opencode-go",
+			wantAuthType: "api",
+		},
+		{
+			name:         "oauth email codex",
+			label:        "yuan364299311@gmail.com",
+			source:       "yuan364299311@gmail.com",
+			model:        "gpt-5.6-sol",
+			wantProvider: "codex",
+			wantAuthType: "oauth",
+		},
+		{
+			name:         "historical xai by model",
+			label:        "yuan364299311@gmail.com",
+			source:       "yuan364299311@gmail.com",
+			model:        "grok-4.5",
+			wantProvider: "xai",
+			wantAuthType: "oauth",
+		},
+		{
+			name:         "live provider hint wins",
+			label:        "opencode go",
+			source:       "sk-abc",
+			providerHint: "opencode-go",
+			wantProvider: "opencode-go",
+			wantAuthType: "api",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			provider, authType := InferChannelDisplayMeta(tc.label, tc.source, tc.model, tc.providerHint)
+			if provider != tc.wantProvider || authType != tc.wantAuthType {
+				t.Fatalf("got provider/authType = %q/%q, want %q/%q", provider, authType, tc.wantProvider, tc.wantAuthType)
+			}
+		})
 	}
 }

@@ -365,17 +365,21 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	// during in-flight requests do not orphan log records.
 	apiKeyID := strings.TrimSpace(record.APIKeyID)
 	apiKeyName := strings.TrimSpace(record.APIKeyName)
-	if apiKeyName == "" && statsKey != "" {
-		if row := GetAPIKey(statsKey); row != nil && row.Name != "" {
-			apiKeyName = row.Name
+	if statsKey != "" {
+		if row := GetAPIKey(statsKey); row != nil {
+			// Persist the key's own name. Account display name is resolved separately
+			// at read time so the UI can show both user and key identity.
+			if name := strings.TrimSpace(row.Name); name != "" {
+				apiKeyName = name
+			}
 		}
 	}
 	inputContent := resolveDeferredUsageContent(record.InputContent, record.InputContentPath)
 	outputContent := resolveDeferredUsageContent(record.OutputContent, record.OutputContentPath)
 	detailContent := resolveDeferredUsageContent(record.DetailContent, record.DetailContentPath)
-	InsertLogWithDetailsIdentitySubjectUpstreamVision(statsKey, apiKeyID, record.AuthSubjectID, apiKeyName, modelName, record.UpstreamModel, record.VisionFallbackModel, record.Source, record.ChannelName,
+	InsertLogWithDetailsIdentitySubjectUpstreamVisionStreaming(statsKey, apiKeyID, record.AuthSubjectID, apiKeyName, modelName, record.UpstreamModel, record.VisionFallbackModel, record.Source, record.ChannelName,
 		record.AuthIndex, failed, timestamp, record.LatencyMs, record.FirstTokenMs, detail,
-		inputContent, outputContent, detailContent)
+		inputContent, outputContent, detailContent, record.Streaming)
 }
 
 func resolveDeferredUsageContent(inline, path string) string {
@@ -387,6 +391,9 @@ func resolveDeferredUsageContent(inline, path string) string {
 	if err != nil {
 		log.Errorf("usage: read deferred request log content: %v", err)
 		return inline
+	}
+	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Warnf("usage: remove consumed deferred request log content: %v", err)
 	}
 	if inline == "" {
 		return string(data)

@@ -18,96 +18,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// LogRow represents a single request log entry returned by QueryLogs.
-type LogRow struct {
-	ID                  int64     `json:"id"`
-	Timestamp           time.Time `json:"timestamp"`
-	APIKey              string    `json:"api_key"`
-	APIKeyName          string    `json:"api_key_name"`
-	Model               string    `json:"model"`
-	UpstreamModel       string    `json:"upstream_model,omitempty"`
-	VisionFallbackModel string    `json:"vision_fallback_model,omitempty"`
-	Source              string    `json:"source"`
-	ChannelName         string    `json:"channel_name"`
-	Provider            string    `json:"provider,omitempty"`
-	AuthType            string    `json:"auth_type,omitempty"` // "oauth" | "api"
-	AuthIndex           string    `json:"auth_index"`
-	Failed              bool      `json:"failed"`
-	Streaming           bool      `json:"streaming"`
-	LatencyMs           int64     `json:"latency_ms"`
-	FirstTokenMs        int64     `json:"first_token_ms"`
-	InputTokens         int64     `json:"input_tokens"`
-	OutputTokens        int64     `json:"output_tokens"`
-	ReasoningTokens     int64     `json:"reasoning_tokens"`
-	CachedTokens        int64     `json:"cached_tokens"`
-	TotalTokens         int64     `json:"total_tokens"`
-	Cost                float64   `json:"cost"`
-	HasContent          bool      `json:"has_content"`
-}
-
-// LogQueryParams holds filter/pagination parameters for QueryLogs.
-type LogQueryParams struct {
-	TenantID        string
-	Page            int      // 1-based
-	Size            int      // rows per page
-	Days            int      // time range in days
-	APIKey          string   // exact match filter (deprecated, use APIKeys)
-	Model           string   // exact match filter (deprecated, use Models)
-	Status          string   // "success", "failed", or "" (all) (deprecated, use Statuses)
-	APIKeys         []string // multi-value API key filter
-	Models          []string // multi-value model filter
-	Statuses        []string // multi-value status filter
-	MatchNoAPIKeys  bool     // explicit empty API key filter
-	MatchNoModels   bool     // explicit empty model filter
-	MatchNoStatuses bool     // explicit empty status filter
-	MatchNoChannels bool     // explicit empty channel filter
-	AuthIndexes     []string // optional auth_index IN (...) filter
-	ChannelNames    []string // optional channel_name IN (...) filter
-	// Optional precise legacy matches for renamed auth channels whose stored
-	// channel_name was a shared provider/source value.
-	AuthIndexChannelNames map[string][]string
-}
-
-// LogQueryResult holds the paginated query result.
-type LogQueryResult struct {
-	Items []LogRow `json:"items"`
-	Total int64    `json:"total"`
-	Page  int      `json:"page"`
-	Size  int      `json:"size"`
-}
-
-// FilterOptions holds the available filter values for the UI.
-type FilterOptions struct {
-	APIKeys     []string          `json:"api_keys"`
-	APIKeyNames map[string]string `json:"api_key_names"`
-	Models      []string          `json:"models"`
-	// Channels is a legacy plain-name list kept for older clients.
-	// Prefer ChannelOptions when both are present.
-	Channels       []string              `json:"channels"`
-	ChannelOptions []ChannelFilterOption `json:"channel_options,omitempty"`
-	Statuses       []string              `json:"statuses"`
-}
-
-// ChannelFilterOption is one selectable channel in request-log filters.
-// Value is stable for filtering (auth_index when known, otherwise the display name).
-type ChannelFilterOption struct {
-	Value     string `json:"value"`
-	Label     string `json:"label"`
-	Provider  string `json:"provider,omitempty"`
-	AuthType  string `json:"auth_type,omitempty"` // "oauth" | "api"
-	AuthIndex string `json:"auth_index,omitempty"`
-}
-
-// LogStats holds aggregated stats over the filtered result set.
-type LogStats struct {
-	Total         int64   `json:"total"`
-	SuccessRate   float64 `json:"success_rate"`
-	TotalTokens   int64   `json:"total_tokens"`
-	TotalSessions int64   `json:"total_sessions"`
-	TotalCost     float64 `json:"total_cost"`
-	CacheRate     float64 `json:"cache_rate"`
-}
-
 const cacheRateEffectiveInputSQL = "CASE WHEN cached_tokens > input_tokens THEN input_tokens + cached_tokens ELSE input_tokens END"
 
 func cacheRateFromTokenTotals(effectiveInputTokens, cachedTokens int64) float64 {
@@ -115,14 +25,6 @@ func cacheRateFromTokenTotals(effectiveInputTokens, cachedTokens int64) float64 
 		return 0
 	}
 	return float64(cachedTokens) / float64(effectiveInputTokens) * 100
-}
-
-type ClearRequestLogsResult struct {
-	DeletedLogs       int64 `json:"deleted_logs"`
-	DeletedContents   int64 `json:"deleted_contents"`
-	ClearedBodyRows   int64 `json:"cleared_body_rows"`
-	ClearedDetailRows int64 `json:"cleared_detail_rows"`
-	ClearedLegacyRows int64 `json:"cleared_legacy_rows"`
 }
 
 type ClearRequestLogsOptions struct {
@@ -135,12 +37,13 @@ type ClearRequestLogsOptions struct {
 const systemRequestLogFilterValue = "__system__"
 
 var (
-	usageDB     *sql.DB
-	usageReadDB *sql.DB
-	usageDBMu   sync.Mutex
-	usageDBPath string
-	usageDriver string
-	usageLoc    *time.Location
+	usageDBLifecycleMu sync.Mutex
+	usageDB            *sql.DB
+	usageReadDB        *sql.DB
+	usageDBMu          sync.Mutex
+	usageDBPath        string
+	usageDriver        string
+	usageLoc           *time.Location
 )
 
 // DatabaseStats summarizes the active runtime database for management telemetry.
@@ -676,6 +579,9 @@ func startRequestLogContentSessionIDBackfill(db *sql.DB) {
 // InitDB opens (or creates) the SQLite database at the given path and creates
 // the request_logs table if it doesn't exist.
 func InitDB(dbPath string, storageCfg config.RequestLogStorageConfig, loc *time.Location) error {
+	usageDBLifecycleMu.Lock()
+	defer usageDBLifecycleMu.Unlock()
+
 	usageDBMu.Lock()
 	defer usageDBMu.Unlock()
 
@@ -753,6 +659,9 @@ func InitDB(dbPath string, storageCfg config.RequestLogStorageConfig, loc *time.
 }
 
 func InitPostgres(pgCfg config.PostgresConfig, storageCfg config.RequestLogStorageConfig, loc *time.Location) error {
+	usageDBLifecycleMu.Lock()
+	defer usageDBLifecycleMu.Unlock()
+
 	usageDBMu.Lock()
 	defer usageDBMu.Unlock()
 
@@ -788,8 +697,7 @@ func initOpenedDBLocked(db, readDB *sql.DB, dbPath, driver string, storageCfg co
 	usageReadDB = readDB
 	usageDBPath = dbPath
 	usageDriver = driver
-	requestLogStorage = normalizeRequestLogStorageConfig(storageCfg)
-	SetRequestLogBodyStorageEnabled(storageCfg.StoreContent)
+	ApplyRequestLogStorageConfig(storageCfg)
 	if runSQLiteBootstrap {
 		log.Debugf("usage: running tenant scope column migration")
 		migrateRequestLogTenantColumns(db)
@@ -825,7 +733,27 @@ func initOpenedDBLocked(db, readDB *sql.DB, dbPath, driver string, storageCfg co
 		ensureRequestLogDetailIndexes(db)
 	}
 	bootstrapAIAccountStatusReadModels(db, loc)
+	if err := ensureAIAccountSharedSubjectTables(db); err != nil {
+		_ = db.Close()
+		usageDB, usageReadDB = nil, nil
+		return err
+	}
+	if err := loadAIAccountSubjectCycleCache(db); err != nil {
+		_ = db.Close()
+		usageDB, usageReadDB = nil, nil
+		return fmt.Errorf("usage: load shared ai account cycles: %w", err)
+	}
 	if err := bootstrapAPIKeyDailySpendingResets(db); err != nil {
+		_ = db.Close()
+		usageDB, usageReadDB = nil, nil
+		return err
+	}
+	if err := bootstrapAPIKeyDailySpendingResetEvents(db); err != nil {
+		_ = db.Close()
+		usageDB, usageReadDB = nil, nil
+		return err
+	}
+	if err := bootstrapEndUserDailySpendingResets(db); err != nil {
 		_ = db.Close()
 		usageDB, usageReadDB = nil, nil
 		return err
@@ -838,6 +766,13 @@ func initOpenedDBLocked(db, readDB *sql.DB, dbPath, driver string, storageCfg co
 	initAPIKeysTable(db)
 	log.Debugf("usage: backfilling request log api_key_id values")
 	backfillRequestLogAPIKeyIDs(db)
+	// Rollup backfill after api_keys + api_key_id repair so historical rows resolve
+	// stable key/end-user dimensions before marker is set.
+	if err := bootstrapUsageRollup(db, loc); err != nil {
+		_ = db.Close()
+		usageDB, usageReadDB = nil, nil
+		return fmt.Errorf("usage: bootstrap usage rollup: %w", err)
+	}
 	log.Debugf("usage: initializing api_key_permission_profiles table")
 	initAPIKeyPermissionProfilesTable(db)
 	log.Debugf("usage: initializing ccswitch_import_configs table")
@@ -858,20 +793,33 @@ func initOpenedDBLocked(db, readDB *sql.DB, dbPath, driver string, storageCfg co
 
 // CloseDB closes the runtime database gracefully.
 func CloseDB() {
-	usageDBMu.Lock()
-	defer usageDBMu.Unlock()
+	usageDBLifecycleMu.Lock()
+	defer usageDBLifecycleMu.Unlock()
 
+	// Maintenance and in-flight SQLite writes can read usageLoc under usageDBMu.
+	// Stop the worker, then detach the handles under the mutex before waiting for
+	// database/sql to drain them, otherwise shutdown can deadlock on that mutex.
 	stopRequestLogMaintenance()
-	if usageDB != nil {
-		_ = usageDB.Close()
-		usageDB = nil
+
+	usageDBMu.Lock()
+	db := usageDB
+	readDB := usageReadDB
+	usageDB = nil
+	usageReadDB = nil
+	usageDBMu.Unlock()
+
+	if db != nil {
+		_ = db.Close()
 	}
-	if usageReadDB != nil {
-		_ = usageReadDB.Close()
-		usageReadDB = nil
+	if readDB != nil && readDB != db {
+		_ = readDB.Close()
 	}
+
+	usageDBMu.Lock()
 	usageLoc = nil
 	usageDriver = ""
+	usageDBMu.Unlock()
+	resetAIAccountSubjectCycleCache()
 	log.Info("usage: database closed")
 }
 
@@ -880,54 +828,53 @@ func CloseDB() {
 func InsertLog(apiKey, apiKeyName, model, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent string) {
-	insertLogIdentity(apiKey, "", "", apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, "")
+	insertLogIdentity(apiKey, "", "", apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, "", isStreamingRequestContent(inputContent))
 }
 
 func InsertLogWithDetails(apiKey, apiKeyName, model, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent, detailContent string) {
-	insertLogIdentity(apiKey, "", "", apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+	insertLogIdentity(apiKey, "", "", apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent, isStreamingRequestContent(inputContent))
 }
 
 func InsertLogWithDetailsIdentity(apiKey, apiKeyID, apiKeyName, model, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent, detailContent string) {
-	insertLogIdentity(apiKey, apiKeyID, "", apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+	insertLogIdentity(apiKey, apiKeyID, "", apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent, isStreamingRequestContent(inputContent))
 }
 
 func InsertLogWithDetailsIdentitySubject(apiKey, apiKeyID, authSubjectID, apiKeyName, model, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent, detailContent string) {
-	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, "", "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent, isStreamingRequestContent(inputContent))
 }
 
 func InsertLogWithDetailsIdentitySubjectUpstream(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent, detailContent string) {
-	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, "", source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent, isStreamingRequestContent(inputContent))
 }
 
 func InsertLogWithDetailsIdentitySubjectUpstreamVision(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
 	inputContent, outputContent, detailContent string) {
-	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent)
+	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent, isStreamingRequestContent(inputContent))
+}
+
+// InsertLogWithDetailsIdentitySubjectUpstreamVisionStreaming persists an
+// explicit streaming classification even when request body storage is disabled.
+func InsertLogWithDetailsIdentitySubjectUpstreamVisionStreaming(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel, source, channelName, authIndex string,
+	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
+	inputContent, outputContent, detailContent string, streaming bool) {
+	insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel, source, channelName, authIndex, failed, timestamp, latencyMs, firstTokenMs, tokens, inputContent, outputContent, detailContent, streaming)
 }
 
 func insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel, source, channelName, authIndex string,
 	failed bool, timestamp time.Time, latencyMs, firstTokenMs int64, tokens TokenStats,
-	inputContent, outputContent, detailContent string) {
+	inputContent, outputContent, detailContent string, streaming bool) {
 	db := getDB()
 	if db == nil {
 		return
-	}
-
-	failedInt := 0
-	if failed {
-		failedInt = 1
-	}
-	streamingInt := 0
-	if isStreamingRequestContent(inputContent) {
-		streamingInt = 1
 	}
 
 	tenantID := normalizeTenantID(ResolveAPIKeyTenant(apiKey))
@@ -940,33 +887,19 @@ func insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstr
 	apiKeyName = strings.TrimSpace(apiKeyName)
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	visionFallbackModel = strings.TrimSpace(visionFallbackModel)
-	if identity := ResolveAPIKeyIdentity(apiKey); identity != nil {
+	// Resolve identity before opening the write tx: SQLite single-writer + maintenance
+	// would deadlock if we query api_keys while this connection already holds a tx.
+	endUserID := ""
+	if row := GetAPIKey(apiKey); row != nil {
 		if apiKeyID == "" {
-			apiKeyID = identity.ID
+			apiKeyID = strings.TrimSpace(row.ID)
 		}
-		if apiKeyName == "" {
-			apiKeyName = identity.Name
+		if name := strings.TrimSpace(row.Name); name != "" {
+			apiKeyName = name
+		} else if apiKeyName == "" {
+			apiKeyName = strings.TrimSpace(row.Name)
 		}
-	}
-
-	// 插入 request log 的事务由 usage 存储层统一拥有，不从外部 HTTP 请求透传 context，
-	// 以避免请求取消把已经选定要持久化的审计记录中断在半途。
-	tx, err := db.BeginTx(context.Background(), nil)
-	if err != nil {
-		log.Errorf("usage: begin insert tx: %v", err)
-		return
-	}
-
-	insertSQL := `INSERT INTO request_logs
-		(tenant_id, timestamp, api_key, api_key_id, auth_subject_id, api_key_name, model, upstream_model, vision_fallback_model, source, channel_name, auth_index,
-		 failed, streaming, latency_ms, first_token_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, cost)
-	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	insertArgs := []any{
-		tenantID, timestamp.UTC().Format(time.RFC3339Nano),
-		apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel, source, channelName, authIndex,
-		failedInt, streamingInt, latencyMs, firstTokenMs,
-		tokens.InputTokens, tokens.OutputTokens, tokens.ReasoningTokens,
-		tokens.CachedTokens, tokens.TotalTokens, cost,
+		endUserID = strings.TrimSpace(row.EndUserID)
 	}
 
 	// Failed requests always keep a compact error payload in output_content so the
@@ -976,42 +909,28 @@ func insertLogIdentity(apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstr
 	shouldStoreContent := detailContent != "" ||
 		(RequestLogBodyStorageEnabled() && (inputContent != "" || outputContent != "")) ||
 		(failed && strings.TrimSpace(outputContent) != "")
-	if shouldStoreContent {
-		var logID int64
-		if usageDriver == "postgres" {
-			if err := tx.QueryRow(insertSQL+" RETURNING id", insertArgs...).Scan(&logID); err != nil {
-				_ = tx.Rollback()
-				log.Errorf("usage: insert log: %v", err)
-				return
-			}
-		} else {
-			result, err := tx.Exec(insertSQL, insertArgs...)
-			if err != nil {
-				_ = tx.Rollback()
-				log.Errorf("usage: insert log: %v", err)
-				return
-			}
-			var errLastID error
-			logID, errLastID = result.LastInsertId()
-			if errLastID != nil {
-				_ = tx.Rollback()
-				log.Errorf("usage: resolve inserted log id: %v", errLastID)
-				return
-			}
+
+	// Retry on Postgres rollup UPSERT deadlocks under concurrent same-key traffic.
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*attempt) * time.Millisecond)
 		}
-		if errStore := insertLogContentTenantTx(tx, tenantID, logID, timestamp, inputContent, outputContent, detailContent, failed); errStore != nil {
-			_ = tx.Rollback()
-			log.Errorf("usage: insert log content: %v", errStore)
+		lastErr = insertLogIdentityOnce(
+			db, tenantID, apiKey, apiKeyID, authSubjectID, apiKeyName, model, upstreamModel, visionFallbackModel,
+			source, channelName, authIndex, endUserID, failed, streaming, timestamp, latencyMs, firstTokenMs,
+			tokens, cost, inputContent, outputContent, detailContent, shouldStoreContent,
+		)
+		if lastErr == nil {
+			break
+		}
+		if !isRetryableUsageWriteErr(lastErr) {
+			log.Errorf("usage: insert log: %v", lastErr)
 			return
 		}
-	} else if _, err := tx.Exec(insertSQL, insertArgs...); err != nil {
-		_ = tx.Rollback()
-		log.Errorf("usage: insert log: %v", err)
-		return
 	}
-
-	if errCommit := commitLogWithAuthSubjectUsageDaily(tx, tenantID, authSubjectID, failed, cost, timestamp); errCommit != nil {
-		log.Errorf("usage: commit log insert: %v", errCommit)
+	if lastErr != nil {
+		log.Errorf("usage: insert log after retries: %v", lastErr)
 		return
 	}
 
@@ -1089,7 +1008,17 @@ func parseStoredTimeString(value string) (time.Time, bool) {
 	if value == "" {
 		return time.Time{}, false
 	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+	// Include Postgres text forms of timestamptz (space separator, +00 / -07 offsets).
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	} {
 		if parsed, err := time.Parse(layout, value); err == nil {
 			return parsed.UTC(), true
 		}
