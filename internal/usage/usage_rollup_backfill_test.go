@@ -50,7 +50,7 @@ func TestUsageRollupBackfillResolvesLegacyKeyAndEndUser(t *testing.T) {
 	if _, err := getDB().Exec(`UPDATE request_logs SET api_key_id = 'key-bf-1' WHERE api_key = 'sk-bf-legacy'`); err != nil {
 		t.Fatalf("repair key id: %v", err)
 	}
-	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, true); err != nil {
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerDone); err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
 
@@ -96,11 +96,16 @@ func TestUsageRollupBackfillIsReentrantWithoutDoubleCount(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 
-	// Force rebuild twice — absolute rebuild must not double.
-	for i := 0; i < 2; i++ {
-		if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, true); err != nil {
-			t.Fatalf("backfill %d: %v", i, err)
-		}
+	// Absolute rebuild twice while still pending must not double.
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerPending); err != nil {
+		t.Fatalf("backfill 1: %v", err)
+	}
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerDone); err != nil {
+		t.Fatalf("backfill 2: %v", err)
+	}
+	// Once done, further rebuilds are no-ops (would otherwise wipe lifetime history).
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerDone); err != nil {
+		t.Fatalf("backfill 3: %v", err)
 	}
 	var total float64
 	if err := getDB().QueryRow(`
@@ -135,10 +140,13 @@ func TestUsageRollupBlueGreenCatchupIncludesOldSlotRows(t *testing.T) {
 	`, systemTenantID, at.Format(time.RFC3339Nano)); err != nil {
 		t.Fatalf("insert first: %v", err)
 	}
-	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, false); err != nil {
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerPending); err != nil {
 		t.Fatalf("initial backfill: %v", err)
 	}
-	// Simulate old slot writing a detail row without rollup after marker is done.
+	if projectionMarkerValue(getDB(), usageRollupBackfillMarker) != rollupMarkerPending {
+		t.Fatalf("marker after init = %q, want pending", projectionMarkerValue(getDB(), usageRollupBackfillMarker))
+	}
+	// Simulate old slot writing a detail row without rollup while still pending.
 	if _, err := getDB().Exec(`
 		INSERT INTO request_logs
 		(tenant_id, timestamp, api_key, api_key_id, model, source, failed, total_tokens, cost)
@@ -146,18 +154,8 @@ func TestUsageRollupBlueGreenCatchupIncludesOldSlotRows(t *testing.T) {
 	`, systemTenantID, at.Add(time.Minute).Format(time.RFC3339Nano)); err != nil {
 		t.Fatalf("insert old-slot: %v", err)
 	}
-	var before float64
-	if err := getDB().QueryRow(`
-		SELECT COALESCE(SUM(cost_total),0) FROM usage_rollup_buckets
-		WHERE bucket_kind='lifetime' AND api_key_id='key-bg'
-	`).Scan(&before); err != nil {
-		t.Fatalf("before: %v", err)
-	}
-	if before != 1 {
-		t.Fatalf("before catch-up total = %v, want 1", before)
-	}
-	// Force catch-up absolute rebuild (as scheduled after drain).
-	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, true); err != nil {
+	// Post-drain catch-up absolute rebuild includes old-slot row and marks done.
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerDone); err != nil {
 		t.Fatalf("catch-up: %v", err)
 	}
 	var after float64
@@ -169,6 +167,51 @@ func TestUsageRollupBlueGreenCatchupIncludesOldSlotRows(t *testing.T) {
 	}
 	if after != 4 {
 		t.Fatalf("after catch-up total = %v, want 4 (1+3)", after)
+	}
+	if !usageRollupBackfillCompleted(getDB()) {
+		t.Fatal("marker should be done after catch-up")
+	}
+}
+
+func TestUsageRollupCatchupDoesNotWipeLifetimeAfterDetailPurged(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rollup-no-wipe.db")
+	if err := InitDB(dbPath, config.RequestLogStorageConfig{RetentionDays: 7}, time.UTC); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() {
+		stopRequestLogMaintenance()
+		CloseDB()
+	})
+	if err := UpsertAPIKey(APIKeyRow{ID: "key-keep", Key: "sk-keep"}); err != nil {
+		t.Fatalf("UpsertAPIKey: %v", err)
+	}
+	// Seed lifetime-only history that no longer has detail rows.
+	if _, err := getDB().Exec(`
+		INSERT INTO usage_rollup_buckets (
+			tenant_id, bucket_kind, bucket_start, api_key_id, end_user_id, auth_subject_id,
+			model, source, channel_name, request_count, success_count, failure_count, streaming_count,
+			input_tokens, output_tokens, reasoning_tokens, cached_tokens, effective_input_tokens,
+			total_tokens, cost_total, latency_sum_ms, latency_count, first_token_sum_ms, first_token_count, updated_at
+		) VALUES (?, 'lifetime', ?, 'key-keep', '', '', '', '', '', 100, 100, 0, 0, 0, 0, 0, 0, 0, 100, 50, 0, 0, 0, 0, ?)
+	`, systemTenantID, rollupLifetimeStart, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed lifetime: %v", err)
+	}
+	if err := setProjectionMarker(getDB(), usageRollupBackfillMarker, rollupMarkerDone); err != nil {
+		t.Fatalf("marker done: %v", err)
+	}
+	// Catch-up after done must no-op and preserve lifetime history.
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerDone); err != nil {
+		t.Fatalf("catch-up: %v", err)
+	}
+	var total float64
+	if err := getDB().QueryRow(`
+		SELECT COALESCE(SUM(cost_total),0) FROM usage_rollup_buckets
+		WHERE bucket_kind='lifetime' AND api_key_id='key-keep'
+	`).Scan(&total); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if total != 50 {
+		t.Fatalf("lifetime cost after catch-up = %v, want 50 preserved", total)
 	}
 }
 
@@ -213,7 +256,7 @@ func TestMetadataCleanupWaitsForRollupBackfillMarker(t *testing.T) {
 		t.Fatalf("request_logs count = %d, want 1 preserved until backfill", count)
 	}
 	// After marker, retention cleanup may delete the old row.
-	if err := setProjectionMarker(getDB(), usageRollupBackfillMarker, "done"); err != nil {
+	if err := setProjectionMarker(getDB(), usageRollupBackfillMarker, rollupMarkerDone); err != nil {
 		t.Fatalf("set marker: %v", err)
 	}
 	n, err = cleanupExpiredRequestLogMetadata(context.Background(), getDB())
@@ -241,10 +284,10 @@ func TestUsageRollupBackfillDoesNotMarkDoneOnReadFailure(t *testing.T) {
 	if _, err := getDB().Exec(`DELETE FROM usage_projection_markers WHERE marker_key = ?`, usageRollupBackfillMarker); err != nil {
 		t.Fatalf("clear marker: %v", err)
 	}
-	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, true); err == nil {
+	if err := runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerDone); err == nil {
 		t.Fatal("expected backfill error when request_logs missing")
 	}
-	if projectionMarkerValue(getDB(), usageRollupBackfillMarker) == "done" {
+	if projectionMarkerValue(getDB(), usageRollupBackfillMarker) == rollupMarkerDone {
 		t.Fatal("marker must not be done after failed backfill")
 	}
 }

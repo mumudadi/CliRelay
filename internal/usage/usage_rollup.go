@@ -67,7 +67,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_subject_day
   ON usage_rollup_buckets(tenant_id, bucket_kind, auth_subject_id, bucket_start);
 `
 	// Bump marker when rebuild semantics change so upgrades re-run once.
-	usageRollupBackfillMarker = "usage_rollup_buckets_v2"
+	usageRollupBackfillMarker = "usage_rollup_buckets_v3"
+	rollupMarkerPending      = "pending"
+	rollupMarkerDone         = "done"
 )
 
 type rollupEvent struct {
@@ -106,25 +108,36 @@ func bootstrapUsageRollup(db *sql.DB, loc *time.Location) error {
 
 // RunUsageRollupBackfillAtInit rebuilds usage_rollup_buckets from surviving request_logs.
 // Must run after api_keys are imported and end_user_id ownership is populated.
+// Leaves marker as "pending" so a post-drain catch-up can include old-slot rows
+// before detail cleanup is allowed ("done").
 func RunUsageRollupBackfillAtInit() error {
-	return runUsageRollupBackfillAtInitDB(getDB(), getUsageLocation(), false)
+	return runUsageRollupBackfillAtInitDB(getDB(), getUsageLocation(), rollupMarkerPending)
 }
 
-// ScheduleUsageRollupBlueGreenCatchup waits for old-slot drain, then force-rebuilds
-// rollup from all surviving request_logs so rows written by the previous binary
-// (without projection) are not permanently missing after marker is set.
+// ScheduleUsageRollupBlueGreenCatchup waits for old-slot drain, then absolute-rebuilds
+// once more and marks done. Only runs while marker is not yet done — never wipes
+// lifetime rollup after detail retention has already pruned request_logs.
 func ScheduleUsageRollupBlueGreenCatchup() {
 	go func() {
-		// Cover blue-green drain (~35s) plus cutover lag; run twice for safety.
-		delays := []time.Duration{90 * time.Second, 90 * time.Second}
-		for i, d := range delays {
-			time.Sleep(d)
-			if err := runUsageRollupBackfillAtInitDB(getDB(), getUsageLocation(), true); err != nil {
-				log.Errorf("usage: blue-green rollup catch-up %d failed: %v", i+1, err)
-				continue
-			}
-			log.Infof("usage: blue-green rollup catch-up %d completed", i+1)
+		// Cover blue-green drain (~35s) plus cutover lag.
+		time.Sleep(90 * time.Second)
+		db := getDB()
+		if usageRollupBackfillCompleted(db) {
+			return
 		}
+		if err := runUsageRollupBackfillAtInitDB(db, getUsageLocation(), rollupMarkerDone); err != nil {
+			log.Errorf("usage: blue-green rollup catch-up failed: %v", err)
+			// Retry once after another drain window.
+			time.Sleep(90 * time.Second)
+			if usageRollupBackfillCompleted(getDB()) {
+				return
+			}
+			if err := runUsageRollupBackfillAtInitDB(getDB(), getUsageLocation(), rollupMarkerDone); err != nil {
+				log.Errorf("usage: blue-green rollup catch-up retry failed: %v", err)
+				return
+			}
+		}
+		log.Info("usage: blue-green rollup catch-up marked done")
 	}()
 }
 
@@ -132,19 +145,22 @@ func usageRollupBackfillCompleted(db *sql.DB) bool {
 	if db == nil {
 		return false
 	}
-	return projectionMarkerValue(db, usageRollupBackfillMarker) == "done"
+	return projectionMarkerValue(db, usageRollupBackfillMarker) == rollupMarkerDone
 }
 
-// runUsageRollupBackfillAtInitDB rebuilds rollup from surviving request_logs.
-// force=true re-runs even when marker is done (post-drain catch-up).
-// Absolute rebuild holds usageProjectionMu exclusively so live writers pause briefly.
-func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, force bool) error {
+// runUsageRollupBackfillAtInitDB absolute-rebuilds rollup from surviving request_logs.
+// No-op when marker is already "done" (lifetime history may only live in rollup).
+// finalMarker is "pending" (init) or "done" (post-drain catch-up).
+func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker string) error {
 	if db == nil {
 		return nil
 	}
 	ensureUsageProjectionMarkerTable(db)
-	if !force && projectionMarkerValue(db, usageRollupBackfillMarker) == "done" {
+	if projectionMarkerValue(db, usageRollupBackfillMarker) == rollupMarkerDone {
 		return nil
+	}
+	if finalMarker != rollupMarkerPending && finalMarker != rollupMarkerDone {
+		finalMarker = rollupMarkerPending
 	}
 	if loc == nil {
 		loc = time.Local
@@ -282,11 +298,11 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, force bool) 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err = tx.Exec(`
 		INSERT INTO usage_projection_markers (marker_key, marker_value, updated_at)
-		VALUES (?, 'done', ?)
+		VALUES (?, ?, ?)
 		ON CONFLICT(marker_key) DO UPDATE SET
 			marker_value = excluded.marker_value,
 			updated_at = excluded.updated_at
-	`, usageRollupBackfillMarker, now); err != nil {
+	`, usageRollupBackfillMarker, finalMarker, now); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("usage: rollup backfill marker: %w", err)
 	}
