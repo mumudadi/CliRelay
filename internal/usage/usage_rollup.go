@@ -122,7 +122,8 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {
 	keyIDToEndUser := map[string]string{}
 	secretToEndUser := map[string]string{}
 	secretToKeyID := map[string]string{}
-	keyRows, err := db.Query(`SELECT id, key, COALESCE(end_user_id,'') FROM api_keys`)
+	// end_user_id is UUID on Postgres; cast to text so empty COALESCE works on both drivers.
+	keyRows, err := db.Query(`SELECT id, key, COALESCE(CAST(end_user_id AS TEXT), '') FROM api_keys`)
 	if err != nil {
 		// api_keys missing is fatal for correct ownership; do not write marker.
 		return fmt.Errorf("usage: rollup backfill query api_keys: %w", err)
