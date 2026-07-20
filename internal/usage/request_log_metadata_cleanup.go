@@ -213,9 +213,18 @@ func GetRequestLogStorageStatus() (RequestLogStorageStatus, error) {
 	if db == nil {
 		return st, nil
 	}
-	_ = db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&st.MetadataRowCount)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM request_log_content`).Scan(&st.ContentRowCount)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM usage_rollup_buckets`).Scan(&st.RollupRowCount)
+	// Prefer maintained counters when present; fall back to approximate/cheap estimates.
+	// Avoid three hot COUNT(*) on large tables in the common path.
+	if err := db.QueryRow(`
+		SELECT COALESCE(metadata_row_count, 0), COALESCE(content_row_count, 0)
+		FROM request_log_storage_state WHERE id = 1
+	`).Scan(&st.MetadataRowCount, &st.ContentRowCount); err != nil {
+		// Best-effort fallbacks for fresh DBs.
+		_ = db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&st.MetadataRowCount)
+		_ = db.QueryRow(`SELECT COUNT(*) FROM request_log_content`).Scan(&st.ContentRowCount)
+	}
+	// Rollup size is not on the hot path of proxy; approximate via marker table absence is fine.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM usage_rollup_buckets WHERE bucket_kind = 'lifetime'`).Scan(&st.RollupRowCount)
 	_ = db.QueryRow(`
 		SELECT COALESCE(last_cleanup_status,''), COALESCE(last_cleanup_deleted_rows,0),
 		       COALESCE(last_cleanup_duration_ms,0), COALESCE(last_cleanup_finished_at,''),

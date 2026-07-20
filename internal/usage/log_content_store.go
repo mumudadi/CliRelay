@@ -305,6 +305,12 @@ func runRequestLogMaintenancePass(ctx context.Context, db *sql.DB, driver string
 		return
 	}
 
+	if n, err := cleanupExpiredUsageRollupBuckets(db); err != nil {
+		log.Errorf("usage: prune usage rollup buckets: %v", err)
+	} else if n > 0 {
+		log.Infof("usage: pruned %d expired usage_rollup_buckets rows", n)
+	}
+
 	cleanupStarted := time.Now()
 	metaDeleted, metaErr := cleanupExpiredRequestLogMetadata(ctx, db)
 	if metaErr != nil {

@@ -733,11 +733,6 @@ func initOpenedDBLocked(db, readDB *sql.DB, dbPath, driver string, storageCfg co
 		ensureRequestLogDetailIndexes(db)
 	}
 	bootstrapAIAccountStatusReadModels(db, loc)
-	if err := bootstrapUsageRollup(db, loc); err != nil {
-		_ = db.Close()
-		usageDB, usageReadDB = nil, nil
-		return fmt.Errorf("usage: bootstrap usage rollup: %w", err)
-	}
 	if err := bootstrapAPIKeyDailySpendingResets(db); err != nil {
 		_ = db.Close()
 		usageDB, usageReadDB = nil, nil
@@ -761,6 +756,13 @@ func initOpenedDBLocked(db, readDB *sql.DB, dbPath, driver string, storageCfg co
 	initAPIKeysTable(db)
 	log.Debugf("usage: backfilling request log api_key_id values")
 	backfillRequestLogAPIKeyIDs(db)
+	// Rollup backfill after api_keys + api_key_id repair so historical rows resolve
+	// stable key/end-user dimensions before marker is set.
+	if err := bootstrapUsageRollup(db, loc); err != nil {
+		_ = db.Close()
+		usageDB, usageReadDB = nil, nil
+		return fmt.Errorf("usage: bootstrap usage rollup: %w", err)
+	}
 	log.Debugf("usage: initializing api_key_permission_profiles table")
 	initAPIKeyPermissionProfilesTable(db)
 	log.Debugf("usage: initializing ccswitch_import_configs table")

@@ -13,7 +13,11 @@ const (
 	rollupBucketDay      = "day"
 	rollupBucketLifetime = "lifetime"
 	rollupLifetimeStart  = "1970-01-01"
-	usageRollupSchemaSQL = `
+	// minute: 24h, hour: 30d, day: 400d (covers 365d heatmap + buffer)
+	rollupMinuteRetention = 24 * time.Hour
+	rollupHourRetention   = 30 * 24 * time.Hour
+	rollupDayRetention    = 400 * 24 * time.Hour
+	usageRollupSchemaSQL  = `
 CREATE TABLE IF NOT EXISTS usage_rollup_buckets (
   tenant_id               TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
   bucket_kind             TEXT NOT NULL,
@@ -55,23 +59,25 @@ CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_user_day
 CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_subject_day
   ON usage_rollup_buckets(tenant_id, bucket_kind, auth_subject_id, bucket_start);
 `
+	// Bump marker when rebuild semantics change so upgrades re-run once.
+	usageRollupBackfillMarker = "usage_rollup_buckets_v2"
 )
 
 type rollupEvent struct {
-	TenantID       string
-	APIKeyID       string
-	EndUserID      string
-	AuthSubjectID  string
-	Model          string
-	Source         string
-	ChannelName    string
-	Failed         bool
-	Streaming      bool
-	LatencyMs      int64
-	FirstTokenMs   int64
-	Tokens         TokenStats
-	Cost           float64
-	At             time.Time
+	TenantID      string
+	APIKeyID      string
+	EndUserID     string
+	AuthSubjectID string
+	Model         string
+	Source        string
+	ChannelName   string
+	Failed        bool
+	Streaming     bool
+	LatencyMs     int64
+	FirstTokenMs  int64
+	Tokens        TokenStats
+	Cost          float64
+	At            time.Time
 }
 
 func ensureUsageRollupTables(db *sql.DB) error {
@@ -84,18 +90,16 @@ func ensureUsageRollupTables(db *sql.DB) error {
 	return nil
 }
 
-const usageRollupBackfillMarker = "usage_rollup_buckets_v1"
-
 func bootstrapUsageRollup(db *sql.DB, loc *time.Location) error {
 	if err := ensureUsageRollupTables(db); err != nil {
 		return err
 	}
-	// One-shot reentrant backfill of surviving request_logs into rollup before
-	// maintenance can prune them. Marker prevents replaying on every restart.
 	// Caller must pass loc — do not call getUsageLocation while holding usageDBMu.
 	return runUsageRollupBackfillAtInitDB(db, loc)
 }
 
+// runUsageRollupBackfillAtInitDB rebuilds rollup from surviving request_logs once.
+// Reentrancy: if marker is missing, DELETE rollup then absolute rebuild + marker in one tx.
 func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {
 	if db == nil {
 		return nil
@@ -107,7 +111,35 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {
 	if loc == nil {
 		loc = time.Local
 	}
-	// Materialize rows first: SQLite MaxOpenConns=1 cannot Query+Begin concurrently.
+
+	// Resolve end_user_id from api_keys after identity tables exist.
+	// Map by api_key_id first, then raw secret for legacy empty-id rows.
+	keyIDToEndUser := map[string]string{}
+	secretToEndUser := map[string]string{}
+	secretToKeyID := map[string]string{}
+	if keyRows, err := db.Query(`SELECT id, key, COALESCE(end_user_id,'') FROM api_keys`); err == nil {
+		for keyRows.Next() {
+			var id, key, endUser string
+			if err := keyRows.Scan(&id, &key, &endUser); err != nil {
+				_ = keyRows.Close()
+				return fmt.Errorf("usage: rollup backfill scan api_keys: %w", err)
+			}
+			id = strings.TrimSpace(id)
+			key = strings.TrimSpace(key)
+			endUser = strings.TrimSpace(endUser)
+			if id != "" {
+				keyIDToEndUser[id] = endUser
+			}
+			if key != "" {
+				secretToEndUser[key] = endUser
+				if id != "" {
+					secretToKeyID[key] = id
+				}
+			}
+		}
+		_ = keyRows.Close()
+	}
+
 	type backfillRow struct {
 		ev rollupEvent
 	}
@@ -117,26 +149,25 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {
 		       COALESCE(model,''), COALESCE(source,''), COALESCE(channel_name,''),
 		       failed, streaming, latency_ms, first_token_ms,
 		       input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens,
-		       cost, timestamp
+		       cost, timestamp, COALESCE(api_key,'')
 		FROM request_logs
 	`)
 	if err != nil {
-		// Empty / missing table during early tests.
 		return setProjectionMarker(db, usageRollupBackfillMarker, "done")
 	}
 	for rows.Next() {
 		var (
-			tenantID, apiKeyID, authSubjectID, model, source, channel, ts string
-			failed, streaming                                             int
-			latencyMs, firstTokenMs                                       int64
-			inTok, outTok, reasonTok, cachedTok, totalTok                 int64
-			cost                                                          float64
+			tenantID, apiKeyID, authSubjectID, model, source, channel, ts, apiKey string
+			failed, streaming                                                     int
+			latencyMs, firstTokenMs                                               int64
+			inTok, outTok, reasonTok, cachedTok, totalTok                         int64
+			cost                                                                  float64
 		)
 		if err = rows.Scan(
 			&tenantID, &apiKeyID, &authSubjectID, &model, &source, &channel,
 			&failed, &streaming, &latencyMs, &firstTokenMs,
 			&inTok, &outTok, &reasonTok, &cachedTok, &totalTok,
-			&cost, &ts,
+			&cost, &ts, &apiKey,
 		); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("usage: rollup backfill scan: %w", err)
@@ -145,9 +176,22 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {
 		if !ok {
 			continue
 		}
+		apiKeyID = strings.TrimSpace(apiKeyID)
+		apiKey = strings.TrimSpace(apiKey)
+		endUserID := ""
+		if apiKeyID != "" {
+			endUserID = keyIDToEndUser[apiKeyID]
+		}
+		if endUserID == "" && apiKey != "" {
+			endUserID = secretToEndUser[apiKey]
+		}
+		if apiKeyID == "" && apiKey != "" {
+			apiKeyID = secretToKeyID[apiKey]
+		}
 		events = append(events, backfillRow{ev: rollupEvent{
 			TenantID:      tenantID,
 			APIKeyID:      apiKeyID,
+			EndUserID:     endUserID,
 			AuthSubjectID: authSubjectID,
 			Model:         model,
 			Source:        source,
@@ -170,13 +214,15 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {
 	}
 	_ = rows.Close()
 
-	if len(events) == 0 {
-		return setProjectionMarker(db, usageRollupBackfillMarker, "done")
-	}
-
+	// Single transaction: wipe incomplete projection + rebuild + marker.
+	// Prevents double-count if process dies between commit and marker write.
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("usage: rollup backfill begin: %w", err)
+	}
+	if _, err = tx.Exec(`DELETE FROM usage_rollup_buckets`); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("usage: rollup backfill clear: %w", err)
 	}
 	for _, item := range events {
 		if err = projectUsageRollupTx(tx, item.ev); err != nil {
@@ -184,10 +230,21 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {
 			return err
 		}
 	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = tx.Exec(`
+		INSERT INTO usage_projection_markers (marker_key, marker_value, updated_at)
+		VALUES (?, 'done', ?)
+		ON CONFLICT(marker_key) DO UPDATE SET
+			marker_value = excluded.marker_value,
+			updated_at = excluded.updated_at
+	`, usageRollupBackfillMarker, now); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("usage: rollup backfill marker: %w", err)
+	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("usage: rollup backfill commit: %w", err)
 	}
-	return setProjectionMarker(db, usageRollupBackfillMarker, "done")
+	return nil
 }
 
 func rollupBucketStarts(at time.Time, loc *time.Location) map[string]string {
@@ -327,4 +384,38 @@ func commitLogWithProjections(tx *sql.Tx, ev rollupEvent) error {
 		return err
 	}
 	return nil
+}
+
+// cleanupExpiredUsageRollupBuckets prunes minute/hour/day buckets past retention.
+// lifetime buckets are never deleted.
+func cleanupExpiredUsageRollupBuckets(db *sql.DB) (int64, error) {
+	if db == nil {
+		return 0, nil
+	}
+	loc := usageLoc
+	if loc == nil {
+		loc = time.Local
+	}
+	now := time.Now().In(loc)
+	cuts := []struct {
+		kind string
+		from string
+	}{
+		{rollupBucketMinute, now.Add(-rollupMinuteRetention).Format("2006-01-02T15:04")},
+		{rollupBucketHour, now.Add(-rollupHourRetention).Format("2006-01-02T15")},
+		{rollupBucketDay, now.Add(-rollupDayRetention).Format("2006-01-02")},
+	}
+	var deleted int64
+	for _, c := range cuts {
+		res, err := db.Exec(`
+			DELETE FROM usage_rollup_buckets
+			WHERE bucket_kind = ? AND bucket_start < ?
+		`, c.kind, c.from)
+		if err != nil {
+			return deleted, fmt.Errorf("usage: prune rollup %s: %w", c.kind, err)
+		}
+		n, _ := res.RowsAffected()
+		deleted += n
+	}
+	return deleted, nil
 }
