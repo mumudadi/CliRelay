@@ -75,8 +75,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_subject_day
 `
 	// Bump marker when rebuild semantics change so upgrades re-run once.
 	usageRollupBackfillMarker = "usage_rollup_buckets_v3"
-	rollupMarkerPending      = "pending"
-	rollupMarkerDone         = "done"
+	rollupMarkerPending       = "pending"
+	rollupMarkerDone          = "done"
 )
 
 type rollupEvent struct {

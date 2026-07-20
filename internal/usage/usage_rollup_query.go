@@ -7,18 +7,18 @@ import (
 )
 
 type rollupAgg struct {
-	RequestCount          int64
-	SuccessCount          int64
-	FailureCount          int64
-	InputTokens           int64
-	OutputTokens          int64
-	ReasoningTokens       int64
-	CachedTokens          int64
-	EffectiveInputTokens  int64
-	TotalTokens           int64
-	CostTotal             float64
-	LatencySumMs          int64
-	LatencyCount          int64
+	RequestCount         int64
+	SuccessCount         int64
+	FailureCount         int64
+	InputTokens          int64
+	OutputTokens         int64
+	ReasoningTokens      int64
+	CachedTokens         int64
+	EffectiveInputTokens int64
+	TotalTokens          int64
+	CostTotal            float64
+	LatencySumMs         int64
+	LatencyCount         int64
 }
 
 func (a rollupAgg) toLogStats() LogStats {
@@ -37,15 +37,15 @@ func (a rollupAgg) toLogStats() LogStats {
 
 func (a rollupAgg) toDashboardKPI() DashboardKPI {
 	kpi := DashboardKPI{
-		TotalRequests:    a.RequestCount,
-		SuccessRequests:  a.SuccessCount,
-		FailedRequests:   a.FailureCount,
-		InputTokens:      a.InputTokens,
-		OutputTokens:     a.OutputTokens,
-		ReasoningTokens:  a.ReasoningTokens,
-		CachedTokens:     a.CachedTokens,
-		TotalTokens:      a.TotalTokens,
-		TotalCost:        a.CostTotal,
+		TotalRequests:   a.RequestCount,
+		SuccessRequests: a.SuccessCount,
+		FailedRequests:  a.FailureCount,
+		InputTokens:     a.InputTokens,
+		OutputTokens:    a.OutputTokens,
+		ReasoningTokens: a.ReasoningTokens,
+		CachedTokens:    a.CachedTokens,
+		TotalTokens:     a.TotalTokens,
+		TotalCost:       a.CostTotal,
 	}
 	if a.RequestCount > 0 {
 		kpi.SuccessRate = float64(a.SuccessCount) / float64(a.RequestCount) * 100

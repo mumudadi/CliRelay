@@ -32,13 +32,13 @@ func TestUsageRollupSurvivesDetailDelete(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := projectUsageRollupTx(tx, rollupEvent{
-		TenantID:  systemTenantID,
-		APIKeyID:  "key-1",
-		Model:     "gpt-test",
-		Source:    "openai",
-		Tokens:    TokenStats{InputTokens: 100, OutputTokens: 50, CachedTokens: 20, TotalTokens: 150},
-		Cost:      0.02,
-		At:        now,
+		TenantID: systemTenantID,
+		APIKeyID: "key-1",
+		Model:    "gpt-test",
+		Source:   "openai",
+		Tokens:   TokenStats{InputTokens: 100, OutputTokens: 50, CachedTokens: 20, TotalTokens: 150},
+		Cost:     0.02,
+		At:       now,
 	}); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("project: %v", err)
@@ -96,13 +96,13 @@ func TestQueryStatsDoesNotRequireRequestLogs(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := projectUsageRollupTx(tx, rollupEvent{
-		TenantID:  systemTenantID,
-		APIKeyID:  "key-guard",
-		Model:     "m",
-		Source:    "s",
-		Tokens:    TokenStats{InputTokens: 10, TotalTokens: 10},
-		Cost:      0.01,
-		At:        time.Now().UTC(),
+		TenantID: systemTenantID,
+		APIKeyID: "key-guard",
+		Model:    "m",
+		Source:   "s",
+		Tokens:   TokenStats{InputTokens: 10, TotalTokens: 10},
+		Cost:     0.01,
+		At:       time.Now().UTC(),
 	}); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("project: %v", err)

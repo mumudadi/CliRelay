@@ -34,14 +34,14 @@ func TestDashboardQueriesAreTenantScoped(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := projectUsageRollupTx(tx, rollupEvent{
-			TenantID: tenantID,
-			Model:    "model",
-			Source:   "source",
+			TenantID:    tenantID,
+			Model:       "model",
+			Source:      "source",
 			ChannelName: "channel",
-			Failed:   failed,
-			Tokens:   TokenStats{InputTokens: in, OutputTokens: out, TotalTokens: total},
-			Cost:     cost,
-			At:       now,
+			Failed:      failed,
+			Tokens:      TokenStats{InputTokens: in, OutputTokens: out, TotalTokens: total},
+			Cost:        cost,
+			At:          now,
 		}); err != nil {
 			_ = tx.Rollback()
 			t.Fatal(err)

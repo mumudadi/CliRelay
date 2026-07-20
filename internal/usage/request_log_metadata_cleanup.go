@@ -184,22 +184,22 @@ func recordCleanupPass(deleted int64, started time.Time, status, errMsg string) 
 
 // RequestLogStorageStatus is exposed to management UI.
 type RequestLogStorageStatus struct {
-	RetentionDays            int    `json:"retention_days"`
-	ContentRetentionDays     int    `json:"content_retention_days"`
-	CleanupEnabled           bool   `json:"cleanup_enabled"`
-	CleanupIntervalMinutes   int    `json:"cleanup_interval_minutes"`
-	MaxRows                  int    `json:"max_rows"`
-	MaxMetadataSizeMB        int    `json:"max_metadata_size_mb"`
-	MaxTotalSizeMB           int    `json:"max_total_size_mb"`
-	MetadataRowCount         int64  `json:"metadata_row_count"`
-	ContentRowCount          int64  `json:"content_row_count"`
-	RollupRowCount           int64  `json:"rollup_row_count"`
-	LastCleanupStatus        string `json:"last_cleanup_status"`
-	LastCleanupDeletedRows   int64  `json:"last_cleanup_deleted_rows"`
-	LastCleanupDurationMs    int64  `json:"last_cleanup_duration_ms"`
-	LastCleanupFinishedAt    string `json:"last_cleanup_finished_at,omitempty"`
-	LastCleanupError         string `json:"last_cleanup_error,omitempty"`
-	StatsNote                string `json:"stats_note"`
+	RetentionDays          int    `json:"retention_days"`
+	ContentRetentionDays   int    `json:"content_retention_days"`
+	CleanupEnabled         bool   `json:"cleanup_enabled"`
+	CleanupIntervalMinutes int    `json:"cleanup_interval_minutes"`
+	MaxRows                int    `json:"max_rows"`
+	MaxMetadataSizeMB      int    `json:"max_metadata_size_mb"`
+	MaxTotalSizeMB         int    `json:"max_total_size_mb"`
+	MetadataRowCount       int64  `json:"metadata_row_count"`
+	ContentRowCount        int64  `json:"content_row_count"`
+	RollupRowCount         int64  `json:"rollup_row_count"`
+	LastCleanupStatus      string `json:"last_cleanup_status"`
+	LastCleanupDeletedRows int64  `json:"last_cleanup_deleted_rows"`
+	LastCleanupDurationMs  int64  `json:"last_cleanup_duration_ms"`
+	LastCleanupFinishedAt  string `json:"last_cleanup_finished_at,omitempty"`
+	LastCleanupError       string `json:"last_cleanup_error,omitempty"`
+	StatsNote              string `json:"stats_note"`
 }
 
 func GetRequestLogStorageStatus() (RequestLogStorageStatus, error) {
