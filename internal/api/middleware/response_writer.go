@@ -43,6 +43,7 @@ type ResponseWriterWrapper struct {
 	ginCtx              *gin.Context               // ginCtx allows propagating first-response timing into usage records.
 	statusCode          int                        // statusCode stores the HTTP status code of the response.
 	headers             map[string][]string        // headers stores the response headers.
+	headersCaptured     bool                       // headersCaptured avoids cloning immutable response headers per stream chunk.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
 	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
 }
@@ -79,31 +80,30 @@ func (w *ResponseWriterWrapper) Unwrap() http.ResponseWriter {
 // CRITICAL: This method prioritizes writing to the client to ensure zero latency,
 // handling logging operations subsequently.
 func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
-	// Ensure headers are captured before first write
-	// This is critical because Write() may trigger WriteHeader() internally
-	w.ensureHeadersCaptured()
+	loggingEnabled := w.loggingEnabled()
+	if loggingEnabled {
+		w.ensureHeadersCaptured()
+	}
 
-	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.Write(data)
-
 	if n > 0 {
 		w.markFirstResponseWrite()
 	}
 
-	// THEN: Handle logging based on response type
-	if w.isStreaming && w.chunkChannel != nil {
-		// For streaming responses: Send to async logging channel (non-blocking)
+	if loggingEnabled && w.isStreaming && w.chunkChannel != nil {
 		select {
-		case w.chunkChannel <- append([]byte(nil), data...): // Non-blocking send with copy
-		default: // Channel full, skip logging to avoid blocking
+		case w.chunkChannel <- append([]byte(nil), data...):
+		default:
 		}
 		return n, err
 	}
 
 	if w.shouldBufferResponseBody() {
+		if !loggingEnabled {
+			w.ensureHeadersCaptured()
+		}
 		w.body.Write(data)
 	}
-
 	return n, err
 }
 
@@ -129,17 +129,17 @@ func (w *ResponseWriterWrapper) shouldBufferResponseBody() bool {
 // Some handlers (and fmt/io helpers) write via io.StringWriter; without this override, those writes
 // bypass Write() and would be missing from request logs.
 func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
-	w.ensureHeadersCaptured()
+	loggingEnabled := w.loggingEnabled()
+	if loggingEnabled {
+		w.ensureHeadersCaptured()
+	}
 
-	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.WriteString(data)
-
 	if n > 0 {
 		w.markFirstResponseWrite()
 	}
 
-	// THEN: Capture for logging
-	if w.isStreaming && w.chunkChannel != nil {
+	if loggingEnabled && w.isStreaming && w.chunkChannel != nil {
 		select {
 		case w.chunkChannel <- []byte(data):
 		default:
@@ -148,6 +148,9 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 	}
 
 	if w.shouldBufferResponseBody() {
+		if !loggingEnabled {
+			w.ensureHeadersCaptured()
+		}
 		w.body.WriteString(data)
 	}
 	return n, err
@@ -158,40 +161,38 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 // and initializes the appropriate logging mechanism (standard or streaming).
 func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
+	loggingEnabled := w.loggingEnabled()
+	captureError := w.logOnErrorOnly && statusCode >= http.StatusBadRequest
+	w.closeStreamingLogWriter()
+	if loggingEnabled || captureError {
+		w.ensureHeadersCaptured()
+		w.hydrateRequestInfoBody(w.ginCtx)
+		if captureError {
+			w.hydrateRequestInfoHeaders(w.ginCtx)
+		}
 
-	// Capture response headers using the new method
-	w.captureCurrentHeaders()
-	w.hydrateRequestInfoBody(w.ginCtx)
+		contentType := w.ResponseWriter.Header().Get("Content-Type")
+		w.isStreaming = loggingEnabled && w.detectStreaming(contentType)
 
-	// Detect streaming based on Content-Type
-	contentType := w.ResponseWriter.Header().Get("Content-Type")
-	w.isStreaming = w.detectStreaming(contentType)
-
-	// If streaming, initialize streaming log writer
-	if w.isStreaming && w.logger.IsEnabled() {
-		requestBody := w.extractRequestBody(w.ginCtx)
-		streamWriter, err := w.logger.LogStreamingRequest(
-			w.requestInfo.URL,
-			w.requestInfo.Method,
-			w.requestInfo.Headers,
-			requestBody,
-			w.requestInfo.RequestID,
-		)
-		if err == nil {
-			w.streamWriter = streamWriter
-			w.chunkChannel = make(chan []byte, 100) // Buffered channel for async writes
-			doneChan := make(chan struct{})
-			w.streamDone = doneChan
-
-			// Start async chunk processor
-			go w.processStreamingChunks(doneChan, streamWriter, w.chunkChannel)
-
-			// Write status immediately
-			_ = streamWriter.WriteStatus(statusCode, w.headers)
+		if w.isStreaming {
+			requestBody := w.extractRequestBody(w.ginCtx)
+			streamWriter, err := w.logger.LogStreamingRequest(
+				w.requestInfo.URL,
+				w.requestInfo.Method,
+				w.requestInfo.Headers,
+				requestBody,
+				w.requestInfo.RequestID,
+			)
+			if err == nil {
+				w.streamWriter = streamWriter
+				w.chunkChannel = make(chan []byte, 100)
+				doneChan := make(chan struct{})
+				w.streamDone = doneChan
+				go w.processStreamingChunks(doneChan, streamWriter, w.chunkChannel)
+				_ = streamWriter.WriteStatus(statusCode, w.headers)
+			}
 		}
 	}
-
-	// Call original WriteHeader
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
@@ -199,8 +200,14 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 // It is safe to call this method multiple times; it will always refresh the headers
 // with the latest state from the underlying ResponseWriter.
 func (w *ResponseWriterWrapper) ensureHeadersCaptured() {
-	// Always capture the current headers to ensure we have the latest state
+	if w == nil || w.headersCaptured {
+		return
+	}
 	w.captureCurrentHeaders()
+}
+
+func (w *ResponseWriterWrapper) loggingEnabled() bool {
+	return w != nil && w.logger != nil && w.logger.IsEnabled()
 }
 
 // captureCurrentHeaders reads all headers from the underlying ResponseWriter and stores them
@@ -213,11 +220,9 @@ func (w *ResponseWriterWrapper) captureCurrentHeaders() {
 
 	// Capture all current headers from the underlying ResponseWriter
 	for key, values := range w.ResponseWriter.Header() {
-		// Make a copy of the values slice to avoid reference issues
-		headerValues := make([]string, len(values))
-		copy(headerValues, values)
-		w.headers[key] = headerValues
+		w.headers[key] = append([]string(nil), values...)
 	}
+	w.headersCaptured = true
 }
 
 func (w *ResponseWriterWrapper) markFirstResponseWrite() {
@@ -302,41 +307,77 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest
 	diagnostics.RecordResponse(c, finalStatusCode, w.body.Bytes())
 	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
+	if forceLog {
+		w.hydrateRequestInfoHeaders(c)
+		w.hydrateRequestInfoBody(c)
+		w.ensureHeadersCaptured()
+	}
+	// Stream writers create request-body-*.tmp / response-body-*.tmp as soon as
+	// WriteHeader runs. Always close them even when request-log is later disabled
+	// mid-request, otherwise the logs dir fills with orphaned spool files that
+	// historically bypassed logs-max-total-size-mb.
+	if w.streamWriter != nil {
+		return w.finalizeStreamingLog(c, forceLog)
+	}
 	if !w.logger.IsEnabled() && !forceLog {
 		return nil
 	}
 
-	if w.isStreaming && w.streamWriter != nil {
-		if w.chunkChannel != nil {
-			close(w.chunkChannel)
-			w.chunkChannel = nil
-		}
+	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.body.Bytes(), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+}
 
-		if w.streamDone != nil {
-			<-w.streamDone
-			w.streamDone = nil
-		}
-
-		w.streamWriter.SetFirstChunkTimestamp(w.firstChunkTimestamp)
-
-		// Write API Request and Response to the streaming log before closing
-		apiRequest := w.extractAPIRequest(c)
-		if len(apiRequest) > 0 {
-			_ = w.streamWriter.WriteAPIRequest(apiRequest)
-		}
-		apiResponse := w.extractAPIResponse(c)
-		if len(apiResponse) > 0 {
-			_ = w.streamWriter.WriteAPIResponse(apiResponse)
-		}
-		if err := w.streamWriter.Close(); err != nil {
-			w.streamWriter = nil
-			return err
-		}
-		w.streamWriter = nil
+func (w *ResponseWriterWrapper) finalizeStreamingLog(c *gin.Context, forceLog bool) error {
+	writer := w.streamWriter
+	if writer == nil {
+		w.closeStreamingLogWriter()
 		return nil
 	}
 
-	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.body.Bytes(), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+	// Drop spool temps without writing a final request log when logging is off.
+	if !w.logger.IsEnabled() && !forceLog {
+		w.closeStreamingLogWriter()
+		return nil
+	}
+
+	if w.chunkChannel != nil {
+		close(w.chunkChannel)
+		w.chunkChannel = nil
+	}
+	if w.streamDone != nil {
+		<-w.streamDone
+		w.streamDone = nil
+	}
+
+	w.streamWriter = nil
+	writer.SetFirstChunkTimestamp(w.firstChunkTimestamp)
+
+	apiRequest := w.extractAPIRequest(c)
+	if len(apiRequest) > 0 {
+		_ = writer.WriteAPIRequest(apiRequest)
+	}
+	apiResponse := w.extractAPIResponse(c)
+	if len(apiResponse) > 0 {
+		_ = writer.WriteAPIResponse(apiResponse)
+	}
+	return writer.Close()
+}
+
+func (w *ResponseWriterWrapper) closeStreamingLogWriter() {
+	if w == nil {
+		return
+	}
+	if w.chunkChannel != nil {
+		close(w.chunkChannel)
+		w.chunkChannel = nil
+	}
+	if w.streamDone != nil {
+		<-w.streamDone
+		w.streamDone = nil
+	}
+	if w.streamWriter != nil {
+		_ = w.streamWriter.Close()
+		w.streamWriter = nil
+	}
 }
 
 func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {
@@ -393,6 +434,21 @@ func (w *ResponseWriterWrapper) extractRequestBody(c *gin.Context) []byte {
 		return w.requestInfo.Body
 	}
 	return nil
+}
+
+func (w *ResponseWriterWrapper) hydrateRequestInfoHeaders(c *gin.Context) map[string][]string {
+	if w == nil || w.requestInfo == nil {
+		return nil
+	}
+	if w.requestInfo.Headers != nil {
+		return w.requestInfo.Headers
+	}
+	if c == nil || c.Request == nil {
+		w.requestInfo.Headers = map[string][]string{}
+		return w.requestInfo.Headers
+	}
+	w.requestInfo.Headers = cloneHTTPHeader(c.Request.Header)
+	return w.requestInfo.Headers
 }
 
 func (w *ResponseWriterWrapper) hydrateRequestInfoBody(c *gin.Context) []byte {

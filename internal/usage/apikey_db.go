@@ -45,16 +45,17 @@ func backfillAPIKeyNames(db *sql.DB) {
 // It only migrates if the api_keys table is empty AND the config has entries.
 // After migration, it backs up config.yaml and re-saves it without the API key
 // fields so the YAML file stays clean.
-func MigrateAPIKeysFromConfig(cfg *config.Config, configFilePath string) int {
+// Fail-closed: DB query/write errors return err so callers do not mark one-shot
+// end-user backfill complete against an incomplete key set.
+func MigrateAPIKeysFromConfig(cfg *config.Config, configFilePath string) (int, error) {
 	db := getDB()
 	if db == nil || cfg == nil {
-		return 0
+		return 0, nil
 	}
 
 	var count int64
 	if err := db.QueryRow("SELECT COUNT(*) FROM api_keys").Scan(&count); err != nil {
-		log.Errorf("usage: migration count api_keys: %v", err)
-		return 0
+		return 0, err
 	}
 	if count > 0 {
 		cfg.APIKeys = nil
@@ -62,7 +63,7 @@ func MigrateAPIKeysFromConfig(cfg *config.Config, configFilePath string) int {
 		if configFilePath != "" {
 			cleanAPIKeysFromYAML(configFilePath)
 		}
-		return 0
+		return 0, nil
 	}
 
 	seen := make(map[string]struct{})
@@ -109,12 +110,11 @@ func MigrateAPIKeysFromConfig(cfg *config.Config, configFilePath string) int {
 	}
 
 	if len(rows) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	if err := apiKeyStore().ReplaceAll(rows); err != nil {
-		log.Errorf("usage: migrate api_keys into SQLite: %v", err)
-		return 0
+		return 0, err
 	}
 
 	log.Infof("usage: migrated %d API keys from config to SQLite", len(rows))
@@ -128,7 +128,7 @@ func MigrateAPIKeysFromConfig(cfg *config.Config, configFilePath string) int {
 		}
 	}
 
-	return len(rows)
+	return len(rows), nil
 }
 
 // EffectiveAPIKeyRow applies the currently linked permission profile to an API key row.
@@ -171,14 +171,16 @@ func ListAllAPIKeys() []APIKeyRow {
 	return apiKeyStore().ListAll()
 }
 
-// GetAPIKey retrieves a single API key entry by key string.
+// GetAPIKey retrieves a single API key entry by globally unique key string.
+// The secret is the input used to discover tenant scope, so this lookup must
+// not be pinned to the system tenant.
 func GetAPIKey(key string) *APIKeyRow {
-	return apiKeyStore().Get(key)
+	return apiKeyStore().GetAnyTenant(key)
 }
 
-// GetAPIKeyByID retrieves a single API key entry by stable id.
+// GetAPIKeyByID retrieves a single API key entry by globally unique stable id.
 func GetAPIKeyByID(id string) *APIKeyRow {
-	return apiKeyStore().GetByID(id)
+	return apiKeyStore().GetByIDAnyTenant(id)
 }
 
 // UpsertAPIKey inserts or updates an API key entry.
@@ -247,6 +249,7 @@ func toPermissionProfileSnapshots(profiles []APIKeyPermissionProfileRow) []sqlap
 			ID:                   profile.ID,
 			DailyLimit:           profile.DailyLimit,
 			TotalQuota:           profile.TotalQuota,
+			DailySpendingLimit:   profile.DailySpendingLimit,
 			ConcurrencyLimit:     profile.ConcurrencyLimit,
 			RPMLimit:             profile.RPMLimit,
 			TPMLimit:             profile.TPMLimit,

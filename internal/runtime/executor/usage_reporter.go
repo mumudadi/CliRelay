@@ -8,12 +8,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 const usageReporterOutputMemoryLimit = 256 * 1024
@@ -34,6 +36,9 @@ type usageReporter struct {
 	requestedAt         time.Time
 	once                sync.Once
 	contentMu           sync.Mutex
+	captureFullContent  bool
+	streamingRequest    bool
+	compactOutputFull   atomic.Bool
 
 	// Content captured for log detail viewer
 	inputContent  string
@@ -47,12 +52,13 @@ type usageReporter struct {
 func newUsageReporter(ctx context.Context, provider, model, upstreamModel string, auth *cliproxyauth.Auth) *usageReporter {
 	apiKey := apiKeyFromContext(ctx)
 	reporter := &usageReporter{
-		provider:      provider,
-		model:         model,
-		upstreamModel: upstreamModel,
-		requestedAt:   time.Now(),
-		apiKey:        apiKey,
-		source:        resolveUsageSource(auth, apiKey),
+		provider:           provider,
+		model:              model,
+		upstreamModel:      upstreamModel,
+		requestedAt:        time.Now(),
+		apiKey:             apiKey,
+		source:             resolveUsageSource(auth, apiKey),
+		captureFullContent: internalusage.RequestLogBodyStorageEnabled(),
 	}
 	if identity := internalusage.ResolveAPIKeyIdentity(apiKey); identity != nil {
 		reporter.apiKeyID = identity.ID
@@ -74,10 +80,20 @@ func (r *usageReporter) publish(ctx context.Context, detail coreusage.Detail) {
 }
 
 func (r *usageReporter) publishWithContent(ctx context.Context, detail coreusage.Detail, inputContent, outputContent string) {
-	r.contentMu.Lock()
-	r.setInputContentLocked(inputContent)
-	r.outputContent = outputContent
-	r.contentMu.Unlock()
+	r.publishWithContentBytes(ctx, detail, []byte(inputContent), outputContent)
+}
+
+func (r *usageReporter) publishWithContentBytes(ctx context.Context, detail coreusage.Detail, inputContent []byte, outputContent string) {
+	if r == nil {
+		return
+	}
+	r.streamingRequest = isStreamingUsageRequestBytes(inputContent)
+	if r.captureFullContent {
+		r.contentMu.Lock()
+		r.setInputContentLocked(string(inputContent))
+		r.outputContent = outputContent
+		r.contentMu.Unlock()
+	}
 	r.publishWithOutcome(ctx, detail, false)
 }
 
@@ -116,12 +132,31 @@ func (r *usageReporter) setVisionFallbackModel(model string) {
 // setInputContent stores the request payload for inclusion in usage records.
 // Call before starting the streaming goroutine.
 func (r *usageReporter) setInputContent(content string) {
+	r.setInputContentBytes([]byte(content))
+}
+
+// setInputContentBytes is the hot-path form: never force a string(payload) copy when
+// store-content is off and we only need the stream flag.
+func (r *usageReporter) setInputContentBytes(content []byte) {
 	if r == nil {
+		return
+	}
+	r.streamingRequest = isStreamingUsageRequestBytes(content)
+	if !r.captureFullContent {
 		return
 	}
 	r.contentMu.Lock()
 	defer r.contentMu.Unlock()
-	r.setInputContentLocked(content)
+	r.setInputContentLocked(string(content))
+}
+
+func isStreamingUsageRequest(content string) bool {
+	return isStreamingUsageRequestBytes([]byte(content))
+}
+
+func isStreamingUsageRequestBytes(content []byte) bool {
+	// Only read top-level "stream"; full Unmarshal on multi-MB bodies was a hot alloc path.
+	return gjson.GetBytes(content, "stream").Bool()
 }
 
 // appendOutputChunk accumulates a streaming response line for inclusion in usage records.
@@ -129,8 +164,32 @@ func (r *usageReporter) appendOutputChunk(chunk []byte) {
 	if r == nil || len(chunk) == 0 {
 		return
 	}
+	if !r.captureFullContent && r.compactOutputFull.Load() {
+		return
+	}
+
 	r.contentMu.Lock()
 	defer r.contentMu.Unlock()
+
+	if !r.captureFullContent {
+		const compactLimit = internalusage.MaxFailedOutputContentBytes
+		remaining := compactLimit - r.outputBuilder.Len()
+		if remaining <= 0 {
+			r.compactOutputFull.Store(true)
+			return
+		}
+		if len(chunk) > remaining {
+			chunk = chunk[:remaining]
+		}
+		r.outputBuilder.Write(chunk)
+		if r.outputBuilder.Len() < compactLimit {
+			r.outputBuilder.WriteByte('\n')
+		}
+		if r.outputBuilder.Len() >= compactLimit {
+			r.compactOutputFull.Store(true)
+		}
+		return
+	}
 
 	if r.outputFile == nil && r.outputBuilder.Len()+len(chunk)+1 > usageReporterOutputMemoryLimit {
 		if err := r.spillOutputBuilderToFileLocked(); err != nil {
@@ -163,15 +222,24 @@ func (r *usageReporter) publishFailure(ctx context.Context) {
 // request payload and the upstream error response body so that the error
 // is visible in the management UI error-detail modal.
 func (r *usageReporter) publishFailureWithContent(ctx context.Context, inputContent, outputContent string) {
+	r.publishFailureWithContentBytes(ctx, []byte(inputContent), outputContent)
+}
+
+func (r *usageReporter) publishFailureWithContentBytes(ctx context.Context, inputContent []byte, outputContent string) {
 	if r == nil {
 		return
 	}
 	if shouldSuppressUsageFailure(nil, outputContent) {
 		return
 	}
+	r.streamingRequest = isStreamingUsageRequestBytes(inputContent)
 	r.contentMu.Lock()
-	r.setInputContentLocked(inputContent)
-	r.outputContent = outputContent
+	if r.captureFullContent {
+		r.setInputContentLocked(string(inputContent))
+		r.outputContent = outputContent
+	} else {
+		r.outputContent = internalusage.CompactFailedOutputContent(outputContent)
+	}
 	r.contentMu.Unlock()
 	r.publishWithOutcome(ctx, coreusage.Detail{}, true)
 }
@@ -186,7 +254,11 @@ func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
 		}
 		r.contentMu.Lock()
 		if r.outputContent == "" && r.outputBuilder.Len() == 0 && r.outputFile == nil {
-			r.outputContent = structuredUpstreamErrorJSON(*errPtr)
+			output := structuredUpstreamErrorJSON(*errPtr)
+			if !r.captureFullContent {
+				output = internalusage.CompactFailedOutputContent(output)
+			}
+			r.outputContent = output
 		}
 		r.contentMu.Unlock()
 		r.publishFailure(ctx)
@@ -254,8 +326,8 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail coreusage
 		return
 	}
 	r.once.Do(func() {
-		inputContent, outputContent, inputPath, outputPath := r.finalizeContent()
-		detailContent, detailPath := deferLargeContent("cliproxy-usage-detail-*", buildRequestDetailContent(ctx))
+		inputContent, outputContent, inputPath, outputPath := r.finalizeContentForOutcome(failed)
+		detailContent, detailPath := deferLargeContent("cliproxy-usage-detail-*", buildRequestDetailContent(ctx, r.captureFullContent))
 		latencyMs := time.Since(r.requestedAt).Milliseconds()
 		if latencyMs < 0 {
 			latencyMs = 0
@@ -282,6 +354,7 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail coreusage
 			APIIdentifier:       apiIdentifier,
 			RequestID:           requestID,
 			ResponseStatus:      responseStatus,
+			Streaming:           r.streamingRequest,
 			Detail:              detail,
 			InputContent:        inputContent,
 			OutputContent:       outputContent,
@@ -302,8 +375,8 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		inputContent, outputContent, inputPath, outputPath := r.finalizeContent()
-		detailContent, detailPath := deferLargeContent("cliproxy-usage-detail-*", buildRequestDetailContent(ctx))
+		inputContent, outputContent, inputPath, outputPath := r.finalizeContentForOutcome(false)
+		detailContent, detailPath := deferLargeContent("cliproxy-usage-detail-*", buildRequestDetailContent(ctx, r.captureFullContent))
 		latencyMs := time.Since(r.requestedAt).Milliseconds()
 		if latencyMs < 0 {
 			latencyMs = 0
@@ -330,6 +403,7 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 			APIIdentifier:       apiIdentifier,
 			RequestID:           requestID,
 			ResponseStatus:      responseStatus,
+			Streaming:           r.streamingRequest,
 			Detail:              coreusage.Detail{},
 			InputContent:        inputContent,
 			OutputContent:       outputContent,
@@ -360,6 +434,49 @@ func (r *usageReporter) spillOutputBuilderToFileLocked() error {
 	r.outputFile = file
 	r.outputPath = file.Name()
 	return nil
+}
+
+func (r *usageReporter) finalizeContentForOutcome(failed bool) (string, string, string, string) {
+	if r == nil {
+		return "", "", "", ""
+	}
+	if r.captureFullContent || failed {
+		input, output, inputPath, outputPath := r.finalizeContent()
+		if !r.captureFullContent {
+			input = ""
+			if inputPath != "" {
+				_ = os.Remove(inputPath)
+				inputPath = ""
+			}
+			output = internalusage.CompactFailedOutputContent(output)
+		}
+		return input, output, inputPath, outputPath
+	}
+	r.discardContent()
+	return "", "", "", ""
+}
+
+func (r *usageReporter) discardContent() {
+	if r == nil {
+		return
+	}
+	r.contentMu.Lock()
+	defer r.contentMu.Unlock()
+	if r.inputPath != "" {
+		_ = os.Remove(r.inputPath)
+	}
+	if r.outputFile != nil {
+		_ = r.outputFile.Close()
+	}
+	if r.outputPath != "" {
+		_ = os.Remove(r.outputPath)
+	}
+	r.inputContent = ""
+	r.inputPath = ""
+	r.outputContent = ""
+	r.outputBuilder.Reset()
+	r.outputFile = nil
+	r.outputPath = ""
 }
 
 func (r *usageReporter) finalizeContent() (string, string, string, string) {
