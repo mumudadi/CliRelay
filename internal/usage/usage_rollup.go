@@ -103,6 +103,13 @@ func RunUsageRollupBackfillAtInit() error {
 	return runUsageRollupBackfillAtInitDB(getDB(), getUsageLocation())
 }
 
+func usageRollupBackfillCompleted(db *sql.DB) bool {
+	if db == nil {
+		return false
+	}
+	return projectionMarkerValue(db, usageRollupBackfillMarker) == "done"
+}
+
 // runUsageRollupBackfillAtInitDB rebuilds rollup from surviving request_logs once.
 // Reentrancy: if marker is missing, DELETE rollup then absolute rebuild + marker in one tx.
 func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location) error {

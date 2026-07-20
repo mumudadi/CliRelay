@@ -117,6 +117,59 @@ func TestUsageRollupBackfillIsReentrantWithoutDoubleCount(t *testing.T) {
 	}
 }
 
+func TestMetadataCleanupWaitsForRollupBackfillMarker(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cleanup-gate.db")
+	enabled := true
+	if err := InitDB(dbPath, config.RequestLogStorageConfig{
+		RetentionDays:            1,
+		CleanupEnabled:           &enabled,
+		CleanupBatchSize:         100,
+		CleanupMaxRuntimeSeconds: 10,
+	}, time.UTC); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() {
+		stopRequestLogMaintenance()
+		CloseDB()
+	})
+	// Clear marker to simulate upgrade before backfill.
+	if _, err := getDB().Exec(`DELETE FROM usage_projection_markers WHERE marker_key = ?`, usageRollupBackfillMarker); err != nil {
+		t.Fatalf("clear marker: %v", err)
+	}
+	oldTS := time.Now().UTC().AddDate(0, 0, -30).Format(time.RFC3339Nano)
+	if _, err := getDB().Exec(`
+		INSERT INTO request_logs (tenant_id, timestamp, api_key, model, source, failed, total_tokens, cost)
+		VALUES (?, ?, 'sk-old', 'm', 's', 0, 1, 1)
+	`, systemTenantID, oldTS); err != nil {
+		t.Fatalf("insert old: %v", err)
+	}
+	n, err := cleanupExpiredRequestLogMetadata(context.Background(), getDB())
+	if err != nil {
+		t.Fatalf("cleanup before marker: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("deleted %d rows before backfill marker, want 0", n)
+	}
+	var count int64
+	if err := getDB().QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("request_logs count = %d, want 1 preserved until backfill", count)
+	}
+	// After marker, retention cleanup may delete the old row.
+	if err := setProjectionMarker(getDB(), usageRollupBackfillMarker, "done"); err != nil {
+		t.Fatalf("set marker: %v", err)
+	}
+	n, err = cleanupExpiredRequestLogMetadata(context.Background(), getDB())
+	if err != nil {
+		t.Fatalf("cleanup after marker: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deleted %d after marker, want 1", n)
+	}
+}
+
 func TestUsageRollupBackfillDoesNotMarkDoneOnReadFailure(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "rollup-fail.db")
 	if err := InitDB(dbPath, config.RequestLogStorageConfig{RetentionDays: 7}, time.UTC); err != nil {

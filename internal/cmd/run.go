@@ -142,6 +142,7 @@ func initializeRuntimeDataStack(cfg *config.Config, configPath string, loc *time
 		log.Infof("enduser: backfilled %d end users from api keys", created)
 	}
 	// After keys + end-user ownership are stable, rebuild usage rollup once.
+	// Metadata cleanup is gated on this marker so detail retention cannot run first.
 	if err := usage.RunUsageRollupBackfillAtInit(); err != nil {
 		return fmt.Errorf("usage rollup backfill: %w", err)
 	}
