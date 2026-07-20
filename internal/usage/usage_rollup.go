@@ -450,7 +450,9 @@ func projectUsageRollupTx(tx *sql.Tx, ev rollupEvent) error {
 			updated_at = excluded.updated_at
 	`
 
-	for kind, start := range starts {
+	// Fixed order avoids Postgres deadlocks when concurrent writers UPSERT the same key.
+	for _, kind := range []string{rollupBucketMinute, rollupBucketHour, rollupBucketDay, rollupBucketLifetime} {
+		start := starts[kind]
 		if _, err := tx.Exec(upsertSQL,
 			ev.TenantID, kind, start,
 			ev.APIKeyID, ev.EndUserID, ev.AuthSubjectID,
