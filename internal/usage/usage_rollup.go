@@ -14,6 +14,13 @@ import (
 // catch-up rebuilds cannot race mid-UPSERT.
 var usageProjectionMu sync.RWMutex
 
+// Earliest wall time when pending→done finalize is allowed (after blue-green drain).
+// Zero means not scheduled / allow only explicit init pending rebuild.
+var (
+	rollupCatchupEarliestMu sync.Mutex
+	rollupCatchupEarliest   time.Time
+)
+
 const (
 	rollupBucketMinute   = "minute"
 	rollupBucketHour     = "hour"
@@ -119,9 +126,16 @@ func RunUsageRollupBackfillAtInit() error {
 // lifetime rollup after detail retention has already pruned request_logs.
 // Retries until success so a single failed catch-up cannot leave cleanup gated forever.
 func ScheduleUsageRollupBlueGreenCatchup() {
+	// Maintenance must not finalize before this instant (drain + cutover lag).
+	rollupCatchupEarliestMu.Lock()
+	rollupCatchupEarliest = time.Now().Add(90 * time.Second)
+	earliest := rollupCatchupEarliest
+	rollupCatchupEarliestMu.Unlock()
+
 	go func() {
-		// First attempt after blue-green drain (~35s) plus cutover lag.
-		time.Sleep(90 * time.Second)
+		if d := time.Until(earliest); d > 0 {
+			time.Sleep(d)
+		}
 		attempt := 0
 		for {
 			db := getDB()
@@ -148,14 +162,19 @@ func usageRollupBackfillCompleted(db *sql.DB) bool {
 	return projectionMarkerValue(db, usageRollupBackfillMarker) == rollupMarkerDone
 }
 
-// maybeFinalizeUsageRollupCatchup is called from maintenance: if still pending after
-// startup, keep trying to finish catch-up without relying only on the one-shot goroutine.
+// maybeFinalizeUsageRollupCatchup is called from maintenance as a backup finalizer.
+// It never runs before rollupCatchupEarliest (drain window) so it cannot race old slot.
 func maybeFinalizeUsageRollupCatchup(db *sql.DB) {
 	if db == nil || usageRollupBackfillCompleted(db) {
 		return
 	}
-	// Only finalize when marker is explicitly pending (not missing/failed).
 	if projectionMarkerValue(db, usageRollupBackfillMarker) != rollupMarkerPending {
+		return
+	}
+	rollupCatchupEarliestMu.Lock()
+	earliest := rollupCatchupEarliest
+	rollupCatchupEarliestMu.Unlock()
+	if earliest.IsZero() || time.Now().Before(earliest) {
 		return
 	}
 	if err := runUsageRollupBackfillAtInitDB(db, getUsageLocation(), rollupMarkerDone); err != nil {
@@ -173,17 +192,23 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker 
 		return nil
 	}
 	ensureUsageProjectionMarkerTable(db)
-	if projectionMarkerValue(db, usageRollupBackfillMarker) == rollupMarkerDone {
-		return nil
-	}
 	if finalMarker != rollupMarkerPending && finalMarker != rollupMarkerDone {
 		finalMarker = rollupMarkerPending
 	}
 	if loc == nil {
 		loc = time.Local
 	}
+
+	// Exclusive rebuild: re-check marker under lock so concurrent finalizers cannot
+	// double-DELETE after the first writer already marked done and cleanup ran.
 	usageProjectionMu.Lock()
 	defer usageProjectionMu.Unlock()
+
+	current := projectionMarkerValue(db, usageRollupBackfillMarker)
+	if current == rollupMarkerDone {
+		return nil
+	}
+	// pending→pending rebuild is allowed (init retry); pending→done is catch-up.
 
 	// Resolve end_user_id from api_keys after identity tables exist.
 	// Map by api_key_id first, then raw secret for legacy empty-id rows.

@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -170,6 +171,92 @@ func TestUsageRollupBlueGreenCatchupIncludesOldSlotRows(t *testing.T) {
 	}
 	if !usageRollupBackfillCompleted(getDB()) {
 		t.Fatal("marker should be done after catch-up")
+	}
+}
+
+func TestUsageRollupMaintenanceDoesNotFinalizeBeforeDrainWindow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rollup-early.db")
+	if err := InitDB(dbPath, config.RequestLogStorageConfig{RetentionDays: 7}, time.UTC); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() {
+		stopRequestLogMaintenance()
+		CloseDB()
+	})
+	// Simulate init pending without scheduling catch-up (earliest zero).
+	if err := setProjectionMarker(getDB(), usageRollupBackfillMarker, rollupMarkerPending); err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	rollupCatchupEarliestMu.Lock()
+	rollupCatchupEarliest = time.Time{}
+	rollupCatchupEarliestMu.Unlock()
+	maybeFinalizeUsageRollupCatchup(getDB())
+	if projectionMarkerValue(getDB(), usageRollupBackfillMarker) != rollupMarkerPending {
+		t.Fatalf("marker = %q, want pending when drain window not open", projectionMarkerValue(getDB(), usageRollupBackfillMarker))
+	}
+	// Future earliest still blocks.
+	rollupCatchupEarliestMu.Lock()
+	rollupCatchupEarliest = time.Now().Add(time.Hour)
+	rollupCatchupEarliestMu.Unlock()
+	maybeFinalizeUsageRollupCatchup(getDB())
+	if projectionMarkerValue(getDB(), usageRollupBackfillMarker) != rollupMarkerPending {
+		t.Fatalf("marker = %q, want pending before earliest", projectionMarkerValue(getDB(), usageRollupBackfillMarker))
+	}
+	// Past earliest allows finalize.
+	rollupCatchupEarliestMu.Lock()
+	rollupCatchupEarliest = time.Now().Add(-time.Second)
+	rollupCatchupEarliestMu.Unlock()
+	maybeFinalizeUsageRollupCatchup(getDB())
+	if !usageRollupBackfillCompleted(getDB()) {
+		t.Fatal("marker should be done after earliest elapsed")
+	}
+}
+
+func TestUsageRollupConcurrentFinalizeDoesNotWipeAfterDone(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rollup-concurrent.db")
+	if err := InitDB(dbPath, config.RequestLogStorageConfig{RetentionDays: 7}, time.UTC); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() {
+		stopRequestLogMaintenance()
+		CloseDB()
+	})
+	if err := UpsertAPIKey(APIKeyRow{ID: "key-c", Key: "sk-c"}); err != nil {
+		t.Fatalf("UpsertAPIKey: %v", err)
+	}
+	// Lifetime-only history + done marker.
+	if _, err := getDB().Exec(`
+		INSERT INTO usage_rollup_buckets (
+			tenant_id, bucket_kind, bucket_start, api_key_id, end_user_id, auth_subject_id,
+			model, source, channel_name, request_count, success_count, failure_count, streaming_count,
+			input_tokens, output_tokens, reasoning_tokens, cached_tokens, effective_input_tokens,
+			total_tokens, cost_total, latency_sum_ms, latency_count, first_token_sum_ms, first_token_count, updated_at
+		) VALUES (?, 'lifetime', ?, 'key-c', '', '', '', '', '', 10, 10, 0, 0, 0, 0, 0, 0, 0, 10, 99, 0, 0, 0, 0, ?)
+	`, systemTenantID, rollupLifetimeStart, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := setProjectionMarker(getDB(), usageRollupBackfillMarker, rollupMarkerDone); err != nil {
+		t.Fatalf("done: %v", err)
+	}
+	// Concurrent "finalize" attempts must no-op under lock re-check.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = runUsageRollupBackfillAtInitDB(getDB(), time.UTC, rollupMarkerDone)
+		}()
+	}
+	wg.Wait()
+	var total float64
+	if err := getDB().QueryRow(`
+		SELECT COALESCE(SUM(cost_total),0) FROM usage_rollup_buckets
+		WHERE bucket_kind='lifetime' AND api_key_id='key-c'
+	`).Scan(&total); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if total != 99 {
+		t.Fatalf("lifetime cost after concurrent finalize = %v, want 99", total)
 	}
 }
 
