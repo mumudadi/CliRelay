@@ -1043,7 +1043,12 @@ func queryDistinctStatuses(db *sql.DB, params LogQueryParams) ([]string, error) 
 }
 
 func queryDistinctAPIKeys(db *sql.DB, params LogQueryParams) ([]string, map[string]string, error) {
-	currentByID := currentAPIKeyRowsByID()
+	tenantID := normalizeTenantID(params.TenantID)
+	currentByID := currentAPIKeyRowsByIDForTenant(tenantID)
+	currentByKey := currentAPIKeyRowsByKeyForTenant(tenantID)
+	// One filter option per end-user account (not per key). Owned keys collapse
+	// onto a representative secret so "测试 key" never appears next to "Kittors".
+	repByEndUser, nameByEndUser := accountFilterRepresentatives(tenantID)
 	where, args := buildWhereClause(params)
 	if where == "" {
 		where = " WHERE api_key != ''"
@@ -1072,7 +1077,7 @@ func queryDistinctAPIKeys(db *sql.DB, params LogQueryParams) ([]string, map[stri
 
 	values := make([]string, 0)
 	names := make(map[string]string)
-	seen := make(map[string]struct{})
+	seenAccount := make(map[string]struct{})
 	for rows.Next() {
 		var logicalSelector string
 		var logicalID sql.NullString
@@ -1085,31 +1090,87 @@ func queryDistinctAPIKeys(db *sql.DB, params LogQueryParams) ([]string, map[stri
 
 		value := strings.TrimSpace(snapshotKey)
 		name := strings.TrimSpace(snapshotName)
-		if row, ok := currentByID[trimNullString(logicalID)]; ok {
+		var row *APIKeyRow
+		if r, ok := currentByID[trimNullString(logicalID)]; ok {
+			copy := r
+			row = &copy
+		} else if r, ok := currentByKey[value]; ok {
+			copy := r
+			row = &copy
+		}
+		accountID := ""
+		if row != nil {
 			if trimmed := strings.TrimSpace(row.Key); trimmed != "" {
 				value = trimmed
 			}
-			// Owned keys: show end-user account name in filters / labels.
-			if label := ResolveAPIKeyDisplayName(&row, name); label != "" {
+			if eu := strings.TrimSpace(row.EndUserID); eu != "" {
+				accountID = eu
+				if rep := strings.TrimSpace(repByEndUser[eu]); rep != "" {
+					value = rep
+				}
+				if label := strings.TrimSpace(nameByEndUser[eu]); label != "" {
+					name = label
+				} else if label := ResolveAPIKeyDisplayName(row, name); label != "" {
+					name = label
+				}
+			} else if label := ResolveAPIKeyDisplayName(row, name); label != "" {
 				name = label
 			}
 		}
 		if value == "" {
 			continue
 		}
-		if _, ok := seen[value]; ok {
-			if name != "" {
+		// Dedupe: end-user account id when owned, else raw key secret.
+		dedupeKey := value
+		if accountID != "" {
+			dedupeKey = "eu:" + accountID
+		}
+		if _, ok := seenAccount[dedupeKey]; ok {
+			if name != "" && names[value] == "" {
 				names[value] = name
 			}
 			continue
 		}
-		seen[value] = struct{}{}
+		seenAccount[dedupeKey] = struct{}{}
 		values = append(values, value)
 		if name != "" {
 			names[value] = name
 		}
 	}
 	return values, names, rows.Err()
+}
+
+// accountFilterRepresentatives picks one filter value per end-user (prefer default key).
+func accountFilterRepresentatives(tenantID string) (repByEndUser map[string]string, nameByEndUser map[string]string) {
+	rows := ListAPIKeysForTenant(tenantID)
+	repByEndUser = make(map[string]string)
+	nameByEndUser = make(map[string]string)
+	defaultPicked := make(map[string]bool)
+	for _, row := range rows {
+		eu := strings.TrimSpace(row.EndUserID)
+		if eu == "" {
+			continue
+		}
+		key := strings.TrimSpace(row.Key)
+		if key == "" {
+			continue
+		}
+		if _, ok := repByEndUser[eu]; !ok {
+			repByEndUser[eu] = key
+			defaultPicked[eu] = row.IsDefault
+		} else if row.IsDefault && !defaultPicked[eu] {
+			repByEndUser[eu] = key
+			defaultPicked[eu] = true
+		}
+		if _, ok := nameByEndUser[eu]; !ok {
+			if label := DisplayNameForEndUser(eu); label != "" {
+				nameByEndUser[eu] = label
+			} else if n := strings.TrimSpace(row.Name); n != "" {
+				nameByEndUser[eu] = n
+			}
+		}
+	}
+	return repByEndUser, nameByEndUser
 }
 
 func trimNullString(value sql.NullString) string {
@@ -1128,8 +1189,21 @@ func buildSingleAPIKeySelectorClauseForTenant(tenantID, selector string) (string
 	if trimmed == "" {
 		return "", nil
 	}
-	if row := GetAPIKeyForTenant(normalizeTenantID(tenantID), trimmed); row != nil && strings.TrimSpace(row.ID) != "" {
-		return " WHERE (api_key_id = ? OR (api_key_id = '' AND api_key = ?))", []interface{}{strings.TrimSpace(row.ID), strings.TrimSpace(row.Key)}
+	tenantID = normalizeTenantID(tenantID)
+	row := GetAPIKeyForTenant(tenantID, trimmed)
+	if row == nil {
+		// Secret may resolve outside the tenant pin (legacy global lookup).
+		row = GetAPIKey(trimmed)
+	}
+	// Owned keys: selecting the account filter matches the whole key pool.
+	if row != nil {
+		if eu := strings.TrimSpace(row.EndUserID); eu != "" {
+			pred, args := buildEndUserAPIKeySelectorPredicate(tenantID, eu)
+			return " WHERE " + pred, args
+		}
+		if id := strings.TrimSpace(row.ID); id != "" {
+			return " WHERE (api_key_id = ? OR (api_key_id = '' AND api_key = ?))", []interface{}{id, strings.TrimSpace(row.Key)}
+		}
 	}
 	return " WHERE api_key = ?", []interface{}{trimmed}
 }
