@@ -111,6 +111,11 @@ COPY --chown=clirelay:clirelay config.example.yaml /CLIProxyAPI/config.yaml
 COPY --chown=clirelay:clirelay config.example.yaml /CLIProxyAPI/config.example.yaml
 COPY --chown=clirelay:clirelay config.cloudrun.yaml /CLIProxyAPI/config.cloudrun.yaml
 
+# Bake .env into the image so CLIRELAY_ADMIN_PASSWORD and CLIRELAY_API_KEY
+# are stable across container restarts (no random regeneration).
+# WARNING: .env may contain secrets; restrict image distribution accordingly.
+COPY --chown=clirelay:clirelay .env /CLIProxyAPI/.env
+
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/cloudrun-entrypoint.sh /usr/local/bin/cloudrun-entrypoint.sh
 COPY scripts/migrate-sqlite-to-postgres.sh /usr/local/bin/migrate-sqlite-to-postgres.sh

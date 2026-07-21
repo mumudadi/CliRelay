@@ -117,18 +117,20 @@ ensure_admin_password() {
 # This lets operators supply a stable password via a mounted .env file so it
 # survives container restarts without random regeneration.
 _load_env_password() {
-  [ -f "$1" ] || return 1
+  [ -f "$1" ] || return 0   # silently skip if .env does not exist
   # Only read from .env when the variable isn't already set in the environment.
   if [ -z "${CLIRELAY_ADMIN_PASSWORD:-}" ]; then
-    _val="$(grep -m1 '^CLIRELAY_ADMIN_PASSWORD=' "$1" 2>/dev/null | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
+    _val="$(grep -m1 '^CLIRELAY_ADMIN_PASSWORD=' "$1" 2>/dev/null || true)"
+    _val="$(printf '%s' "$_val" | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
     [ -n "$_val" ] && CLIRELAY_ADMIN_PASSWORD="$_val"
   fi
   if [ -z "${MANAGEMENT_PASSWORD:-}" ]; then
-    _val="$(grep -m1 '^MANAGEMENT_PASSWORD=' "$1" 2>/dev/null | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
+    _val="$(grep -m1 '^MANAGEMENT_PASSWORD=' "$1" 2>/dev/null || true)"
+    _val="$(printf '%s' "$_val" | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
     [ -n "$_val" ] && MANAGEMENT_PASSWORD="$_val"
   fi
 }
-_load_env_password "${APP_DIR}/.env"
+_load_env_password "${APP_DIR}/.env" || true
 unset _load_env_password
 
 ensure_admin_password
