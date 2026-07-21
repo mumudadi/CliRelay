@@ -243,12 +243,12 @@ func (s *Service) Bootstrap(ctx context.Context, initialPassword string) error {
 				return fmt.Errorf("identity: bootstrap admin password: %w", err)
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `
-			INSERT INTO users (
-			  id, tenant_id, username, username_normalized, display_name, password_hash,
-			  status, must_change_password, password_changed_at, created_at, updated_at
-			) VALUES (?, ?, 'admin', 'admin', 'Administrator', ?, 'active', true, now(), now(), now())
-		`, SystemUserID, SystemTenantID, passwordHash); err != nil {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO users (
+				  id, tenant_id, username, username_normalized, display_name, password_hash,
+				  status, must_change_password, password_changed_at, created_at, updated_at
+				) VALUES (?, ?, 'admin', 'admin', 'Administrator', ?, 'active', false, now(), now(), now())
+			`, SystemUserID, SystemTenantID, passwordHash); err != nil {
 			return fmt.Errorf("identity: seed admin: %w", err)
 		}
 	}
