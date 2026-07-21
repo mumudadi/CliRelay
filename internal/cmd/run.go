@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/enduser"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/identity"
 	settingsstore "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/store"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -43,6 +44,7 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).
+		WithCoreAuthHook(usage.NewAIAccountBindingHook()).
 		WithLocalManagementPassword(localPassword)
 
 	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -85,6 +87,7 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).
+		WithCoreAuthHook(usage.NewAIAccountBindingHook()).
 		WithLocalManagementPassword(localPassword)
 
 	ctx, cancelFn := context.WithCancel(context.Background())
@@ -124,10 +127,33 @@ func initializeRuntimeDataStack(cfg *config.Config, configPath string, loc *time
 		bootstrapPassword = strings.TrimSpace(cfg.RemoteManagement.SecretKey)
 	}
 	identityService := identity.NewService(usage.RuntimeDB())
+	enduserService := enduser.NewService(usage.RuntimeDB())
+	enduser.SetDefault(enduserService)
 	if err := identityService.Bootstrap(context.Background(), bootstrapPassword); err != nil {
 		return fmt.Errorf("identity bootstrap: %w", err)
 	}
 	identity.SetDefault(identityService)
+	// Import YAML keys first so one-shot end-user backfill can see them.
+	if _, err := usage.MigrateAPIKeysFromConfig(cfg, configPath); err != nil {
+		return fmt.Errorf("migrate api keys from config: %w", err)
+	}
+	if created, err := enduserService.BackfillFromAPIKeys(context.Background()); err != nil {
+		log.WithError(err).Error("enduser: backfill from api keys failed")
+		return fmt.Errorf("enduser backfill: %w", err)
+	} else if created > 0 {
+		log.Infof("enduser: backfilled %d end users from api keys", created)
+	}
+	// After keys + end-user ownership are stable, rebuild usage rollup once.
+	// Metadata cleanup is gated on this marker so detail retention cannot run first.
+	if err := usage.RunUsageRollupBackfillAtInit(); err != nil {
+		return fmt.Errorf("usage rollup backfill: %w", err)
+	}
+	if _, err := usage.RunAIAccountSharedSubjectBackfillAtInit(); err != nil {
+		return fmt.Errorf("ai account shared subject backfill: %w", err)
+	}
+	// Old blue-green slot may keep writing request_logs without rollup until drain.
+	// Catch-up absolute rebuilds after drain so those rows are not permanently missing.
+	usage.ScheduleUsageRollupBlueGreenCatchup()
 	usage.MigrateAPIKeysFromConfig(cfg, configPath)
 	usage.MigrateAPIKeyFromEnv()
 	usage.MigrateAPIKeyPermissionProfilesFromYAML(configPath)
@@ -138,7 +164,14 @@ func initializeRuntimeDataStack(cfg *config.Config, configPath string, loc *time
 	settingsstore.MigrateRuntimeSettingsFromConfig(cfg, configPath)
 	settingsstore.ApplyStoredRuntimeSettings(cfg)
 	middleware.InitQuotaUsageFuncs(usage.CountTodayByKey, usage.CountTotalByKey, usage.QueryTotalCostByKey, usage.QueryTodayCostByKey)
-	usage.SetTokenUsageCallback(middleware.RecordTokenUsage)
+	middleware.InitQuotaEndUserUsageFuncs(usage.CountTodayByEndUser, usage.CountTotalByEndUser, usage.QueryTotalCostByEndUser, usage.QueryTodayCostByEndUser)
+	usage.SetTokenUsageCallback(func(apiKey string, totalTokens int64) {
+		endUserID := ""
+		if row := usage.GetAPIKey(apiKey); row != nil {
+			endUserID = row.EndUserID
+		}
+		middleware.RecordTokenUsageForRequest(apiKey, endUserID, totalTokens)
+	})
 	return nil
 }
 

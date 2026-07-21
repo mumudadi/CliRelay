@@ -28,7 +28,19 @@ func permissionForManagementRequest(method, path string) string {
 		return "tenant.users.read"
 	case relative == "/users" && method == http.MethodPost:
 		return "tenant.users.create"
-	case strings.HasSuffix(relative, "/reset-password"):
+	// Key sub-resources under end-users use api_keys.* so legacy key-admin roles
+	// keep working after the sidebar moves to 用户账号.
+	case strings.HasPrefix(relative, "/end-users/") && strings.Contains(relative, "/api-keys"):
+		if write {
+			return "api_keys.write"
+		}
+		return "api_keys.read"
+	case strings.HasPrefix(relative, "/end-users"):
+		if write {
+			return "end_users.write"
+		}
+		return "end_users.read"
+	case strings.HasSuffix(relative, "/reset-password") && strings.HasPrefix(relative, "/users/"):
 		return "tenant.users.reset_password"
 	case strings.HasSuffix(relative, "/roles") && strings.HasPrefix(relative, "/users/"):
 		return "tenant.users.assign_roles"
@@ -86,6 +98,14 @@ func permissionForManagementRequest(method, path string) string {
 	// Exact /usage* stats paths only — /usage-statistics-enabled is config.
 	case relative == "/usage" || strings.HasPrefix(relative, "/usage/"):
 		return "monitor.read"
+	// AI account status read model: same capability surface as auth-files list.
+	case strings.HasPrefix(relative, "/ai-accounts/status-refresh") && write:
+		return "auth_files.write"
+	case strings.HasPrefix(relative, "/ai-accounts/status"):
+		if write {
+			return "auth_files.write"
+		}
+		return "auth_files.read"
 	case strings.HasPrefix(relative, "/auth-files"), relative == "/vertex/import", relative == "/get-auth-status", strings.Contains(relative, "auth-url"), strings.Contains(relative, "oauth"):
 		if relative == "/get-auth-status" || strings.Contains(relative, "auth-url") || strings.Contains(relative, "oauth") {
 			return "auth_files.oauth"

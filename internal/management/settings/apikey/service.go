@@ -11,14 +11,15 @@ import (
 )
 
 var (
-	ErrInvalidProfileID   = errors.New("id is required")
-	ErrInvalidProfileName = errors.New("name is required")
-	ErrMissingValue       = errors.New("missing value")
-	ErrInvalidEntry       = errors.New("invalid api key entry")
-	ErrItemNotFound       = errors.New("item not found")
-	ErrDuplicateKey       = errors.New("api key already exists")
-	ErrMissingKeyOrIndex  = errors.New("missing key or index")
-	ErrKeyRequired        = errors.New("key is required")
+	ErrInvalidProfileID          = errors.New("id is required")
+	ErrInvalidProfileName        = errors.New("name is required")
+	ErrMissingValue              = errors.New("missing value")
+	ErrInvalidEntry              = errors.New("invalid api key entry")
+	ErrItemNotFound              = errors.New("item not found")
+	ErrDuplicateKey              = errors.New("api key already exists")
+	ErrMissingKeyOrIndex         = errors.New("missing key or index")
+	ErrKeyRequired               = errors.New("key is required")
+	ErrDailySpendingLimitMissing = errors.New("daily spending limit is not set")
 )
 
 type ChannelSanitizer func([]string) ([]string, error)
@@ -38,6 +39,7 @@ type Service struct {
 type EntryPatch struct {
 	Key                  *string   `json:"key"`
 	Name                 *string   `json:"name"`
+	Disabled             *bool     `json:"disabled"`
 	PermissionProfileID  *string   `json:"permission-profile-id"`
 	DailyLimit           *int      `json:"daily-limit"`
 	TotalQuota           *int      `json:"total-quota"`
@@ -51,6 +53,8 @@ type EntryPatch struct {
 	AllowedChannelGroups *[]string `json:"allowed-channel-groups"`
 	SystemPrompt         *string   `json:"system-prompt"`
 	CreatedAt            *string   `json:"created-at"`
+	// end_user_id / is_default are intentionally not patchable here; ownership
+	// changes go through end-user owner-scoped APIs only.
 }
 
 type DeleteEntryResult struct {
@@ -162,26 +166,42 @@ func (s *Service) PermissionProfiles() []usage.APIKeyPermissionProfileRow {
 }
 
 func (s *Service) ReplacePermissionProfiles(profiles []usage.APIKeyPermissionProfileRow) error {
+	normalized, err := s.normalizePermissionProfiles(profiles)
+	if err != nil {
+		return err
+	}
+	return usage.ReplaceAllAPIKeyPermissionProfilesForTenant(s.tenantID, normalized)
+}
+
+func (s *Service) ReplacePermissionProfilesAndSyncAccounts(profiles []usage.APIKeyPermissionProfileRow) (int64, error) {
+	normalized, err := s.normalizePermissionProfiles(profiles)
+	if err != nil {
+		return 0, err
+	}
+	return usage.ReplaceAllAPIKeyPermissionProfilesForTenantAndSyncEndUsers(s.tenantID, normalized)
+}
+
+func (s *Service) normalizePermissionProfiles(profiles []usage.APIKeyPermissionProfileRow) ([]usage.APIKeyPermissionProfileRow, error) {
 	normalized := make([]usage.APIKeyPermissionProfileRow, len(profiles))
 	copy(normalized, profiles)
 	for idx := range normalized {
 		normalized[idx].ID = strings.TrimSpace(normalized[idx].ID)
 		normalized[idx].Name = strings.TrimSpace(normalized[idx].Name)
 		if normalized[idx].ID == "" {
-			return ErrInvalidProfileID
+			return nil, ErrInvalidProfileID
 		}
 		if normalized[idx].Name == "" {
-			return ErrInvalidProfileName
+			return nil, ErrInvalidProfileName
 		}
 		if s != nil && s.sanitizeChannels != nil {
 			cleaned, err := s.sanitizeChannels(normalized[idx].AllowedChannels)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			normalized[idx].AllowedChannels = cleaned
 		}
 	}
-	return usage.ReplaceAllAPIKeyPermissionProfilesForTenant(s.tenantID, normalized)
+	return normalized, nil
 }
 
 func (s *Service) RenameAllowedChannelRestrictions(oldNameSet map[string]struct{}, newName string) error {
@@ -247,12 +267,158 @@ func (s *Service) RemovePermissionProfileChannelRestrictions(oldNameSet map[stri
 }
 
 func (s *Service) ListEntries() []config.APIKeyEntry {
-	rows := usage.EffectiveAPIKeyRowsForTenant(s.tenantID, usage.ListAPIKeysForTenant(s.tenantID))
+	entries, _ := s.ListEntriesWithDailySpending()
+	return entries
+}
+
+// ListEntriesWithDailySpending lists keys and attaches effective daily spending fields.
+// Query failures return an error so management handlers do not silently show $0.
+func (s *Service) ListEntriesWithDailySpending() ([]config.APIKeyEntry, error) {
+	all := usage.ListAPIKeysForTenant(s.tenantID)
+	// Soft-deleted owned keys keep a sk-deleted-* tombstone secret for log
+	// ownership; hide them from management lists. Intentional disable (same
+	// secret, disabled=1) still appears so operators can re-enable.
+	visible := make([]usage.APIKeyRow, 0, len(all))
+	for _, row := range all {
+		if row.Disabled && strings.TrimSpace(row.EndUserID) != "" && strings.HasPrefix(strings.TrimSpace(row.Key), "sk-deleted-") {
+			continue
+		}
+		visible = append(visible, row)
+	}
+	rows := usage.EffectiveAPIKeyRowsForTenant(s.tenantID, visible)
 	entries := make([]config.APIKeyEntry, 0, len(rows))
 	for _, row := range rows {
 		entries = append(entries, row.ToConfigEntry())
 	}
-	return entries
+	if err := s.attachDailySpendingRuntime(entries, rows); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// attachDailySpendingRuntime fills daily-spending-used / daily-spending-remaining via batch queries.
+func (s *Service) attachDailySpendingRuntime(entries []config.APIKeyEntry, rows []usage.APIKeyRow) error {
+	if len(entries) == 0 || len(rows) == 0 {
+		return nil
+	}
+	rawCosts, err := usage.QueryRawTodayCostsByKeysForTenant(s.tenantID, rows)
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if id := strings.TrimSpace(row.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	baselines, err := usage.ListDailySpendingResetBaselines(s.tenantID, ids)
+	if err != nil {
+		return err
+	}
+	counts, err := usage.ListDailySpendingResetEventCounts(s.tenantID, ids)
+	if err != nil {
+		return err
+	}
+	for i := range entries {
+		id := strings.TrimSpace(rows[i].ID)
+		key := strings.TrimSpace(rows[i].Key)
+		raw := 0.0
+		if id != "" {
+			if v, ok := rawCosts[id]; ok {
+				raw = v
+			} else if v, ok := rawCosts[key]; ok {
+				raw = v
+			}
+		} else if v, ok := rawCosts[key]; ok {
+			raw = v
+		}
+		baseline := 0.0
+		if id != "" {
+			baseline = baselines[id]
+		}
+		used := raw - baseline
+		if used < 0 {
+			used = 0
+		}
+		entries[i].DailySpendingUsed = used
+		entries[i].DailySpendingRemaining = usage.DailySpendingRemaining(entries[i].DailySpendingLimit, used)
+		if id != "" {
+			entries[i].DailySpendingResetCount = counts[id]
+		}
+	}
+	return nil
+}
+
+type DailySpendingResetActor struct {
+	UserID   string
+	Username string
+	Kind     string
+}
+
+type DailySpendingResetResult struct {
+	ID                      string   `json:"id"`
+	Key                     string   `json:"key,omitempty"`
+	DailySpendingLimit      float64  `json:"daily-spending-limit"`
+	DailySpendingUsed       float64  `json:"daily-spending-used"`
+	DailySpendingRemaining  *float64 `json:"daily-spending-remaining"`
+	DailySpendingResetCount int      `json:"daily-spending-reset-count"`
+}
+
+// ResetDailySpending sets today's cost baseline to the current raw today cost so effective used becomes 0.
+func (s *Service) ResetDailySpending(id *string, match *string, actor DailySpendingResetActor) (DailySpendingResetResult, error) {
+	row := s.resolvePatchTargetRow(id, nil, match)
+	if row == nil {
+		return DailySpendingResetResult{}, ErrItemNotFound
+	}
+	// Effective row includes permission-profile daily spending limit.
+	effective := usage.EffectiveAPIKeyRowForTenant(s.tenantID, *row)
+	if effective.DailySpendingLimit <= 0 {
+		return DailySpendingResetResult{}, ErrDailySpendingLimitMissing
+	}
+	raw, err := usage.QueryRawTodayCostByKeyForTenant(s.tenantID, effective.Key)
+	if err != nil {
+		return DailySpendingResetResult{}, err
+	}
+	baselineBefore, _, err := usage.GetDailySpendingResetBaseline(s.tenantID, effective.ID)
+	if err != nil {
+		return DailySpendingResetResult{}, err
+	}
+	usedBefore := raw - baselineBefore
+	if usedBefore < 0 {
+		usedBefore = 0
+	}
+	if err := usage.UpsertDailySpendingReset(s.tenantID, effective.ID, raw); err != nil {
+		return DailySpendingResetResult{}, err
+	}
+	_ = usage.InsertDailySpendingResetEvent(usage.APIKeyDailySpendingResetEvent{
+		TenantID:            s.tenantID,
+		APIKeyID:            effective.ID,
+		CostBaseline:        raw,
+		EffectiveUsedBefore: usedBefore,
+		RawTodayCost:        raw,
+		ActorUserID:         actor.UserID,
+		ActorUsername:       actor.Username,
+		ActorKind:           actor.Kind,
+	})
+	count, _ := usage.CountDailySpendingResetEvents(s.tenantID, effective.ID)
+	used := 0.0
+	return DailySpendingResetResult{
+		ID:                      effective.ID,
+		Key:                     effective.Key,
+		DailySpendingLimit:      effective.DailySpendingLimit,
+		DailySpendingUsed:       used,
+		DailySpendingRemaining:  usage.DailySpendingRemaining(effective.DailySpendingLimit, used),
+		DailySpendingResetCount: count,
+	}, nil
+}
+
+// ListDailySpendingResetHistory returns newest-first reset events for a key.
+func (s *Service) ListDailySpendingResetHistory(id *string, match *string, limit int) ([]usage.APIKeyDailySpendingResetEvent, error) {
+	row := s.resolvePatchTargetRow(id, nil, match)
+	if row == nil {
+		return nil, ErrItemNotFound
+	}
+	return usage.ListDailySpendingResetEvents(s.tenantID, row.ID, limit)
 }
 
 func (s *Service) ReplaceEntries(entries []config.APIKeyEntry) error {
@@ -281,6 +447,13 @@ func (s *Service) PatchEntry(id *string, index *int, match *string, patch EntryP
 	}
 	if patch.Name != nil {
 		entry.Name = strings.TrimSpace(*patch.Name)
+	}
+	if patch.Disabled != nil {
+		// Tombstoned owned secrets are permanently revoked; never re-enable them.
+		if !*patch.Disabled && strings.HasPrefix(strings.TrimSpace(existing.Key), "sk-deleted-") {
+			return ErrItemNotFound
+		}
+		entry.Disabled = *patch.Disabled
 	}
 	if patch.PermissionProfileID != nil {
 		entry.PermissionProfileID = strings.TrimSpace(*patch.PermissionProfileID)
@@ -334,6 +507,9 @@ func (s *Service) PatchEntry(id *string, index *int, match *string, patch EntryP
 	}
 	updated := usage.APIKeyRowFromConfig(normalized)
 	updated.ID = originalID
+	// Preserve ownership regardless of client payload (read-only on generic API).
+	updated.EndUserID = existing.EndUserID
+	updated.IsDefault = existing.IsDefault
 	return usage.UpdateAPIKeyByIDForTenant(s.tenantID, updated)
 }
 
@@ -344,9 +520,12 @@ func (s *Service) DeleteEntry(key string, id *string, index *int, deleteLogs boo
 		return DeleteEntryResult{}, ErrMissingKeyOrIndex
 	}
 	targetKey = row.Key
+	apiKeyID := strings.TrimSpace(row.ID)
 	if err := usage.DeleteAPIKeyByIDForTenant(s.tenantID, row.ID); err != nil {
 		return DeleteEntryResult{}, err
 	}
+	_ = usage.DeleteDailySpendingReset(s.tenantID, apiKeyID)
+	_ = usage.DeleteDailySpendingResetEvents(s.tenantID, apiKeyID)
 
 	result := DeleteEntryResult{}
 	if deleteLogs && s != nil && s.deleteLogs != nil {

@@ -26,6 +26,10 @@ type FieldPatch struct {
 	SubscriptionExpiresAt      *string   `json:"subscription_expires_at"`
 	CodexCLIOnly               *bool     `json:"codex_cli_only"`
 	CodexCLIOnlyAllowedClients *[]string `json:"codex_cli_only_allowed_clients"`
+	// CodexImageGenerationBridge injects Responses-native image_generation for Codex OAuth.
+	CodexImageGenerationBridge *bool `json:"codex_image_generation_bridge"`
+	// UsingAPI selects xAI official API vs Grok Build/CLI for OAuth accounts.
+	UsingAPI *bool `json:"using_api"`
 }
 
 type FieldPatchOptions struct {
@@ -240,6 +244,28 @@ func ApplyFieldPatch(auth *coreauth.Auth, patch FieldPatch, opts FieldPatchOptio
 			delete(metadata, "codex_cli_only_allowed_clients")
 		} else {
 			metadata["codex_cli_only_allowed_clients"] = allowedClients
+		}
+		changed = true
+	}
+	if patch.CodexImageGenerationBridge != nil {
+		if err := ensureCodexImageGenerationBridgeEditable(auth); err != nil {
+			return result, err
+		}
+		metadata := ensureMetadata(auth)
+		metadata[metadataKeyCodexImageGenerationBridge] = *patch.CodexImageGenerationBridge
+		changed = true
+	}
+	if patch.UsingAPI != nil {
+		if err := ensureXAIEndpointEditable(auth); err != nil {
+			return result, err
+		}
+		metadata := ensureMetadata(auth)
+		metadata["using_api"] = *patch.UsingAPI
+		attrs := ensureAttributes(auth)
+		if *patch.UsingAPI {
+			attrs["using_api"] = "true"
+		} else {
+			attrs["using_api"] = "false"
 		}
 		changed = true
 	}

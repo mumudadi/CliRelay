@@ -84,7 +84,9 @@ func (w *tokenWindow) sum() int64 {
 	return w.total.Load()
 }
 
-// ─── Per-key tracker registry ───────────────────────────────────────────────
+// ─── Per-subject tracker registry ───────────────────────────────────────────
+// Tracker keys are end-user ids when present, else the API key secret.
+// Owned keys therefore share one RPM/TPM/concurrency pool per account.
 
 var (
 	rpmTrackers sync.Map // map[string]*slidingWindow
@@ -94,31 +96,53 @@ var (
 	inFlightByKey = map[string]int{}
 )
 
-func getRPMTracker(apiKey string) *slidingWindow {
-	if v, ok := rpmTrackers.Load(apiKey); ok {
+func quotaSubjectKey(apiKey string, metadata map[string]string) string {
+	if metadata != nil {
+		if id := strings.TrimSpace(metadata["end-user-id"]); id != "" {
+			return "eu:" + id
+		}
+	}
+	return apiKey
+}
+
+func getRPMTracker(subject string) *slidingWindow {
+	if v, ok := rpmTrackers.Load(subject); ok {
 		return v.(*slidingWindow)
 	}
 	w := &slidingWindow{}
-	actual, _ := rpmTrackers.LoadOrStore(apiKey, w)
+	actual, _ := rpmTrackers.LoadOrStore(subject, w)
 	return actual.(*slidingWindow)
 }
 
-func getTPMTracker(apiKey string) *tokenWindow {
-	if v, ok := tpmTrackers.Load(apiKey); ok {
+func getTPMTracker(subject string) *tokenWindow {
+	if v, ok := tpmTrackers.Load(subject); ok {
 		return v.(*tokenWindow)
 	}
 	w := &tokenWindow{}
-	actual, _ := tpmTrackers.LoadOrStore(apiKey, w)
+	actual, _ := tpmTrackers.LoadOrStore(subject, w)
 	return actual.(*tokenWindow)
 }
 
 // RecordTokenUsage records token consumption for TPM tracking.
 // This should be called by the usage reporter after a request completes.
-func RecordTokenUsage(apiKey string, totalTokens int64) {
-	if apiKey == "" || totalTokens <= 0 {
+// subject should be the same key used by QuotaMiddleware (eu:<id> or api key).
+func RecordTokenUsage(subject string, totalTokens int64) {
+	if subject == "" || totalTokens <= 0 {
 		return
 	}
-	getTPMTracker(apiKey).add(totalTokens)
+	getTPMTracker(subject).add(totalTokens)
+}
+
+// RecordTokenUsageForRequest records TPM against the end-user pool when known.
+func RecordTokenUsageForRequest(apiKey, endUserID string, totalTokens int64) {
+	if totalTokens <= 0 {
+		return
+	}
+	if id := strings.TrimSpace(endUserID); id != "" {
+		RecordTokenUsage("eu:"+id, totalTokens)
+		return
+	}
+	RecordTokenUsage(apiKey, totalTokens)
 }
 
 // ─── Quota Middleware ───────────────────────────────────────────────────────
@@ -149,20 +173,24 @@ func QuotaMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// Get access metadata containing limits (needed for end-user subject).
+		var metadata map[string]string
+		if metadataVal, ok := c.Get("accessMetadata"); ok {
+			metadata, _ = metadataVal.(map[string]string)
+		}
+		subject := quotaSubjectKey(apiKey, metadata)
+		endUserID := ""
+		if metadata != nil {
+			endUserID = strings.TrimSpace(metadata["end-user-id"])
+		}
+
 		// ── Always record this request for system-wide RPM tracking ──
 		// This must happen before any metadata checks so ALL authenticated
 		// POST requests are counted for the dashboard RPM display.
-		rpmTracker := getRPMTracker(apiKey)
+		rpmTracker := getRPMTracker(subject)
 		rpmTracker.add()
 
-		// Get access metadata containing limits
-		metadataVal, exists := c.Get("accessMetadata")
-		if !exists {
-			c.Next()
-			return
-		}
-		metadata, ok := metadataVal.(map[string]string)
-		if !ok {
+		if metadata == nil {
 			c.Next()
 			return
 		}
@@ -186,7 +214,7 @@ func QuotaMiddleware() gin.HandlerFunc {
 		})
 
 		// Cache limits for dashboard snapshot
-		UpdateKeyLimits(apiKey, rpmLimit, tpmLimit)
+		UpdateKeyLimits(subject, rpmLimit, tpmLimit)
 
 		// No limits configured — skip all checks
 		if dailyLimit <= 0 && totalQuota <= 0 && concurrencyLimit <= 0 && rpmLimit <= 0 && tpmLimit <= 0 && spendingLimit <= 0 && dailySpendingLimit <= 0 {
@@ -195,17 +223,11 @@ func QuotaMiddleware() gin.HandlerFunc {
 		}
 
 		if concurrencyLimit > 0 {
-			release, ok := acquireKeyConcurrency(apiKey, concurrencyLimit)
+			release, ok := acquireKeyConcurrency(subject, concurrencyLimit)
 			if !ok {
-				message := fmt.Sprintf("concurrency limit (%d in-flight requests) exceeded for this API key", concurrencyLimit)
-				diagnostics.SetQuotaRejection(c, "concurrency", float64(concurrencyLimit), float64(keyConcurrencyCount(apiKey)), "concurrency_limit_exceeded", "rate_limit_exceeded", message)
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error": map[string]interface{}{
-						"message": message,
-						"type":    "rate_limit_exceeded",
-						"code":    "concurrency_limit_exceeded",
-					},
-				})
+				current := keyConcurrencyCount(subject)
+				rejectQuotaLimit(c, "concurrency", float64(concurrencyLimit), float64(current), "concurrency_limit_exceeded",
+					fmt.Sprintf("Concurrent request limit exceeded: %d in-flight requests (limit %d). Wait for running requests to finish, or raise the concurrency limit in the permission profile.", current, concurrencyLimit))
 				return
 			}
 			defer release()
@@ -215,109 +237,67 @@ func QuotaMiddleware() gin.HandlerFunc {
 		if rpmLimit > 0 {
 			currentRPM := rpmTracker.count()
 			if currentRPM > rpmLimit {
-				message := fmt.Sprintf("RPM limit (%d requests/min) exceeded for this API key", rpmLimit)
-				diagnostics.SetQuotaRejection(c, "rpm", float64(rpmLimit), float64(currentRPM), "rpm_limit_exceeded", "rate_limit_exceeded", message)
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error": map[string]interface{}{
-						"message": message,
-						"type":    "rate_limit_exceeded",
-						"code":    "rpm_limit_exceeded",
-					},
-				})
+				rejectQuotaLimit(c, "rpm", float64(rpmLimit), float64(currentRPM), "rpm_limit_exceeded",
+					fmt.Sprintf("Requests-per-minute (RPM) limit exceeded: %d/%d requests in the last minute. Slow down, or raise the RPM limit in the permission profile.", currentRPM, rpmLimit))
 				return
 			}
 		}
 
 		// --- TPM check (sliding window, in-memory) ---
 		if tpmLimit > 0 {
-			tracker := getTPMTracker(apiKey)
+			tracker := getTPMTracker(subject)
 			currentTPM := tracker.sum()
 			if currentTPM >= int64(tpmLimit) {
-				message := fmt.Sprintf("TPM limit (%d tokens/min) exceeded for this API key", tpmLimit)
-				diagnostics.SetQuotaRejection(c, "tpm", float64(tpmLimit), float64(currentTPM), "tpm_limit_exceeded", "rate_limit_exceeded", message)
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error": map[string]interface{}{
-						"message": message,
-						"type":    "rate_limit_exceeded",
-						"code":    "tpm_limit_exceeded",
-					},
-				})
+				rejectQuotaLimit(c, "tpm", float64(tpmLimit), float64(currentTPM), "tpm_limit_exceeded",
+					fmt.Sprintf("Tokens-per-minute (TPM) limit exceeded: %d/%d tokens in the last minute. Slow down, or raise the TPM limit in the permission profile.", currentTPM, tpmLimit))
 				return
 			}
 		}
 
 		// --- Daily limit check (from usage DB) ---
 		if dailyLimit > 0 {
-			todayCount, err := countTodayByKeyFunc(apiKey)
+			todayCount, err := countTodayUsage(apiKey, endUserID)
 			if err != nil {
 				log.Warnf("quota: failed to query daily usage for key %s: %v", maskKey(apiKey), err)
 			} else if todayCount >= int64(dailyLimit) {
-				message := fmt.Sprintf("daily request limit (%d) exceeded for this API key", dailyLimit)
-				diagnostics.SetQuotaRejection(c, "daily", float64(dailyLimit), float64(todayCount), "daily_limit_exceeded", "rate_limit_exceeded", message)
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error": map[string]interface{}{
-						"message": message,
-						"type":    "rate_limit_exceeded",
-						"code":    "daily_limit_exceeded",
-					},
-				})
+				rejectQuotaLimit(c, "daily", float64(dailyLimit), float64(todayCount), "daily_limit_exceeded",
+					fmt.Sprintf("Daily request limit exceeded: %d/%d requests used today. Raise the daily request limit in the permission profile, or wait until the next project day.", todayCount, dailyLimit))
 				return
 			}
 		}
 
 		// --- Total quota check (from usage DB) ---
 		if totalQuota > 0 {
-			totalCount, err := countTotalByKeyFunc(apiKey)
+			totalCount, err := countTotalUsage(apiKey, endUserID)
 			if err != nil {
 				log.Warnf("quota: failed to query total usage for key %s: %v", maskKey(apiKey), err)
 			} else if totalCount >= int64(totalQuota) {
-				message := fmt.Sprintf("total request quota (%d) exhausted for this API key", totalQuota)
-				diagnostics.SetQuotaRejection(c, "total", float64(totalQuota), float64(totalCount), "total_quota_exceeded", "rate_limit_exceeded", message)
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error": map[string]interface{}{
-						"message": message,
-						"type":    "rate_limit_exceeded",
-						"code":    "total_quota_exceeded",
-					},
-				})
+				rejectQuotaLimit(c, "total", float64(totalQuota), float64(totalCount), "total_quota_exceeded",
+					fmt.Sprintf("Total request quota exhausted: %d/%d lifetime requests used. Raise the total request quota in the permission profile to continue.", totalCount, totalQuota))
 				return
 			}
 		}
 
 		// --- Spending limit check (from usage DB) ---
 		if spendingLimit > 0 {
-			totalCost, err := queryTotalCostByKeyFunc(apiKey)
+			totalCost, err := queryTotalCostUsage(apiKey, endUserID)
 			if err != nil {
 				log.Warnf("quota: failed to query total cost for key %s: %v", maskKey(apiKey), err)
 			} else if totalCost >= spendingLimit {
-				message := fmt.Sprintf("spending limit ($%.2f) exceeded for this API key (current: $%.2f)", spendingLimit, totalCost)
-				diagnostics.SetQuotaRejection(c, "spending", spendingLimit, totalCost, "spending_limit_exceeded", "rate_limit_exceeded", message)
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error": map[string]interface{}{
-						"message": message,
-						"type":    "rate_limit_exceeded",
-						"code":    "spending_limit_exceeded",
-					},
-				})
+				rejectQuotaLimit(c, "spending", spendingLimit, totalCost, "spending_limit_exceeded",
+					fmt.Sprintf("Lifetime spending limit exceeded: $%.2f of $%.2f used. Raise the spending limit to continue.", totalCost, spendingLimit))
 				return
 			}
 		}
 
 		// --- Daily spending limit check (from usage DB) ---
 		if dailySpendingLimit > 0 {
-			todayCost, err := queryTodayCostByKeyFunc(apiKey)
+			todayCost, err := queryTodayCostUsage(apiKey, endUserID)
 			if err != nil {
 				log.Warnf("quota: failed to query today cost for key %s: %v", maskKey(apiKey), err)
 			} else if todayCost >= dailySpendingLimit {
-				message := fmt.Sprintf("daily spending limit ($%.2f) exceeded for this API key (today: $%.2f)", dailySpendingLimit, todayCost)
-				diagnostics.SetQuotaRejection(c, "daily_spending", dailySpendingLimit, todayCost, "daily_spending_limit_exceeded", "rate_limit_exceeded", message)
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error": map[string]interface{}{
-						"message": message,
-						"type":    "rate_limit_exceeded",
-						"code":    "daily_spending_limit_exceeded",
-					},
-				})
+				rejectQuotaLimit(c, "daily_spending", dailySpendingLimit, todayCost, "daily_spending_limit_exceeded",
+					fmt.Sprintf("Daily spending limit exceeded: $%.2f of $%.2f used today. Raise the daily spending limit in the permission profile, reset today's spending, or wait until the next project day.", todayCost, dailySpendingLimit))
 				return
 			}
 		}
@@ -326,15 +306,45 @@ func QuotaMiddleware() gin.HandlerFunc {
 	}
 }
 
+// rejectQuotaLimit writes a 429 with a distinct code/message and diagnostic headers.
+// Headers help clients that only surface "429 Too Many Requests" after retries.
+func rejectQuotaLimit(c *gin.Context, rejectedBy string, limit, current float64, code, message string) {
+	const errType = "rate_limit_exceeded"
+	diagnostics.SetQuotaRejection(c, rejectedBy, limit, current, code, errType, message)
+	c.Header("X-CliRelay-Quota-Code", code)
+	c.Header("X-CliRelay-Quota-Limit", formatQuotaNumber(limit))
+	c.Header("X-CliRelay-Quota-Current", formatQuotaNumber(current))
+	c.Header("X-CliRelay-Quota-Rejected-By", rejectedBy)
+	c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+		"error": map[string]interface{}{
+			"message": message,
+			"type":    errType,
+			"code":    code,
+		},
+	})
+}
+
+func formatQuotaNumber(v float64) string {
+	if v == float64(int64(v)) {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
 // ─── Usage DB query functions (injected to avoid import cycle) ──────────────
 
-// countTodayByKeyFunc and countTotalByKeyFunc are set by InitQuotaUsageFuncs.
-// They default to no-ops that always return 0 (no limit enforced) until set.
+// Key-scoped defaults; InitQuotaUsageFuncs wires real implementations.
+// When endUserID is set, InitQuotaUsageFuncs also wires account-scoped aggregators.
 var (
 	countTodayByKeyFunc     = func(string) (int64, error) { return 0, nil }
 	countTotalByKeyFunc     = func(string) (int64, error) { return 0, nil }
 	queryTotalCostByKeyFunc = func(string) (float64, error) { return 0, nil }
 	queryTodayCostByKeyFunc = func(string) (float64, error) { return 0, nil }
+
+	countTodayByEndUserFunc     = func(string) (int64, error) { return 0, nil }
+	countTotalByEndUserFunc     = func(string) (int64, error) { return 0, nil }
+	queryTotalCostByEndUserFunc = func(string) (float64, error) { return 0, nil }
+	queryTodayCostByEndUserFunc = func(string) (float64, error) { return 0, nil }
 )
 
 // InitQuotaUsageFuncs injects the usage DB query functions into the middleware.
@@ -349,6 +359,48 @@ func InitQuotaUsageFuncs(
 	countTotalByKeyFunc = countTotal
 	queryTotalCostByKeyFunc = totalCost
 	queryTodayCostByKeyFunc = todayCost
+}
+
+// InitQuotaEndUserUsageFuncs injects end-user-scoped usage aggregators.
+// Owned keys share one account pool for daily/total/spending checks.
+func InitQuotaEndUserUsageFuncs(
+	countToday func(string) (int64, error),
+	countTotal func(string) (int64, error),
+	totalCost func(string) (float64, error),
+	todayCost func(string) (float64, error),
+) {
+	countTodayByEndUserFunc = countToday
+	countTotalByEndUserFunc = countTotal
+	queryTotalCostByEndUserFunc = totalCost
+	queryTodayCostByEndUserFunc = todayCost
+}
+
+func countTodayUsage(apiKey, endUserID string) (int64, error) {
+	if endUserID != "" {
+		return countTodayByEndUserFunc(endUserID)
+	}
+	return countTodayByKeyFunc(apiKey)
+}
+
+func countTotalUsage(apiKey, endUserID string) (int64, error) {
+	if endUserID != "" {
+		return countTotalByEndUserFunc(endUserID)
+	}
+	return countTotalByKeyFunc(apiKey)
+}
+
+func queryTotalCostUsage(apiKey, endUserID string) (float64, error) {
+	if endUserID != "" {
+		return queryTotalCostByEndUserFunc(endUserID)
+	}
+	return queryTotalCostByKeyFunc(apiKey)
+}
+
+func queryTodayCostUsage(apiKey, endUserID string) (float64, error) {
+	if endUserID != "" {
+		return queryTodayCostByEndUserFunc(endUserID)
+	}
+	return queryTodayCostByKeyFunc(apiKey)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

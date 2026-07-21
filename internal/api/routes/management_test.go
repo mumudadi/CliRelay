@@ -26,7 +26,7 @@ func TestRegisterManagementRouteTable(t *testing.T) {
 		routes[key] = route
 	}
 
-	if got, want := len(routes), 262; got != want {
+	if got, want := len(routes), 290; got != want {
 		t.Fatalf("route count = %d, want %d", got, want)
 	}
 	if got, want := sortedRouteKeys(routes), expectedManagementRoutes(); !slices.Equal(got, want) {
@@ -42,6 +42,7 @@ func TestRegisterManagementRouteTable(t *testing.T) {
 		"PATCH /v0/management/proxy-pool/:id",
 		"GET /v0/management/usage/logs/:id/content",
 		"GET /v0/management/usage/logs/:id/egress",
+		"POST /v0/management/ai-accounts/status-refresh",
 		"POST /v0/management/api-call",
 		"PATCH /v0/management/api-key-entries",
 		"POST /v0/management/opencode-go-api-key/usage",
@@ -124,6 +125,9 @@ func TestManagementRoutePermissionsComplete(t *testing.T) {
 		{http.MethodDelete, "/v0/management/logs", "system.logs.delete"},
 		{http.MethodPost, "/v0/management/usage/import", "system.config.write"},
 		{http.MethodPost, "/v0/management/usage/auth-file-quota-snapshot", "auth_files.write"},
+		{http.MethodGet, "/v0/management/ai-accounts/status", "auth_files.read"},
+		{http.MethodPost, "/v0/management/ai-accounts/status-refresh", "auth_files.write"},
+		{http.MethodGet, "/v0/management/ai-accounts/status-refresh/job-1", "auth_files.read"},
 		{http.MethodGet, "/v0/management/totally-unknown-route", ""},
 	}
 	for _, item := range locked {
@@ -174,7 +178,19 @@ func expectedManagementRoutes() []string {
 		"GET /v0/auth/me",
 		"POST /v0/auth/login",
 		"POST /v0/auth/logout",
+		"POST /v0/auth/refresh",
 		"PUT /v0/auth/password",
+		"GET /v0/portal/api-keys",
+		"POST /v0/portal/api-keys",
+		"GET /v0/portal/api-keys/:id/secret",
+		"PATCH /v0/portal/api-keys/:id",
+		"POST /v0/portal/api-keys/:id/rotate",
+		"DELETE /v0/portal/api-keys/:id",
+		"POST /v0/portal/auth/login",
+		"POST /v0/portal/auth/logout",
+		"GET /v0/portal/auth/me",
+		"PUT /v0/portal/auth/password",
+		"POST /v0/portal/auth/refresh",
 		"GET /v0/management/menus",
 		"POST /v0/management/menus",
 		"PATCH /v0/management/menus/:code",
@@ -194,6 +210,16 @@ func expectedManagementRoutes() []string {
 		"PATCH /v0/management/users/:id",
 		"DELETE /v0/management/users/:id",
 		"PUT /v0/management/users/:id/roles",
+		"GET /v0/management/end-users",
+		"POST /v0/management/end-users",
+		"PATCH /v0/management/end-users/:id",
+		"DELETE /v0/management/end-users/:id",
+		"POST /v0/management/end-users/:id/reset-password",
+		"POST /v0/management/end-users/:id/daily-spending/reset",
+		"GET /v0/management/end-users/:id/api-keys",
+		"POST /v0/management/end-users/:id/api-keys",
+		"DELETE /v0/management/end-users/:id/api-keys/:key_id",
+		"POST /v0/management/end-users/:id/api-keys/:key_id/default",
 		"GET /v0/management/audit-logs",
 		"GET /v0/management/audit-logs/:id",
 		"DELETE /v0/management/audit-logs/:id",
@@ -222,6 +248,9 @@ func expectedManagementRoutes() []string {
 		"DELETE /v0/management/proxy-url",
 		"DELETE /v0/management/usage/logs",
 		"DELETE /v0/management/vertex-api-key",
+		"GET /v0/management/ai-accounts/status",
+		"GET /v0/management/ai-accounts/status-refresh/:job_id",
+		"POST /v0/management/ai-accounts/status-refresh",
 		"GET /v0/management/ampcode",
 		"GET /v0/management/ampcode/force-model-mappings",
 		"GET /v0/management/ampcode/model-mappings",
@@ -232,6 +261,7 @@ func expectedManagementRoutes() []string {
 		"GET /v0/management/antigravity-auth-url",
 		"GET /v0/management/anthropic-auth-url",
 		"GET /v0/management/api-key-entries",
+		"GET /v0/management/api-key-entries/daily-spending/reset-history",
 		"GET /v0/management/api-key-permission-profiles",
 		"GET /v0/management/api-keys",
 		"GET /v0/management/auth-files",
@@ -298,6 +328,7 @@ func expectedManagementRoutes() []string {
 		"GET /v0/management/request-error-logs/:name",
 		"GET /v0/management/request-log",
 		"GET /v0/management/request-log-storage/store-content",
+		"GET /v0/management/request-log-storage/status",
 		"GET /v0/management/request-log-by-id/:id",
 		"GET /v0/management/request-retry",
 		"GET /v0/management/routing-config",
@@ -362,6 +393,7 @@ func expectedManagementRoutes() []string {
 		"PATCH /v0/management/vertex-api-key",
 		"PATCH /v0/management/ws-auth",
 		"POST /v0/management/api-call",
+		"POST /v0/management/api-key-entries/daily-spending/reset",
 		"POST /v0/management/auth-files",
 		"POST /v0/management/iflow-auth-url",
 		"POST /v0/management/image-generation/test",

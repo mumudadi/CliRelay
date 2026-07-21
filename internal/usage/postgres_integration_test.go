@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/identityfingerprint"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testutil/postgrestest"
 )
 
 func TestPostgresRuntimeDataStackIntegration(t *testing.T) {
@@ -18,6 +19,7 @@ func TestPostgresRuntimeDataStackIntegration(t *testing.T) {
 	if dsn == "" {
 		t.Skip("CLIRELAY_POSTGRES_TEST_DSN is not set")
 	}
+	postgrestest.LockSharedRuntimeDB(t, dsn)
 	CloseDB()
 	t.Cleanup(CloseDB)
 
@@ -50,6 +52,9 @@ func TestPostgresRuntimeDataStackIntegration(t *testing.T) {
 		TRUNCATE
 			request_log_content,
 			request_logs,
+			usage_rollup_buckets,
+			request_log_storage_state,
+			usage_projection_markers,
 			api_keys,
 			api_key_permission_profiles,
 			model_pricing,
@@ -137,6 +142,7 @@ func TestPostgresRuntimeDataStackConcurrencyConstraintsAndHotPaths(t *testing.T)
 	if dsn == "" {
 		t.Skip("CLIRELAY_POSTGRES_TEST_DSN is not set")
 	}
+	postgrestest.LockSharedRuntimeDB(t, dsn)
 	CloseDB()
 	t.Cleanup(CloseDB)
 
@@ -256,6 +262,9 @@ func truncatePostgresRuntimeTables(t *testing.T, db *sql.DB) {
 		TRUNCATE
 			request_log_content,
 			request_logs,
+			usage_rollup_buckets,
+			request_log_storage_state,
+			usage_projection_markers,
 			api_keys,
 			api_key_permission_profiles,
 			model_pricing,

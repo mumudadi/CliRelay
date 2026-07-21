@@ -3,6 +3,7 @@ package usage
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -59,52 +60,10 @@ func QueryDashboardKPI(days int) (DashboardKPI, error) {
 }
 
 func QueryDashboardKPIForTenant(tenantID string, days int) (DashboardKPI, error) {
-	db := getReadDB()
-	if db == nil {
+	if getReadDB() == nil {
 		return DashboardKPI{}, nil
 	}
-	if days < 1 {
-		days = 7
-	}
-
-	cutoff := CutoffStartUTC(days).Format(time.RFC3339)
-
-	var kpi DashboardKPI
-	var effectiveInputTokens int64
-	kpiSQL := "SELECT " +
-		"COUNT(*), " +
-		"COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0), " +
-		"COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0), " +
-		"COALESCE(SUM(input_tokens), 0), " +
-		"COALESCE(SUM(output_tokens), 0), " +
-		"COALESCE(SUM(reasoning_tokens), 0), " +
-		"COALESCE(SUM(cached_tokens), 0), " +
-		"COALESCE(SUM(total_tokens), 0), " +
-		"COALESCE(SUM(cost), 0), " +
-		"COALESCE(SUM(" + cacheRateEffectiveInputSQL + "), 0) " +
-		"FROM request_logs WHERE tenant_id = ? AND timestamp >= ?"
-	err := db.QueryRow(kpiSQL, normalizeTenantID(tenantID), cutoff).Scan(
-		&kpi.TotalRequests,
-		&kpi.SuccessRequests,
-		&kpi.FailedRequests,
-		&kpi.InputTokens,
-		&kpi.OutputTokens,
-		&kpi.ReasoningTokens,
-		&kpi.CachedTokens,
-		&kpi.TotalTokens,
-		&kpi.TotalCost,
-		&effectiveInputTokens,
-	)
-	if err != nil {
-		return DashboardKPI{}, fmt.Errorf("usage: dashboard KPI query: %w", err)
-	}
-
-	if kpi.TotalRequests > 0 {
-		kpi.SuccessRate = float64(kpi.SuccessRequests) / float64(kpi.TotalRequests) * 100
-	}
-	kpi.CacheRate = cacheRateFromTokenTotals(effectiveInputTokens, kpi.CachedTokens)
-
-	return kpi, nil
+	return queryDashboardKPIFromRollup(tenantID, days)
 }
 
 // QueryDashboardTrends returns fixed-width trend buckets used by the dashboard.
@@ -132,38 +91,44 @@ func QueryDashboardTrendsForTenant(tenantID string, days int) (DashboardTrends, 
 		byKey[buckets[i].key] = &buckets[i]
 	}
 
+	// Trends read hour/day rollup buckets (not request_logs).
+	tenantID = normalizeTenantID(tenantID)
+	kind := rollupBucketDay
+	fromKey := dayBucketFromDays(days)
+	if days == 1 {
+		kind = rollupBucketHour
+		fromKey = CutoffStartUTC(1).In(loc).Format("2006-01-02T15")
+	}
 	rows, err := db.Query(`
-		SELECT timestamp, failed, total_tokens
-		FROM request_logs
-		WHERE tenant_id = ? AND timestamp >= ?
-	`, normalizeTenantID(tenantID), CutoffStartUTC(days).Format(time.RFC3339))
+		SELECT bucket_start,
+		       COALESCE(SUM(request_count), 0),
+		       COALESCE(SUM(success_count), 0),
+		       COALESCE(SUM(failure_count), 0),
+		       COALESCE(SUM(total_tokens), 0)
+		FROM usage_rollup_buckets
+		WHERE tenant_id = ? AND bucket_kind = ? AND bucket_start >= ?
+		GROUP BY bucket_start
+	`, tenantID, kind, fromKey)
 	if err != nil {
 		return DashboardTrends{}, fmt.Errorf("usage: query dashboard trends: %w", err)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var ts storedTime
-		var failedInt int
-		var totalTokens int64
-		if err := rows.Scan(&ts, &failedInt, &totalTokens); err != nil {
+		var bucketStart string
+		var requests, success, failure, totalTokens int64
+		if err := rows.Scan(&bucketStart, &requests, &success, &failure, &totalTokens); err != nil {
 			return DashboardTrends{}, fmt.Errorf("usage: scan dashboard trend row: %w", err)
 		}
-		if !ts.Valid {
-			continue
-		}
-		key := dashboardBucketKey(ts.Time.In(loc), days)
+		key := normalizeDashboardSQLBucketKey(rollupBucketToDashboardKey(bucketStart, days), days)
 		bucket := byKey[key]
 		if bucket == nil {
 			continue
 		}
-		bucket.requests++
+		bucket.requests += requests
 		bucket.totalToken += totalTokens
-		if failedInt != 0 {
-			bucket.failed++
-		} else {
-			bucket.success++
-		}
+		bucket.failed += failure
+		bucket.success += success
 	}
 	if err := rows.Err(); err != nil {
 		return DashboardTrends{}, fmt.Errorf("usage: iterate dashboard trends: %w", err)
@@ -177,6 +142,36 @@ func QueryDashboardTrendsForTenant(tenantID string, days int) (DashboardTrends, 
 	trends := dashboardTrendsFromBuckets(buckets)
 	trends.ThroughputSeries = throughputSeries
 	return trends, nil
+}
+
+// rollupBucketToDashboardKey maps rollup bucket_start onto dashboard key shapes.
+// day: "YYYY-MM-DD"; hour: "YYYY-MM-DDTHH" → "YYYY-MM-DD HH".
+func rollupBucketToDashboardKey(bucketStart string, days int) string {
+	bucketStart = strings.TrimSpace(bucketStart)
+	if days == 1 && strings.Contains(bucketStart, "T") {
+		// "2006-01-02T15" → "2006-01-02 15"
+		return strings.Replace(bucketStart, "T", " ", 1)
+	}
+	return bucketStart
+}
+
+// normalizeDashboardSQLBucketKey maps SQL group keys onto dashboardBucketKey shapes.
+// Hourly SQL uses "YYYY-MM-DD HH:00"; Go keys drop the trailing ":00".
+func normalizeDashboardSQLBucketKey(raw string, days int) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if days == 1 {
+		if strings.HasSuffix(raw, ":00") {
+			return strings.TrimSuffix(raw, ":00")
+		}
+		// Accept already-normalized "YYYY-MM-DD HH".
+		if len(raw) == len("2006-01-02 15") {
+			return raw
+		}
+	}
+	return raw
 }
 
 // QueryDashboardThroughputAcrossTenants returns the recent 7 RPM/TPM points
@@ -267,68 +262,65 @@ func queryDashboardThroughputSeriesAt(tenantID string, now time.Time, loc *time.
 		byKey[buckets[i].key] = &buckets[i]
 	}
 
-	// Completed minute points stay calendar-aligned; the latest point is filled
-	// from a rolling 60s window so the dashboard value does not drop to zero at
-	// each minute boundary.
+	// Completed minute points stay calendar-aligned via minute rollup.
+	// The latest point is a real rolling last-60s aggregate from request_logs so
+	// RPM/TPM do not drop to zero at each calendar-minute boundary (rollup alone
+	// only has the in-progress minute bucket, which is empty early in the minute).
 	windowStart := now.Add(-time.Minute)
 	start := now.Truncate(time.Minute).Add(-time.Duration(dashboardThroughputBucketCount-1) * time.Minute)
-	if windowStart.Before(start) {
-		start = windowStart
-	}
-	startUTC := start.UTC().Format(time.RFC3339)
 
 	var (
 		rows *sql.Rows
 		err  error
 	)
+	// Minute rollup keys are local "YYYY-MM-DDTHH:MM".
+	fromMinute := start.Format("2006-01-02T15:04")
+	toMinute := now.Add(time.Minute).Format("2006-01-02T15:04")
 	if allTenants {
 		rows, err = db.Query(`
-			SELECT timestamp, total_tokens
-			FROM request_logs
-			WHERE timestamp >= ?
-		`, startUTC)
+			SELECT bucket_start,
+			       COALESCE(SUM(request_count), 0),
+			       COALESCE(SUM(total_tokens), 0)
+			FROM usage_rollup_buckets
+			WHERE bucket_kind = ? AND bucket_start >= ? AND bucket_start < ?
+			GROUP BY bucket_start
+		`, rollupBucketMinute, fromMinute, toMinute)
 	} else {
 		rows, err = db.Query(`
-			SELECT timestamp, total_tokens
-			FROM request_logs
-			WHERE tenant_id = ? AND timestamp >= ?
-		`, normalizeTenantID(tenantID), startUTC)
+			SELECT bucket_start,
+			       COALESCE(SUM(request_count), 0),
+			       COALESCE(SUM(total_tokens), 0)
+			FROM usage_rollup_buckets
+			WHERE tenant_id = ? AND bucket_kind = ? AND bucket_start >= ? AND bucket_start < ?
+			GROUP BY bucket_start
+		`, normalizeTenantID(tenantID), rollupBucketMinute, fromMinute, toMinute)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("usage: query dashboard throughput trends: %w", err)
 	}
 	defer rows.Close()
 
-	var (
-		windowRequests int64
-		windowTokens   int64
-	)
 	for rows.Next() {
-		var ts storedTime
-		var totalTokens int64
-		if err := rows.Scan(&ts, &totalTokens); err != nil {
+		var bucketStart string
+		var requests, totalTokens int64
+		if err := rows.Scan(&bucketStart, &requests, &totalTokens); err != nil {
 			return nil, fmt.Errorf("usage: scan dashboard throughput row: %w", err)
 		}
-		if !ts.Valid {
-			continue
-		}
-		at := ts.Time.In(loc)
-		// Historical points: full calendar minute.
-		key := at.Truncate(time.Minute).Format("2006-01-02 15:04")
+		// "YYYY-MM-DDTHH:MM" → "YYYY-MM-DD HH:MM"
+		key := strings.Replace(bucketStart, "T", " ", 1)
 		if bucket := byKey[key]; bucket != nil {
-			bucket.requests++
+			bucket.requests += requests
 			bucket.totalToken += totalTokens
-		}
-		// Latest point: requests that finished in the last 60 seconds.
-		if !at.Before(windowStart) && !at.After(now) {
-			windowRequests++
-			windowTokens += totalTokens
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("usage: iterate dashboard throughput rows: %w", err)
 	}
 
+	windowRequests, windowTokens, err := queryRollingThroughputWindow(db, tenantID, windowStart, now, allTenants)
+	if err != nil {
+		return nil, err
+	}
 	if len(buckets) > 0 {
 		// Replace the in-progress calendar minute with the rolling window so the
 		// rightmost chart point and headline RPM/TPM stay continuous.
@@ -337,6 +329,30 @@ func queryDashboardThroughputSeriesAt(tenantID string, now time.Time, loc *time.
 	}
 
 	return throughputSeriesFromBuckets(buckets), nil
+}
+
+// queryRollingThroughputWindow aggregates the last ~60s from request_logs.
+// Bounded timestamp range only — avoids the multi-day dashboard poll storm.
+func queryRollingThroughputWindow(db *sql.DB, tenantID string, windowStart, now time.Time, allTenants bool) (requests int64, totalTokens int64, err error) {
+	fromUTC := windowStart.UTC().Format(time.RFC3339Nano)
+	toUTC := now.UTC().Format(time.RFC3339Nano)
+	if allTenants {
+		err = db.QueryRow(`
+			SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(total_tokens), 0)
+			FROM request_logs
+			WHERE timestamp >= ? AND timestamp <= ?
+		`, fromUTC, toUTC).Scan(&requests, &totalTokens)
+	} else {
+		err = db.QueryRow(`
+			SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(total_tokens), 0)
+			FROM request_logs
+			WHERE tenant_id = ? AND timestamp >= ? AND timestamp <= ?
+		`, normalizeTenantID(tenantID), fromUTC, toUTC).Scan(&requests, &totalTokens)
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("usage: query rolling throughput window: %w", err)
+	}
+	return requests, totalTokens, nil
 }
 
 func dashboardTrendsFromBuckets(buckets []dashboardBucket) DashboardTrends {

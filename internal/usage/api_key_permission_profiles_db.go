@@ -3,6 +3,7 @@ package usage
 import (
 	"database/sql"
 	"encoding/json"
+	"math"
 	"os"
 	"strings"
 
@@ -41,6 +42,10 @@ func ListAPIKeyPermissionProfilesForTenant(tenantID string) []APIKeyPermissionPr
 
 func ReplaceAllAPIKeyPermissionProfilesForTenant(tenantID string, profiles []APIKeyPermissionProfileRow) error {
 	return apiKeyPermissionProfileStoreForTenant(tenantID).ReplaceAllPermissionProfiles(profiles)
+}
+
+func ReplaceAllAPIKeyPermissionProfilesForTenantAndSyncEndUsers(tenantID string, profiles []APIKeyPermissionProfileRow) (int64, error) {
+	return apiKeyPermissionProfileStoreForTenant(tenantID).ReplaceAllPermissionProfilesAndSyncEndUsers(profiles)
 }
 
 func MigrateAPIKeyPermissionProfilesFromYAML(configFilePath string) int {
@@ -109,6 +114,12 @@ func normalizeAPIKeyPermissionProfile(profile APIKeyPermissionProfileRow) APIKey
 	profile.Name = strings.TrimSpace(profile.Name)
 	profile.DailyLimit = normalizeNonNegativeInt(profile.DailyLimit)
 	profile.TotalQuota = normalizeNonNegativeInt(profile.TotalQuota)
+	// Spending limits are whole USD dollars; ceil partial input.
+	if profile.DailySpendingLimit <= 0 || math.IsNaN(profile.DailySpendingLimit) || math.IsInf(profile.DailySpendingLimit, 0) {
+		profile.DailySpendingLimit = 0
+	} else {
+		profile.DailySpendingLimit = math.Ceil(profile.DailySpendingLimit)
+	}
 	profile.ConcurrencyLimit = normalizeNonNegativeInt(profile.ConcurrencyLimit)
 	profile.RPMLimit = normalizeNonNegativeInt(profile.RPMLimit)
 	profile.TPMLimit = normalizeNonNegativeInt(profile.TPMLimit)

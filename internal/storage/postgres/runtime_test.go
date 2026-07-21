@@ -7,8 +7,117 @@ import (
 
 func TestRuntimeMigrationsCoverCoreTables(t *testing.T) {
 	migrations := RuntimeMigrations()
-	if len(migrations) != 10 {
-		t.Fatalf("RuntimeMigrations len = %d, want 10", len(migrations))
+	if len(migrations) != 20 {
+		t.Fatalf("RuntimeMigrations len = %d, want 20", len(migrations))
+	}
+	// Latest: usage rollup buckets for stats/limits isolation from request_logs.
+	rollupSQL := migrations[18].SQL
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS usage_rollup_buckets",
+		"bucket_kind",
+		"effective_input_tokens",
+		"CREATE TABLE IF NOT EXISTS request_log_storage_state",
+	} {
+		if !strings.Contains(rollupSQL, fragment) {
+			t.Fatalf("usage rollup migration missing %q", fragment)
+		}
+	}
+	// Prior: account-level daily spending reset baselines.
+	endUserResetSQL := migrations[17].SQL
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS end_user_daily_spending_resets",
+		"cost_baseline",
+		"day_key",
+	} {
+		if !strings.Contains(endUserResetSQL, fragment) {
+			t.Fatalf("end-user daily spending reset migration missing %q", fragment)
+		}
+	}
+	// Prior: account-level quota on end_users.
+	accountQuotaSQL := migrations[16].SQL
+	for _, fragment := range []string{
+		"end_users ADD COLUMN IF NOT EXISTS permission_profile_id",
+		"end_users ADD COLUMN IF NOT EXISTS daily_limit",
+		"WHERE end_user_id IS NOT NULL",
+	} {
+		if !strings.Contains(accountQuotaSQL, fragment) {
+			t.Fatalf("end user account quota migration missing %q", fragment)
+		}
+	}
+	// Prior: end users + refresh tokens.
+	endUsersSQL := migrations[15].SQL
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS end_users",
+		"end_user_sessions",
+		"access_token_ttl_seconds",
+		"end_users.read",
+	} {
+		if !strings.Contains(endUsersSQL, fragment) {
+			t.Fatalf("end users migration missing %q", fragment)
+		}
+	}
+	// Prior: append-only daily spending reset history.
+	resetEventsSQL := migrations[14].SQL
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS api_key_daily_spending_reset_events",
+		"effective_used_before",
+		"raw_today_cost",
+		"actor_username",
+	} {
+		if !strings.Contains(resetEventsSQL, fragment) {
+			t.Fatalf("daily spending reset events migration missing %q", fragment)
+		}
+	}
+	// Prior: daily spending limit on permission profiles.
+	profileSpendSQL := migrations[13].SQL
+	if !strings.Contains(profileSpendSQL, "daily_spending_limit") {
+		t.Fatalf("profile daily spending migration missing daily_spending_limit")
+	}
+	// Prior: API key daily spending reset baselines.
+	resetSQL := migrations[12].SQL
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS api_key_daily_spending_resets",
+		"cost_baseline",
+		"day_key",
+	} {
+		if !strings.Contains(resetSQL, fragment) {
+			t.Fatalf("daily spending reset migration missing %q", fragment)
+		}
+	}
+	// Prior migration: AI account status read model tables.
+	statusSQL := migrations[11].SQL
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS ai_account_status",
+		"CREATE TABLE IF NOT EXISTS auth_subject_usage_daily",
+		"success_count",
+		"usage_projection_markers",
+	} {
+		if !strings.Contains(statusSQL, fragment) {
+			t.Fatalf("ai account status migration missing %q", fragment)
+		}
+	}
+	sharedSQL := migrations[19].SQL
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS ai_account_subjects",
+		"CREATE TABLE IF NOT EXISTS ai_account_tenant_bindings",
+		"CREATE TABLE IF NOT EXISTS ai_account_subject_status",
+		"CREATE TABLE IF NOT EXISTS ai_account_subject_usage_buckets",
+		"CREATE TABLE IF NOT EXISTS ai_account_subject_quota_cycles",
+		"CREATE TABLE IF NOT EXISTS ai_account_subject_quota_points",
+	} {
+		if !strings.Contains(sharedSQL, fragment) {
+			t.Fatalf("shared AI account migration missing %q", fragment)
+		}
+	}
+
+	authLookupSQL := migrations[10].SQL
+	for _, fragment := range []string{
+		"idx_request_logs_tenant_auth_index_time",
+		"idx_request_logs_tenant_auth_subject_time_cost",
+	} {
+		if !strings.Contains(authLookupSQL, fragment) {
+			t.Fatalf("auth lookup index migration missing %q", fragment)
+		}
 	}
 	sqlText := migrations[0].SQL
 	for _, table := range []string{

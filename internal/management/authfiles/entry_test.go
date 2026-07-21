@@ -49,6 +49,35 @@ func TestListEntriesBuildsAndSortsAuthEntries(t *testing.T) {
 	if got[0]["name"] != "alpha.json" || got[1]["name"] != "zeta.json" {
 		t.Fatalf("sorted names = %#v, want alpha then zeta", []any{got[0]["name"], got[1]["name"]})
 	}
+	if _, ok := got[0]["auth_subject_id"].(string); !ok || got[0]["auth_subject_id"] == "" {
+		t.Fatalf("alpha missing auth_subject_id: %#v", got[0])
+	}
+	if _, ok := got[1]["auth_subject_id"].(string); !ok || got[1]["auth_subject_id"] == "" {
+		t.Fatalf("zeta missing auth_subject_id: %#v", got[1])
+	}
+}
+
+func TestBuildEntryUsesTenantLocalPublicName(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "00000000-0000-0000-0000-00000000000a/account.json",
+		TenantID: "00000000-0000-0000-0000-00000000000a",
+		FileName: "00000000-0000-0000-0000-00000000000a/account.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+	}
+
+	entry := BuildEntry(auth, EntryOptions{})
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if got := entry["id"]; got != auth.ID {
+		t.Fatalf("id = %v, want %q", got, auth.ID)
+	}
+	if got := entry["name"]; got != "account.json" {
+		t.Fatalf("name = %v, want account.json", got)
+	}
 }
 
 func TestBuildEntryAllowsRuntimeOnlyAuthWithoutPath(t *testing.T) {
@@ -159,6 +188,108 @@ func TestBuildEntryIncludesCodexOAuthAdmissionPayload(t *testing.T) {
 	available, ok := admission["available_allowed_clients"].([]codexadmission.AllowedClientPresetInfo)
 	if !ok || len(available) == 0 || available[0].ID != codexadmission.AllowedClientClaudeCode {
 		t.Fatalf("admission.available_allowed_clients = %#v, want claude_code preset info", admission["available_allowed_clients"])
+	}
+	bridge, ok := entry["codex_image_generation_bridge"].(map[string]any)
+	if !ok {
+		t.Fatalf("codex_image_generation_bridge = %#v, want map", entry["codex_image_generation_bridge"])
+	}
+	if enabled, _ := bridge["enabled"].(bool); enabled {
+		t.Fatalf("bridge.enabled = %#v, want false by default", bridge["enabled"])
+	}
+}
+
+func TestBuildEntryIncludesXAIUsingAPI(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "xai-oauth",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+			"auth_kind":    "oauth",
+			"using_api":    "true",
+		},
+		Metadata: map[string]any{
+			"email":     "grok@example.com",
+			"auth_kind": "oauth",
+			"using_api": true,
+		},
+	}
+
+	entry := BuildEntry(auth, EntryOptions{})
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if got, _ := entry["using_api"].(bool); !got {
+		t.Fatalf("using_api = %#v, want true", entry["using_api"])
+	}
+}
+
+func TestBuildEntryDefaultsXAIUsingAPIToBuild(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "xai-oauth",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+			"auth_kind":    "oauth",
+		},
+		Metadata: map[string]any{
+			"email":     "grok@example.com",
+			"auth_kind": "oauth",
+		},
+	}
+
+	entry := BuildEntry(auth, EntryOptions{})
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if got, ok := entry["using_api"].(bool); !ok || got {
+		t.Fatalf("using_api = %#v, want false", entry["using_api"])
+	}
+}
+
+func TestBuildEntryOmitsUsingAPIForNonXAI(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "codex-oauth",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+		Metadata: map[string]any{
+			"email": "codex@example.com",
+		},
+	}
+
+	entry := BuildEntry(auth, EntryOptions{})
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if _, ok := entry["using_api"]; ok {
+		t.Fatalf("using_api should be omitted for non-xAI: %#v", entry["using_api"])
+	}
+}
+
+func TestBuildEntryIncludesCodexImageGenerationBridgeEnabled(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "codex-oauth",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+		Metadata: map[string]any{
+			"codex_image_generation_bridge": true,
+			"email":                         "codex@example.com",
+		},
+	}
+
+	entry := BuildEntry(auth, EntryOptions{})
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	bridge, ok := entry["codex_image_generation_bridge"].(map[string]any)
+	if !ok {
+		t.Fatalf("codex_image_generation_bridge = %#v, want map", entry["codex_image_generation_bridge"])
+	}
+	if enabled, _ := bridge["enabled"].(bool); !enabled {
+		t.Fatalf("bridge.enabled = %#v, want true", bridge["enabled"])
 	}
 }
 

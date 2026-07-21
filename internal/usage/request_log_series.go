@@ -44,8 +44,25 @@ type PublicChartData struct {
 
 // QueryPublicChartData aggregates the public API-key lookup charts in one indexed pass.
 func QueryPublicChartData(apiKey string, days int) (PublicChartData, error) {
-	db := getReadDB()
-	if db == nil {
+	row := GetAPIKey(apiKey)
+	if row != nil && strings.TrimSpace(row.EndUserID) != "" {
+		return QueryPublicChartDataForEndUser(row.TenantID, row.EndUserID, days)
+	}
+	return queryPublicChartData(LogQueryParams{
+		TenantID: ResolveAPIKeyTenant(apiKey),
+		APIKeys:  ExpandPublicLookupAPIKeys(apiKey),
+	}, days)
+}
+
+func QueryPublicChartDataForEndUser(tenantID, endUserID string, days int) (PublicChartData, error) {
+	return queryPublicChartData(LogQueryParams{
+		TenantID:  tenantID,
+		EndUserID: endUserID,
+	}, days)
+}
+
+func queryPublicChartData(params LogQueryParams, days int) (PublicChartData, error) {
+	if getReadDB() == nil {
 		return PublicChartData{
 			DailySeries:       []DailySeriesPoint{},
 			HeatmapSeries:     []DailyHeatmapPoint{},
@@ -56,137 +73,96 @@ func QueryPublicChartData(apiKey string, days int) (PublicChartData, error) {
 	if days < 1 {
 		days = 7
 	}
-
 	const heatmapDays = 365
-	scanDays := days
-	if scanDays < heatmapDays {
-		scanDays = heatmapDays
+	tenantID := params.TenantID
+	if tenantID == "" {
+		tenantID = systemTenantID
 	}
-	statsCutoff := CutoffStartUTC(days).Format(time.RFC3339)
-	heatmapCutoff := CutoffStartUTC(heatmapDays).Format(time.RFC3339)
-
-	params := LogQueryParams{TenantID: ResolveAPIKeyTenant(apiKey), APIKey: apiKey, Days: scanDays}
-	where, args := buildWhereClause(params)
-	queryArgs := make([]interface{}, 0, len(args)+2)
-	queryArgs = append(queryArgs, statsCutoff, heatmapCutoff)
-	queryArgs = append(queryArgs, args...)
-
-	rows, err := db.Query(`SELECT
-	             date(timestamp, 'localtime') as d,
-	             model,
-	             CASE WHEN failed != 0 THEN 1 ELSE 0 END as failed_flag,
-	             input_tokens,
-	             output_tokens,
-	             total_tokens,
-	             cost,
-	             cached_tokens,
-	             CASE WHEN timestamp >= ? THEN 1 ELSE 0 END as in_stats_range,
-	             CASE WHEN timestamp >= ? THEN 1 ELSE 0 END as in_heatmap_range
-	      FROM request_logs`+where, queryArgs...)
+	filter, ok := rollupIdentityFilter(params)
+	if !ok {
+		return PublicChartData{
+			DailySeries:       []DailySeriesPoint{},
+			HeatmapSeries:     []DailyHeatmapPoint{},
+			ModelDistribution: []ModelDistributionPoint{},
+			Stats:             LogStats{CacheRate: 0},
+		}, nil
+	}
+	filter.BucketKind = rollupBucketDay
+	filter.BucketFrom = dayBucketFromDays(heatmapDays)
+	points, err := queryRollupDailySeries(filter)
 	if err != nil {
-		return PublicChartData{}, fmt.Errorf("usage: public chart data query: %w", err)
+		return PublicChartData{}, err
 	}
-	defer rows.Close()
-
+	statsStartDay := dayBucketFromDays(days)
 	dailyByDate := make(map[string]*DailySeriesPoint)
 	heatmapByDate := make(map[string]*DailyHeatmapPoint)
-	modelByName := make(map[string]*ModelDistributionPoint)
 	var stats LogStats
 	var effectiveInputTokens int64
 	var cachedTokens int64
 	var successCount int64
-
-	for rows.Next() {
-		var dateKey string
-		var model string
-		var failedFlag int
-		var inputTokens int64
-		var outputTokens int64
-		var totalTokens int64
-		var cost float64
-		var rowCachedTokens int64
-		var inStatsRange int
-		var inHeatmapRange int
-		if err := rows.Scan(&dateKey, &model, &failedFlag, &inputTokens, &outputTokens, &totalTokens, &cost, &rowCachedTokens, &inStatsRange, &inHeatmapRange); err != nil {
-			return PublicChartData{}, fmt.Errorf("usage: public chart data scan: %w", err)
+	for _, p := range points {
+		heat := heatmapByDate[p.Date]
+		if heat == nil {
+			heat = &DailyHeatmapPoint{Date: p.Date}
+			heatmapByDate[p.Date] = heat
 		}
-
-		if inHeatmapRange != 0 {
-			point := heatmapByDate[dateKey]
-			if point == nil {
-				point = &DailyHeatmapPoint{Date: dateKey}
-				heatmapByDate[dateKey] = point
-			}
-			point.Requests++
-			point.Tokens += totalTokens
-			point.Cost += cost
-		}
-
-		if inStatsRange == 0 {
+		heat.Requests += p.Requests
+		heat.Tokens += p.TotalTokens
+		heat.Cost += p.Cost
+		// Sessions only available within detail retention; leave 0 outside that window.
+		if p.Date < statsStartDay {
 			continue
 		}
-		daily := dailyByDate[dateKey]
+		daily := dailyByDate[p.Date]
 		if daily == nil {
-			daily = &DailySeriesPoint{Date: dateKey}
-			dailyByDate[dateKey] = daily
+			daily = &DailySeriesPoint{Date: p.Date}
+			dailyByDate[p.Date] = daily
 		}
-		daily.Requests++
-		if failedFlag != 0 {
-			daily.FailedReq++
-		} else {
-			successCount++
-		}
-		daily.InputTokens += int(inputTokens)
-		daily.OutputTokens += int(outputTokens)
-
-		modelPoint := modelByName[model]
-		if modelPoint == nil {
-			modelPoint = &ModelDistributionPoint{Model: model}
-			modelByName[model] = modelPoint
-		}
-		modelPoint.Requests++
-		modelPoint.Tokens += totalTokens
-
-		stats.Total++
-		stats.TotalTokens += totalTokens
-		stats.TotalCost += cost
-		effectiveInputTokens += effectiveInputTokenTotal(inputTokens, rowCachedTokens)
-		cachedTokens += rowCachedTokens
+		daily.Requests += int(p.Requests)
+		daily.FailedReq += int(p.FailedRequests)
+		daily.InputTokens += int(p.InputTokens)
+		daily.OutputTokens += int(p.OutputTokens)
+		stats.Total += p.Requests
+		stats.TotalTokens += p.TotalTokens
+		stats.TotalCost += p.Cost
+		successCount += p.SuccessCount
+		effectiveInputTokens += p.EffectiveInput
+		cachedTokens += p.CachedTokens
 	}
-	if err := rows.Err(); err != nil {
-		return PublicChartData{}, err
-	}
-
-	sessionsByDate, err := querySessionSetsByDate(params)
+	models, err := queryRollupModelDistribution(rollupFilter{
+		TenantID:   tenantID,
+		BucketKind: rollupBucketDay,
+		BucketFrom: statsStartDay,
+		APIKeyIDs:  filter.APIKeyIDs,
+		EndUserID:  filter.EndUserID,
+	})
 	if err != nil {
 		return PublicChartData{}, err
 	}
-	statsStartDay := LocalDayKeyAt(CutoffStartUTC(days))
-	heatmapStartDay := LocalDayKeyAt(CutoffStartUTC(heatmapDays))
-	totalSessions := make(map[string]struct{})
-	for dateKey, sessions := range sessionsByDate {
-		if dateKey >= heatmapStartDay {
-			point := heatmapByDate[dateKey]
-			if point != nil {
-				point.Sessions = int64(len(sessions))
-			}
-		}
-		if dateKey >= statsStartDay {
-			for sessionID := range sessions {
-				totalSessions[sessionID] = struct{}{}
-			}
-		}
-	}
-	stats.TotalSessions = int64(len(totalSessions))
 	if stats.Total > 0 {
 		stats.SuccessRate = float64(successCount) / float64(stats.Total) * 100
 	}
 	stats.CacheRate = cacheRateFromTokenTotals(effectiveInputTokens, cachedTokens)
-
+	// Distinct sessions remain detail-retention diagnostics only.
+	if sessionsByDate, sessErr := querySessionSetsByDate(params); sessErr == nil {
+		statsStart := LocalDayKeyAt(CutoffStartUTC(days))
+		totalSessions := make(map[string]struct{})
+		for dateKey, sessions := range sessionsByDate {
+			if point := heatmapByDate[dateKey]; point != nil {
+				point.Sessions = int64(len(sessions))
+			}
+			if dateKey >= statsStart {
+				for sessionID := range sessions {
+					totalSessions[sessionID] = struct{}{}
+				}
+			}
+		}
+		stats.TotalSessions = int64(len(totalSessions))
+	}
 	return PublicChartData{
 		DailySeries:       sortedDailySeries(dailyByDate),
 		HeatmapSeries:     sortedHeatmapSeries(heatmapByDate),
-		ModelDistribution: sortedModelDistribution(modelByName),
+		ModelDistribution: models,
 		Stats:             stats,
 	}, nil
 }
@@ -448,9 +424,14 @@ func sessionDetailString(value gjson.Result) string {
 func sessionDetailKeyRank(key string) int {
 	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(strings.TrimSpace(key)))
 	switch normalized {
-	case "session_id", "sessionid", "x_session_id", "x_sessionid":
+	// Rank 0: stable client session ids. Grok/xAI clients send X-Grok-Session-Id
+	// rather than generic Session-Id; without it request_log_content.session_id
+	// stays empty for the bulk of Grok traffic and session-level analytics break.
+	case "session_id", "sessionid", "x_session_id", "x_sessionid",
+		"x_grok_session_id", "x_grok_sessionid":
 		return 0
-	case "conversation_id", "conversationid", "x_conversation_id", "x_conversationid", "openai_conversation_id":
+	case "conversation_id", "conversationid", "x_conversation_id", "x_conversationid",
+		"openai_conversation_id", "x_grok_conv_id", "x_grok_convid":
 		return 1
 	default:
 		return 99
@@ -549,6 +530,7 @@ func QueryAPIKeyDistributionForTenant(tenantID string, days int) ([]APIKeyDistri
 	}
 	defer rows.Close()
 
+	repByEndUser, nameByEndUser := accountFilterRepresentatives(tenantID)
 	merged := make(map[string]*APIKeyDistributionPoint)
 	order := make([]string, 0)
 	for rows.Next() {
@@ -565,26 +547,40 @@ func QueryAPIKeyDistributionForTenant(tenantID string, days int) ([]APIKeyDistri
 
 		// Prefer stable id identity; fall back to exact raw-key match for
 		// legacy rows that never received api_key_id backfill.
+		var live *APIKeyRow
 		if row, ok := currentByID[trimNullString(logicalID)]; ok {
-			if trimmed := strings.TrimSpace(row.Key); trimmed != "" {
-				p.APIKey = trimmed
-			}
-			if trimmed := strings.TrimSpace(row.Name); trimmed != "" {
-				p.Name = trimmed
-			}
+			copy := row
+			live = &copy
 		} else if row, ok := currentByKey[p.APIKey]; ok {
-			if trimmed := strings.TrimSpace(row.Key); trimmed != "" {
+			copy := row
+			live = &copy
+		}
+		mergeKey := p.APIKey
+		if live != nil {
+			if trimmed := strings.TrimSpace(live.Key); trimmed != "" {
 				p.APIKey = trimmed
+				mergeKey = trimmed
 			}
-			if trimmed := strings.TrimSpace(row.Name); trimmed != "" {
-				p.Name = trimmed
+			if eu := strings.TrimSpace(live.EndUserID); eu != "" {
+				// Collapse multi-key accounts into one distribution slice.
+				mergeKey = "eu:" + eu
+				if rep := strings.TrimSpace(repByEndUser[eu]); rep != "" {
+					p.APIKey = rep
+				}
+				if label := strings.TrimSpace(nameByEndUser[eu]); label != "" {
+					p.Name = label
+				} else if label := ResolveAPIKeyDisplayName(live, p.Name); label != "" {
+					p.Name = label
+				}
+			} else if label := ResolveAPIKeyDisplayName(live, p.Name); label != "" {
+				p.Name = label
 			}
 		}
 		if p.APIKey == "" {
 			continue
 		}
 
-		if existing, ok := merged[p.APIKey]; ok {
+		if existing, ok := merged[mergeKey]; ok {
 			existing.Requests += p.Requests
 			existing.Tokens += p.Tokens
 			if existing.Name == "" && p.Name != "" {
@@ -593,8 +589,8 @@ func QueryAPIKeyDistributionForTenant(tenantID string, days int) ([]APIKeyDistri
 			continue
 		}
 		point := p
-		merged[p.APIKey] = &point
-		order = append(order, p.APIKey)
+		merged[mergeKey] = &point
+		order = append(order, mergeKey)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
