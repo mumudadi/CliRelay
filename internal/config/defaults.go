@@ -16,6 +16,13 @@ const (
 	EnvPort = "CLIRELAY_PORT"
 	// EnvLegacyPort keeps the existing Docker installer PORT environment useful.
 	EnvLegacyPort = "PORT"
+	// EnvAdminPassword overrides the admin bootstrap password (must be >= 12 chars).
+	EnvAdminPassword = "CLIRELAY_ADMIN_PASSWORD"
+	// EnvAPIKey seeds a permanent API key from environment / .env file.
+	// Unlike config-file keys, this survives container restarts because it is
+	// re-inserted on every boot if missing from the SQLite store.
+	EnvAPIKey = "CLIRELAY_API_KEY"
+
 	// EnvPostgresDSN overrides postgres.dsn for container and secret-managed deployments.
 	EnvPostgresDSN = "CLIRELAY_POSTGRES_DSN"
 	// EnvRedisEnable overrides redis.enable.

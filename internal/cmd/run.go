@@ -129,6 +129,7 @@ func initializeRuntimeDataStack(cfg *config.Config, configPath string, loc *time
 	}
 	identity.SetDefault(identityService)
 	usage.MigrateAPIKeysFromConfig(cfg, configPath)
+	usage.MigrateAPIKeyFromEnv()
 	usage.MigrateAPIKeyPermissionProfilesFromYAML(configPath)
 	usage.MigrateRoutingConfigFromConfig(cfg, configPath)
 	usage.ApplyStoredRoutingConfig(cfg)

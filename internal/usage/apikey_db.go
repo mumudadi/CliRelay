@@ -2,6 +2,7 @@ package usage
 
 import (
 	"database/sql"
+	"os"
 	"strings"
 	"time"
 
@@ -129,6 +130,42 @@ func MigrateAPIKeysFromConfig(cfg *config.Config, configFilePath string) int {
 	}
 
 	return len(rows)
+}
+
+// MigrateAPIKeyFromEnv reads CLIRELAY_API_KEY from the environment (which may
+// be sourced from .env by the entrypoint or main()) and inserts it into the
+// SQLite api_keys table if it is not already present.  This gives Cloud Run
+// (and other container) deployments a stable, persistent API key that survives
+// restarts — the key is re-ensured on every boot.
+func MigrateAPIKeyFromEnv() {
+	envKey := strings.TrimSpace(os.Getenv(config.EnvAPIKey))
+	if envKey == "" {
+		return
+	}
+
+	db := getDB()
+	if db == nil {
+		return
+	}
+	store := apiKeyStore()
+
+	// Already exists → nothing to do.
+	if existing := store.Get(envKey); existing != nil {
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	row := sqlapikey.APIKeyRow{
+		Key:       envKey,
+		Name:      "env-default-key",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.Upsert(row); err != nil {
+		log.Errorf("usage: migrate CLIRELAY_API_KEY into SQLite: %v", err)
+		return
+	}
+	log.Infof("usage: seeded API key from %s (name=%s)", config.EnvAPIKey, row.Name)
 }
 
 // EffectiveAPIKeyRow applies the currently linked permission profile to an API key row.
